@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "generate-goldens"
+version = "0.1.0"
+
+[[package]]
 name = "hematite-benchmarks"
 version = "0.1.0"
 dependencies = [
