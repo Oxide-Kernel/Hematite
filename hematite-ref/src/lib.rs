@@ -10,3 +10,5 @@ pub mod pool;
 pub mod activation;
 pub mod softmax;
 pub mod elementwise;
+pub mod data_movement;
+pub mod reductions;

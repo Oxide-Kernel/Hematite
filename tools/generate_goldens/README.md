@@ -126,6 +126,11 @@ All fixture files are written to `hematite-tests/goldens/`:
 | `pad.rs` | Pad | T2 |
 | `slice.rs` | Slice | T2 |
 | `resize_nearest_neighbor.rs` | ResizeNearestNeighbor | T2 |
+| `mean.rs` | Mean | T4 |
+| `sum.rs` | Sum | T4 |
+| `argmax.rs` | ArgMax | T4 |
+| `argmin.rs` | ArgMin | T4 |
+| `l2_norm.rs` | L2Normalization | T4 |
 
 ## How to Add an Op
 

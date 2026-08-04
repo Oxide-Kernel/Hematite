@@ -90,9 +90,18 @@ fn main() {
     ops::data_movement::generate_slice(&mut w);
     ops::data_movement::generate_resize_nearest(&mut w);
 
+    // ── T4 — Reductions ──
+    println!("\n── T4: Reductions ──");
+    ops::reductions::generate_mean(&mut w);
+    ops::reductions::generate_sum(&mut w);
+    ops::reductions::generate_argmax(&mut w);
+    ops::reductions::generate_argmin(&mut w);
+    ops::reductions::generate_l2_norm(&mut w);
+
     // ── Self-check ──
     println!("\n── Self-check ──");
     self_check_conv2d_1x1();
+    self_check_mean();
     guard_generated_fixtures(&goldens_dir);
 
     println!("\nDone. Generated {} fixture files in {}", count_files(&goldens_dir), goldens_dir.display());
@@ -151,6 +160,35 @@ fn self_check_conv2d_1x1() {
     println!("  ✅ conv2d_1x1 self-check passed:");
     println!("     pixel(0,0,ch0): acc=-50 → scaled=-25");
     println!("     pixel(0,0,ch1): acc=50 → scaled=13");
+}
+
+/// Assert the mean op against a hand-computed value.
+fn self_check_mean() {
+    // Hand-compute: mean([1,2,3],[4,8,9]) over axis=1 for ch0
+    // Col 0: (1+4)/2 = 2.5 → round-half-away-from-zero → 3
+    // Col 1: (2+8)/2 = 5.0 → 5
+    // Col 2: (3+9)/2 = 6.0 → 6
+    // Then requantize with mbm(x, 1<<30, 0) = round(x * 0.5):
+    // mbm(3, 1<<30, 0) = 2
+    // mbm(5, 1<<30, 0) = 3
+    // mbm(6, 1<<30, 0) = 3
+
+    use tflm_math::multiply_by_quantized_multiplier;
+
+    let m = 1i32 << 30;
+    let s = 0i32;
+
+    assert_eq!(multiply_by_quantized_multiplier(3, m, s), 2,
+        "mbm(3, 1<<30, 0) should be 2");
+    assert_eq!(multiply_by_quantized_multiplier(5, m, s), 3,
+        "mbm(5, 1<<30, 0) should be 3");
+    assert_eq!(multiply_by_quantized_multiplier(6, m, s), 3,
+        "mbm(6, 1<<30, 0) should be 3");
+
+    println!("  ✅ mean self-check passed:");
+    println!("     ch0 col0: (1+4)/2=3 → mbm(3)=2");
+    println!("     ch0 col1: (2+8)/2=5 → mbm(5)=3");
+    println!("     ch0 col2: (3+9)/2=6 → mbm(6)=3");
 }
 
 fn find_workspace_root() -> PathBuf {

@@ -7,3 +7,4 @@ pub mod activations;
 pub mod elementwise;
 pub mod quantize;
 pub mod data_movement;
+pub mod reductions;

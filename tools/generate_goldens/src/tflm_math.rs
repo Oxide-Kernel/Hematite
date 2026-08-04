@@ -126,6 +126,31 @@ pub fn count_leading_zeros_u32(x: u32) -> i32 {
     leading
 }
 
+/// Integer square root via binary search (no f64, no heap).
+///
+/// Returns `floor(sqrt(n))` for `n >= 0`. Used by L2_NORMALIZATION
+/// to compute the scaling factor from accumulated squared values.
+/// The identical algorithm is mirrored in `hematite-ref/src/reductions.rs`.
+pub fn integer_sqrt(n: u64) -> u32 {
+    if n == 0 {
+        return 0;
+    }
+    let mut low: u32 = 0;
+    let mut high: u32 = 0xFFFFu32;
+    if n > 1_000_000_000_000_000_000 {
+        high = u32::MAX;
+    }
+    while low < high {
+        let mid = low + (high - low) / 2 + (high - low) % 2;
+        if u64::from(mid) * u64::from(mid) <= n {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    low
+}
+
 /// Saturating left shift for positive exponents.
 /// Mirrors `SaturatingRoundingMultiplyByPOT<Exponent>` for Exponent > 0 (int32 scalar).
 pub fn saturating_rounding_left_shift(x: i32, exponent: i32) -> i32 {
@@ -751,6 +776,28 @@ mod tests {
         let delta = (result - expected).abs();
         assert!(delta <= 2_000_000,
             "get_reciprocal(764865,12) delta={delta}: result={result}, expected≈{expected}");
+    }
+    // ── integer_sqrt tests ──
+
+    #[test]
+    fn test_integer_sqrt_smoke() {
+        assert_eq!(integer_sqrt(0), 0);
+        assert_eq!(integer_sqrt(1), 1);
+        assert_eq!(integer_sqrt(2), 1);
+        assert_eq!(integer_sqrt(4), 2);
+        assert_eq!(integer_sqrt(9), 3);
+        assert_eq!(integer_sqrt(15), 3);
+        assert_eq!(integer_sqrt(16), 4);
+        assert_eq!(integer_sqrt(100), 10);
+        assert_eq!(integer_sqrt(10000), 100);
+        // u64::MAX = 18446744073709551615; sqrt ~ 4294967295
+        let n = u64::MAX;
+        let s = integer_sqrt(n);
+        assert!(u64::from(s) * u64::from(s) <= n);
+        if s < u32::MAX {
+            let s_plus = u64::from(s) + 1;
+            assert!(s_plus * s_plus > n);
+        } // else s == u32::MAX, s+1 squared overflows u64 — cannot check
     }
 
     #[test]

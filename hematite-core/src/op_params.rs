@@ -545,7 +545,23 @@ pub struct ReduceParams {
     pub axis_count: i8,
     /// Input tensor shape in NHWC.
     pub input_shape: [i32; 4],
+    /// Output tensor shape in NHWC (after reduction, with or without
+    /// keep-dims size-1 axes).
+    pub output_shape: [i32; 4],
     /// For ARG_MAX / ARG_MIN: the output element type (`kTfLiteInt32`
     /// or `kTfLiteInt64`).
     pub output_type: i32,
+    /// Input zero-point offset (used by MEAN, SUM for requantize).
+    pub input_offset: i32,
+    /// Output zero-point offset (used by MEAN, SUM, L2_NORMALIZATION).
+    pub output_offset: i32,
+    /// Per-tensor output multiplier (Q0.31) — used by MEAN, SUM, L2_NORMALIZATION
+    /// for requantize.
+    pub output_multiplier: i32,
+    /// Per-tensor output right-shift — paired with [`output_multiplier`](Self::output_multiplier).
+    pub output_shift: i32,
+    /// Clamp lower bound for fused activation (applied after requantize).
+    pub quantized_activation_min: i32,
+    /// Clamp upper bound for fused activation (applied after requantize).
+    pub quantized_activation_max: i32,
 }
