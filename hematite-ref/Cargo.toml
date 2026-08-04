@@ -1,0 +1,13 @@
+[package]
+name = "hematite-ref"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hematite-core = { path = "../hematite-core" }
+hematite-int8 = { path = "../hematite-int8" }
+hematite-memory = { path = "../hematite-memory" }
+
+[dev-dependencies]
+hematite-tests = { path = "../hematite-tests" }

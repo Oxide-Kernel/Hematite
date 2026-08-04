@@ -1,0 +1,15 @@
+[package]
+name = "hematite-benchmarks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hematite-benchmarks"
+path = "src/main.rs"
+
+[dependencies]
+hematite-ref = { path = "../hematite-ref" }
+hematite-s3 = { path = "../hematite-s3" }
+hematite-codegen = { path = "../hematite-codegen" }
+hematite-tests = { path = "../hematite-tests" }

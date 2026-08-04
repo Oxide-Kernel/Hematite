@@ -1,0 +1,14 @@
+[package]
+name = "hematite-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hematite-ref = { path = "../hematite-ref" }
+hematite-codegen = { path = "../hematite-codegen" }
+hematite-s3 = { path = "../hematite-s3", optional = true }
+
+[features]
+default = []
+hematite-s3 = ["dep:hematite-s3"]

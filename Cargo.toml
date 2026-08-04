@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "hematite-core",
+    "hematite-int8",
+    "hematite-memory",
+    "hematite-ref",
+    "hematite-s3",
+    "hematite-codegen",
+    "hematite-tests",
+    "hematite-benchmarks",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+esp-hal = "1.1"
+defmt = "0.3"
+# REMOVED: postcard, flatbuffers — per plan decisions cited below:
+#   postcard:  deserialization cannot run in const context; T2.0/T5.0 mandate
+#              pre-generated Rust const-array fixture files (see T0.5, T2.0).
+#   flatbuffers: T4.0 mandates a hand-rolled ~300-LOC byte-offset walker in
+#                hematite-codegen — NO runtime flatbuffers dependency.
+# DO NOT re-add either without a plan amendment.
+probe-rs = "0.31"
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full", "extra-traits"] }

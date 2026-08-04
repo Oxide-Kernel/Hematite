@@ -1,0 +1,22 @@
+# ── Cargo configuration for Hematite ──────────────────────────────────
+#
+# No global [build] target is set and no global [unstable] build-std is
+# declared.  The esp-rs/rust fork toolchain (required for the Xtensa
+# target) is NOT present on every machine and installing it is a ~1-2 GB
+# operation that needs explicit user consent.  Phases 1, 2 and 4 of the
+# hematite-nn plan are fully host-testable — a global xtensa default
+# would brick every bare `cargo check` / `cargo test` for those phases.
+#
+# Xtensa builds are scoped into the cargo aliases below.  Host commands
+# (`cargo check`, `cargo test`, `cargo run`) need no explicit --target.
+#
+# See: local-notes/plans/hematite-nn.md T0.1 (amended 2026-08-04)
+# ───────────────────────────────────────────────────────────────────────
+
+[target.xtensa-esp32s3-none-elf]
+runner = "espflash flash --monitor"
+
+[alias]
+xtensa-check = "check -Zbuild-std=core,alloc --target xtensa-esp32s3-none-elf"
+xtensa-build = "build -Zbuild-std=core,alloc --target xtensa-esp32s3-none-elf"
+xtensa-run   = "run   -Zbuild-std=core,alloc --target xtensa-esp32s3-none-elf"
