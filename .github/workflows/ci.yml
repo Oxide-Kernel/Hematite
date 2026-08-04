@@ -1,0 +1,63 @@
+# Hematite CI — Phase 0 scaffold
+#
+# Two independent jobs: host (stable Rust, all workspace checks)
+# and xtensa (esp-rs fork, device target check only).
+# Neither depends on the other; both must pass for PR merge.
+#
+# See: local-notes/plans/hematite-nn.md T0.3
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  host:
+    name: Host (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: cargo check
+        run: cargo check --workspace --locked
+
+      - name: cargo clippy (pedantic)
+        run: cargo clippy --workspace --locked -- -W clippy::pedantic
+
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+      - name: Install cargo-vet
+        uses: taiki-e/install-action@v2.84.0
+        with:
+          tool: cargo-vet
+
+      - name: cargo vet
+        run: cargo vet --locked
+
+  xtensa:
+    name: Xtensa (esp-rs fork)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust for Xtensa
+        uses: esp-rs/xtensa-toolchain@v1.7.0
+        with:
+          default: true
+          buildtargets: esp32s3
+          version: "1.97.0.0"
+
+      - name: cargo xtensa-check
+        run: cargo xtensa-check --workspace --locked
