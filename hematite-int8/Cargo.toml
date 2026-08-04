@@ -6,3 +6,8 @@ license.workspace = true
 
 [dependencies]
 hematite-core = { path = "../hematite-core" }
+
+[features]
+# Enables host-side helpers that use f64 (quantize_multiplier).
+# OFF by default — device builds contain zero floating-point code paths.
+host = []

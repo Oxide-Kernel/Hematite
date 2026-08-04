@@ -4,5 +4,6 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# Zero external dependencies — this is a compile-time planning crate.
+# Codegen (T4.2b) imports OpInfo and calls liveness_plan().
 [dependencies]
-hematite-core = { path = "../hematite-core" }

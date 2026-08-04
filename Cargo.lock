@@ -40,9 +40,6 @@ dependencies = [
 [[package]]
 name = "hematite-memory"
 version = "0.1.0"
-dependencies = [
- "hematite-core",
-]
 
 [[package]]
 name = "hematite-ref"
