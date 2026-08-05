@@ -116,7 +116,7 @@ dl_tie728_s8_conv2d_11cn:
 
     l32i a11, a4, 68  # bias
     l32i a8, a4, 64 # mac shift
-    blti a8, 0, .L11cn_per_channel
+    bltz a8, .L11cn_per_channel
 
 
 .L11cn_per_layer:
@@ -215,7 +215,7 @@ dl_tie728_s8_conv2d_11cn_relu:
 
     l32i a11, a4, 68  # bias
     l32i a8, a4, 64 # mac shift
-    blti a8, 0, .L11cn_relu_per_channel
+    bltz a8, .L11cn_relu_per_channel
 
 
 .L11cn_relu_per_layer:
@@ -318,7 +318,7 @@ dl_tie728_s8_conv2d_11cn_prelu:
 
     l32i a11, a4, 68  # bias
     l32i a8, a4, 64 # mac shift
-    blti a8, 0, .L11cn_prelu_per_channel
+    bltz a8, .L11cn_prelu_per_channel
 
 
 .L11cn_prelu_per_layer:
@@ -404,11 +404,19 @@ dl_tie728_s8_conv2d_11cn_prelu:
     #l16si a7, a1, 0
     EE.MOVI.32.A \operation_type, \tmp, 0 # operation type in q7[0]
 
-    bbci \tmp, 3, 7f
-    bbci \tmp, 2, 11f
+    bbsi \tmp, 3, 700f
+    j 7f
+700:
+    bbsi \tmp, 2, 701f
+    j 11f
+701:
 11:  # per_channel bias + prelu, 0x1011
-    bbci \tmp, 1, 9f
-    bbci \tmp, 0, 10f
+    bbsi \tmp, 1, 702f
+    j 9f
+702:
+    bbsi \tmp, 0, 703f
+    j 10f
+703:
 
     # l16si \tmp, \mac_shift, 0
     # addi \mac_shift, \mac_shift, 2
@@ -480,7 +488,9 @@ dl_tie728_s8_conv2d_11cn_prelu:
     j 16f  # jump to 16f
 
 9:  # per_channel bias, 0x1001
-    bbci \tmp, 0, 8f
+    bbsi \tmp, 0, 704f
+    j 8f
+704:
     # l16si \tmp, \mac_shift, 0
     # addi \mac_shift, \mac_shift, 2
     # EE.SRS.ACCX \output, \tmp, 0
@@ -523,9 +533,15 @@ dl_tie728_s8_conv2d_11cn_prelu:
     j 17f  # jump to 16f
 
 7: # per_channel no_bias + relu, 0x111
-    bbci \tmp, 2, 3f
-    bbci \tmp, 1, 5f
-    bbci \tmp, 0, 6f
+    bbsi \tmp, 2, 705f
+    j 3f
+705:
+    bbsi \tmp, 1, 706f
+    j 5f
+706:
+    bbsi \tmp, 0, 707f
+    j 6f
+707:
 
     l16si \tmp, \mac_shift, 0
 
@@ -664,7 +680,7 @@ dl_tie728_s8_conv2d_11cn_prelu:
     # filter_ptr:   filter_ptr
     # c_div_x_1:    input_channel // 16 - 1
 
-    blti \c_div_x_1, 0, 17f # input_channel < 16
+    bltz \c_div_x_1, 17f # input_channel < 16
 
     EE.LD.128.USAR.IP \input_front_aligned, \input_ptr, 16
 
@@ -746,11 +762,15 @@ dl_tie728_s8_conv2d_11cn_prelu:
 
 
 15: # remainder_c == 15, 0x1111
-    bbci \remainder_c, 3, 7f
+    bbsi \remainder_c, 3, 708f
+    j 7f
+708:
 
     EE.VLD.128.IP \filter_v1, \filter_ptr,  16
 
-    bbci \remainder_c, 2, 11f
+    bbsi \remainder_c, 2, 709f
+    j 11f
+709:
     bbci \remainder_c, 1, 13f
     bbci \remainder_c, 0, 14f
     EE.VSMULAS.S8.QACC.LD.INCP \filter_v0, \filter_ptr, \filter_v0, \input_v0, 0
@@ -820,8 +840,12 @@ dl_tie728_s8_conv2d_11cn_prelu:
     j 16f  # jump to 16f
 
 11:  # remainder_c == 11, 0x1011
-    bbci \remainder_c, 1, 9f
-    bbci \remainder_c, 0, 10f
+    bbsi \remainder_c, 1, 710f
+    j 9f
+710:
+    bbsi \remainder_c, 0, 711f
+    j 10f
+711:
     EE.VSMULAS.S8.QACC.LD.INCP \filter_v0, \filter_ptr, \filter_v0, \input_v0, 0
     EE.VSMULAS.S8.QACC.LD.INCP \filter_v1, \filter_ptr, \filter_v1, \input_v0, 1
     EE.VSMULAS.S8.QACC.LD.INCP \filter_v0, \filter_ptr, \filter_v0, \input_v0, 2
@@ -847,7 +871,9 @@ dl_tie728_s8_conv2d_11cn_prelu:
     EE.VSMULAS.S8.QACC  \filter_v1, \input_v0, 9
     j 16f  # jump to 16f
 9:  # remainder_c == 9, 0x1001
-    bbci \remainder_c, 0, 8f
+    bbsi \remainder_c, 0, 712f
+    j 8f
+712:
     EE.VSMULAS.S8.QACC.LD.INCP \filter_v0, \filter_ptr, \filter_v0, \input_v0, 0
     EE.VSMULAS.S8.QACC.LD.INCP \filter_v1, \filter_ptr, \filter_v1, \input_v0, 1
     EE.VSMULAS.S8.QACC.LD.INCP \filter_v0, \filter_ptr, \filter_v0, \input_v0, 2
@@ -870,11 +896,17 @@ dl_tie728_s8_conv2d_11cn_prelu:
     j 16f  # jump to 16f
 
 7: # remainder == 7, 0x111
-    bbci \remainder_c, 2, 3f
+    bbsi \remainder_c, 2, 713f
+    j 3f
+713:
 
     EE.VLD.128.IP \filter_v1, \filter_ptr,  16
-    bbci \remainder_c, 1, 5f
-    bbci \remainder_c, 0, 6f
+    bbsi \remainder_c, 1, 714f
+    j 5f
+714:
+    bbsi \remainder_c, 0, 715f
+    j 6f
+715:
     EE.VSMULAS.S8.QACC.LD.INCP \filter_v0, \filter_ptr, \filter_v0, \input_v0, 0
     EE.VSMULAS.S8.QACC.LD.INCP \filter_v1, \filter_ptr, \filter_v1, \input_v0, 1
     EE.VSMULAS.S8.QACC.LD.INCP \filter_v0, \filter_ptr, \filter_v0, \input_v0, 2
@@ -947,7 +979,7 @@ dl_tie728_s8_conv2d_11cn_prelu:
     # filter_ptr:   filter_ptr
     # c_div_x_1:        input_channel // 16 - 1
 
-    blti \c_div_x_1, 0, 17f # input_channel < 16
+    bltz \c_div_x_1, 17f # input_channel < 16
 
     EE.LD.128.USAR.IP \input_front_aligned, \input_ptr, 16
     EE.LD.128.USAR.IP \filter_front_aligned, \filter_ptr, 16
@@ -1079,13 +1111,17 @@ dl_tie728_s8_unaligned_conv2d_11cn:
     tie728_s8_unaligned_conv2d_operation_type a10, a8, a11, a13, a12, a4
 
 
-    beqz a7, .Lu11cn_loop_end # output_channel < 16
+    bnez a7, 800f
+    j .Lu11cn_loop_end # output_channel < 16
+800:
 
     EE.LD.128.USAR.IP q1, a2, 0
     rur.sar_byte a14
 
-    beqi a14, 0, .Lu11cn_loop0
-    beqi a14, 8, .Lu11cn_loop8
+    beqz a14, .Lu11cn_loop0
+    bnei a14, 8, 716f
+    j .Lu11cn_loop8
+716:
 
 # output sar_byte != 0 && != 8
     .Lu11cn_loop:
@@ -1270,7 +1306,9 @@ dl_tie728_s8_conv2d_33cn:
 
     l32i a11, a4, 68  # bias
     l32i a8, a4, 64 # mac shift
-    blti a8, 0, .L33cn_per_channel
+    bgez a8, 742f
+    j .L33cn_per_channel
+742:
 
 
 .L33cn_per_layer:
@@ -1369,7 +1407,9 @@ dl_tie728_s8_conv2d_33cn_relu:
 
     l32i a11, a4, 68  # bias
     l32i a8, a4, 64 # mac shift
-    blti a8, 0, .L33cn_relu_per_channel
+    bgez a8, 743f
+    j .L33cn_relu_per_channel
+743:
 
 
 .L33cn_relu_per_layer:
@@ -1472,7 +1512,9 @@ dl_tie728_s8_conv2d_33cn_prelu:
 
     l32i a11, a4, 68  # bias
     l32i a8, a4, 64 # mac shift
-    blti a8, 0, .L33cn_prelu_per_channel
+    bgez a8, 744f
+    j .L33cn_prelu_per_channel
+744:
 
 
 .L33cn_prelu_per_layer:
@@ -1659,17 +1701,25 @@ dl_tie728_s8_unaligned_conv2d_33cn:
     tie728_s8_unaligned_conv2d_operation_type a14, a8, a11, a13, a12, a4
     EE.MOVI.32.Q q7, a14, 0  # operation_type q7[0]
 
-    beqz a7, .Lu33cn_loop_end # output_channel < 16
+    bnez a7, 801f
+    j .Lu33cn_loop_end # output_channel < 16
+801:
 
     EE.LD.128.USAR.IP q1, a2, 0  # output sar_byte
     rur.sar_byte a14
 
-    bgez a13, .Lu33cn_act
+    bltz a13, 717f
+    j .Lu33cn_act
+717:
         l32i a13, a4, 136  # c_remainder: c % 16, replace activation_shift
         EE.MOVI.32.A q7, a12, 0  # operation_type, replace activation_alpha
 
-        beqi a14, 0, .Lu33cn_loop0
-        beqi a14, 8, .Lu33cn_loop8
+        bnez a14, 745f
+        j .Lu33cn_loop0
+745:
+        bnei a14, 8, 718f
+        j .Lu33cn_loop8
+718:
 
     # output sar_byte != 0 && != 8
         .Lu33cn_loop:
@@ -1687,7 +1737,9 @@ dl_tie728_s8_unaligned_conv2d_33cn:
             dl_tie728_s8_unaligned_store0 q0, a2, a14
 
             addi a7, a7, -1
-        bnez a7, .Lu33cn_loop
+        beqz a7, 719f
+        j .Lu33cn_loop
+719:
         j .Lu33cn_loop_end
 
     # output sar_byte == 0
@@ -1705,7 +1757,9 @@ dl_tie728_s8_unaligned_conv2d_33cn:
             EE.VST.128.IP q0, a2, 16
 
             addi a7, a7, -1
-        bnez a7, .Lu33cn_loop0
+        beqz a7, 720f
+        j .Lu33cn_loop0
+720:
         j .Lu33cn_loop_end
 
     # output sar_byte == 8
@@ -1724,12 +1778,18 @@ dl_tie728_s8_unaligned_conv2d_33cn:
             dl_tie728_s8_unaligned_store1 q0, a2
 
             addi a7, a7, -1
-        bnez a7, .Lu33cn_loop8
+        beqz a7, 721f
+        j .Lu33cn_loop8
+721:
         j .Lu33cn_loop_end
 
     .Lu33cn_act:
-        beqi a14, 0, .Lu33cn_act_loop0
-        beqi a14, 8, .Lu33cn_act_loop8
+        bnez a14, 746f
+        j .Lu33cn_act_loop0
+746:
+        bnei a14, 8, 722f
+        j .Lu33cn_act_loop8
+722:
 
     # output sar_byte != 0 && != 8
         .Lu33cn_act_loop:
@@ -1751,7 +1811,9 @@ dl_tie728_s8_unaligned_conv2d_33cn:
             dl_tie728_s8_unaligned_store0 q0, a2, a14
 
             addi a7, a7, -1
-        bnez a7, .Lu33cn_act_loop
+        beqz a7, 723f
+        j .Lu33cn_act_loop
+723:
         j .Lu33cn_loop_end
 
     # output sar_byte == 0
@@ -1773,7 +1835,9 @@ dl_tie728_s8_unaligned_conv2d_33cn:
             EE.VST.128.IP q0, a2, 16
 
             addi a7, a7, -1
-        bnez a7, .Lu33cn_act_loop0
+        beqz a7, 724f
+        j .Lu33cn_act_loop0
+724:
         j .Lu33cn_loop_end
 
     # output sar_byte == 8
@@ -1796,7 +1860,9 @@ dl_tie728_s8_unaligned_conv2d_33cn:
             dl_tie728_s8_unaligned_store1 q0, a2
 
             addi a7, a7, -1
-        bnez a7, .Lu33cn_act_loop8
+        beqz a7, 725f
+        j .Lu33cn_act_loop8
+725:
         j .Lu33cn_loop_end
 
 .Lu33cn_loop_end:
@@ -1804,7 +1870,9 @@ dl_tie728_s8_unaligned_conv2d_33cn:
 
     # handle the n remainder
     l32i a13, a4, 140  # n % 16 remainder_n
-    beqz a13, .Lu33cn_end
+    bnez a13, 726f
+    j .Lu33cn_end
+726:
 
     l32i a14, a4, 84  # activation_shift
 
@@ -1878,7 +1946,9 @@ dl_tie728_s8_unaligned_conv2d_33cn:
     # filter_w
 
     l32i \filter_w,          \args,  56  # filter_width
-    blti \filter_w, 2, 3f
+    bgei \filter_w, 2, 727f
+    j 3f
+727:
 
     l32i \filter_h,          \args,  52  # filter_height
     1:
@@ -1888,7 +1958,9 @@ dl_tie728_s8_unaligned_conv2d_33cn:
             add \input_ptr, \input_ptr, \dilation_x_offset
 
             addi \filter_w, \filter_w, -1
-        bgei \filter_w, 2, 2b
+        blti \filter_w, 2, 728f
+        j 2b
+728:
 
         tie728_s8_conv2d_11c16 \input_v0, \input_ptr, \filter_v0, \filter_v1, \filter_ptr, \c_div_x_1
 
@@ -2052,7 +2124,7 @@ dl_tie728_s8_conv2d_hwcn_relu:
     l32i a11, a4, 144   # filter_n_offset
     EE.MOVI.32.Q q6, a12, 1
     EE.MOVI.32.Q q6, a11, 2
-    blti a8, 0, .Lhwcn_relu_per_channel
+    bltz a8, .Lhwcn_relu_per_channel
 
 
 .Lhwcn_relu_per_layer:
@@ -2170,7 +2242,7 @@ dl_tie728_s8_conv2d_hwcn_prelu:
     l32i a11, a4, 144
     EE.MOVI.32.Q q6, a12, 1
     EE.MOVI.32.Q q6, a11, 2
-    blti a8, 0, .Lhwcn_prelu_per_channel
+    bltz a8, .Lhwcn_prelu_per_channel
 
 
 .Lhwcn_prelu_per_layer:
@@ -2268,7 +2340,9 @@ dl_tie728_s8_conv2d_hwcn_prelu:
     # filter_w
 
     l32i \filter_w,          \args,  56  # filter_width
-    blti \filter_w, 2, 23f
+    bgei \filter_w, 2, 729f
+    j 23f
+729:
 
 
     l32i \filter_h,          \args,  52  # filter_height
@@ -2281,7 +2355,9 @@ dl_tie728_s8_conv2d_hwcn_prelu:
 
 
             addi \filter_w, \filter_w, -1
-        bgei \filter_w, 2, 22b
+        blti \filter_w, 2, 730f
+        j 22b
+730:
 
         tie728_s8_conv2d_1_1_unaligned_c \input_v0, \input_front_aligned, \input_back_aligned, \input_ptr, \filter_v0, \filter_v1, \filter_ptr, \c_div_x_1, \remainder_c, \tmp
         l32i \tmp, \args, 112  # input dilation y offset
@@ -2321,7 +2397,9 @@ dl_tie728_s8_conv2d_hwcn_prelu:
     # filter_w
 
     l32i \filter_w,          \args,  56  # filter_width
-    blti \filter_w, 2, 22f
+    bgei \filter_w, 2, 731f
+    j 22f
+731:
 
     l32i \filter_h,          \args,  52  # filter_height
     21:
@@ -2333,7 +2411,9 @@ dl_tie728_s8_conv2d_hwcn_prelu:
 
 
         addi \filter_w, \filter_w, -1
-        bgei \filter_w, 2, 20b
+        blti \filter_w, 2, 732f
+        j 20b
+732:
 
         tie728_s8_conv2d_1_1_c_n_remainder \input_v0, \input_front_aligned, \input_back_aligned, \input_ptr, \filter_v0, \filter_front_aligned, \filter_back_aligned, \filter_ptr, \c_div_x_1, \remainder_c, \tmp, \tmp1
         l32i \tmp, \args, 112  # input dilation y offset
@@ -2409,17 +2489,25 @@ dl_tie728_s8_unaligned_conv2d_hwcn:
     tie728_s8_unaligned_conv2d_operation_type a12, a8, a13, a11, a14, a4
     EE.MOVI.32.Q q7, a12, 0  # operation_type q7[0]
 
-    beqz a7, .Luhwcn_loop_end # output_channel < 16
+    bnez a7, 802f
+    j .Luhwcn_loop_end # output_channel < 16
+802:
 
     EE.LD.128.USAR.IP q1, a2, 0  # output sar_byte
     rur.sar_byte a12
 
-    bgez a11, .Luhwcn_act
+    bltz a11, 733f
+    j .Luhwcn_act
+733:
         l32i a9, a4, 136  # c_remainder: c % 16
         EE.MOVI.32.A q7, a10, 0  # operation_type
 
-        beqi a12, 0, .Luhwcn_loop0
-        beqi a12, 8, .Luhwcn_loop8
+        bnez a12, 747f
+        j .Luhwcn_loop0
+747:
+        bnei a12, 8, 734f
+        j .Luhwcn_loop8
+734:
 
     # output sar_byte != 0 && != 8
         .Luhwcn_loop:
@@ -2437,7 +2525,9 @@ dl_tie728_s8_unaligned_conv2d_hwcn:
             dl_tie728_s8_unaligned_store0 q0, a2, a14
 
             addi a7, a7, -1
-        bnez a7, .Luhwcn_loop
+        beqz a7, 735f
+        j .Luhwcn_loop
+735:
         j .Luhwcn_loop_end
 
     # output sar_byte == 0
@@ -2455,7 +2545,9 @@ dl_tie728_s8_unaligned_conv2d_hwcn:
             EE.VST.128.IP q0, a2, 16
 
             addi a7, a7, -1
-        bnez a7, .Luhwcn_loop0
+        beqz a7, 736f
+        j .Luhwcn_loop0
+736:
         j .Luhwcn_loop_end
 
     # output sar_byte == 8
@@ -2474,7 +2566,9 @@ dl_tie728_s8_unaligned_conv2d_hwcn:
             dl_tie728_s8_unaligned_store1 q0, a2
 
             addi a7, a7, -1
-        bnez a7, .Luhwcn_loop8
+        beqz a7, 737f
+        j .Luhwcn_loop8
+737:
         j .Luhwcn_loop_end
 
 
@@ -2483,8 +2577,12 @@ dl_tie728_s8_unaligned_conv2d_hwcn:
 
         EE.LD.128.USAR.IP q1, a2, 0  # output sar_byte
         rur.sar_byte a12
-        beqi a12, 0, .Luhwcn_act_loop0
-        beqi a12, 8, .Luhwcn_act_loop8
+        bnez a12, 748f
+        j .Luhwcn_act_loop0
+748:
+        bnei a12, 8, 738f
+        j .Luhwcn_act_loop8
+738:
 
     # output sar_byte != 0 && != 8
         .Luhwcn_act_loop:
@@ -2504,7 +2602,9 @@ dl_tie728_s8_unaligned_conv2d_hwcn:
             dl_tie728_s8_unaligned_store0 q0, a2, a11
 
             addi a7, a7, -1
-        bnez a7, .Luhwcn_act_loop
+        beqz a7, 739f
+        j .Luhwcn_act_loop
+739:
         j .Luhwcn_loop_end
 
     # output sar_byte == 0
@@ -2524,7 +2624,9 @@ dl_tie728_s8_unaligned_conv2d_hwcn:
             EE.VST.128.IP q0, a2, 16
 
             addi a7, a7, -1
-        bnez a7, .Luhwcn_act_loop0
+        beqz a7, 740f
+        j .Luhwcn_act_loop0
+740:
         j .Luhwcn_loop_end
 
     # output sar_byte == 8
@@ -2545,7 +2647,9 @@ dl_tie728_s8_unaligned_conv2d_hwcn:
             dl_tie728_s8_unaligned_store1 q0, a2
 
             addi a7, a7, -1
-        bnez a7, .Luhwcn_act_loop8
+        beqz a7, 741f
+        j .Luhwcn_act_loop8
+741:
         j .Luhwcn_loop_end
 
 .Luhwcn_loop_end:
@@ -2612,3 +2716,6 @@ dl_tie728_s8_unaligned_conv2d_hwcn:
 .Luhwcn_end:
 
     retw
+
+
+

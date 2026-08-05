@@ -87,7 +87,7 @@ dl_tie728_s8_unaligned_max_pool2d_22c1:
     add a8, a3, a5
     add a9, a8, a6
 
-    blti a11, 0, dl_tie728_s8_unaligned_max_pool2d_22c1_remainder #channel < 16
+    bltz a11, dl_tie728_s8_unaligned_max_pool2d_22c1_remainder #channel < 16
 
     EE.LD.128.USAR.IP q6, a2, 0 #get output_ptr sar_byte
     rur.sar_byte a15
@@ -95,7 +95,7 @@ dl_tie728_s8_unaligned_max_pool2d_22c1:
     EE.LD.128.USAR.IP q0, a3, 16
     EE.LD.128.USAR.IP q1, a3, 0
 
-    beqi a15, 0, 1f
+    beqz a15, 1f
     beqi a15, 8, 2f
 
     loopgtz a11, 0f
@@ -267,7 +267,9 @@ dl_tie728_s8_max_pool2d_hwc1:
     srli a10, a9, 1
     addi a10, a10, -1   # filter_w / 2 - 1
 
-    beqi a9, 1, dl_tie728_s8_max_pool2d_h1c1 #filter_width == 1
+    bnei a9, 1, 800f
+    j dl_tie728_s8_max_pool2d_h1c1 #filter_width == 1
+800:
     blti a11, 1, dl_tie728_s8_max_pool2d_hw_small_channel
     5:
         mov a7, a3
@@ -355,8 +357,12 @@ dl_tie728_s8_unaligned_max_pool2d_hwc1:
 
     addi a11, a11, 1
 
-    beqi a9, 1, dl_tie728_s8_unaligned_max_pool2d_h1c1 #filter_width == 1
-    blti a11, 1, dl_tie728_s8_unaligned_max_pool2d_hw_remainder
+    bnei a9, 1, 801f
+    j dl_tie728_s8_unaligned_max_pool2d_h1c1 #filter_width == 1
+801:
+    bgei a11, 1, 802f
+    j dl_tie728_s8_unaligned_max_pool2d_hw_remainder
+802:
 
     9:
         mov a7, a3
@@ -408,7 +414,7 @@ dl_tie728_s8_unaligned_max_pool2d_hwc1:
             mov a13, a7
         bnez a14, 4b
 
-        beqi a15, 0, 5f
+        beqz a15, 5f
         beqi a15, 8, 6f
 
         dl_tie728_s8_unaligned_store0 q7, a2, a14
@@ -473,7 +479,7 @@ dl_tie728_s8_unaligned_max_pool2d_h1c1:
             EE.VMAX.S8 q7, q7, q0
         0:
 
-        beqi a15, 0, 1f
+        beqz a15, 1f
         beqi a15, 8, 2f
 
         dl_tie728_s8_unaligned_store0 q7, a2, a14
@@ -512,3 +518,4 @@ dl_tie728_s8_unaligned_max_pool2d_h1_remainder:
 
 dl_tie728_s8_unaligned_max_pool2d_h1_remainder_end:
     retw
+

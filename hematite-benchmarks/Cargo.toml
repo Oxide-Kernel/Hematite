@@ -27,6 +27,12 @@ hematite-s3 = { path = "../hematite-s3" }
 # `GeneratedModel` trait in `src/model_bench.rs`. T5.2 adds the macro wiring
 # (one `#[model("models/x.tflite")]` annotation per zoo model).
 [target.'cfg(target_arch = "xtensa")'.dependencies]
-esp-hal = { workspace = true, features = ["esp32s3", "defmt"] }
+# `unstable` is required for `esp_hal::psram` (the module and the
+# `Peripherals::PSRAM` field are `unstable_module!`/`create_peripheral!`-gated
+# in esp-hal 1.1.1). The bench PSRAM arena is backed by the runtime-mapped
+# PSRAM region via `Psram::new` + `raw_parts` — esp-hal 1.1.1 has NO static
+# `.dram1.psram` linker section (that's an esp-idf concept), so a static arena
+# cannot be linked.
+esp-hal = { workspace = true, features = ["esp32s3", "defmt", "unstable"] }
 defmt = { workspace = true }
 defmt-rtt = "0.4"

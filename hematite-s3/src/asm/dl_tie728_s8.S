@@ -45,7 +45,9 @@
 .macro dl_tie728_s8_store_remainder output_v, tmp_a0, tmp_a1, tmp_a2, tmp_a3, output_ptr, remainder_c
     EE.MOVI.32.A \output_v, \tmp_a0, 0
 615: # remainder_c == 15, 0x1111
-    bbci \remainder_c, 3, 607f
+    bbsi \remainder_c, 3, 700f
+    j 607f
+700:
     EE.MOVI.32.A \output_v, \tmp_a1, 1
     bbci \remainder_c, 2, 611f
     EE.MOVI.32.A \output_v, \tmp_a2, 2
@@ -228,19 +230,23 @@
     movi \tmp, 20
     EE.SRCMB.S16.QACC \tmp_q1, \tmp, 0 # \tmp_q1: even 16 bit
 
-    l16si \tmp, a1, 5 #re-arrange qacc odd 16 bit
+    addi \tmp, a1, 5
+    l16si \tmp, \tmp, 0 #re-arrange qacc odd 16 bit
     s16i \tmp, a1, 2
     l16si \tmp, a1, 10
     s16i \tmp, a1, 4
-    l16si \tmp, a1, 15
+    addi \tmp, a1, 15
+    l16si \tmp, \tmp, 0
     s16i \tmp, a1, 6
     l16si \tmp, a1, 32
     s16i \tmp, a1, 8
-    l16si \tmp, a1, 37
+    addi \tmp, a1, 37
+    l16si \tmp, \tmp, 0
     s16i \tmp, a1, 10
     l16si \tmp, a1, 42
     s16i \tmp, a1, 12
-    l16si \tmp, a1, 47
+    addi \tmp, a1, 47
+    l16si \tmp, \tmp, 0
     s16i \tmp, a1, 14
 
     EE.VLD.128.IP \output_v, a1, 0 # \output_v: odd 16 bit
@@ -279,19 +285,23 @@
     movi \tmp, 20
     EE.SRCMB.S16.QACC \tmp_q1, \tmp, 0 # \tmp_q1: even 16 bit
 
-    l16si \tmp, a1, 5 #re-arrange qacc odd 16 bit
+    addi \tmp, a1, 5
+    l16si \tmp, \tmp, 0 #re-arrange qacc odd 16 bit
     s16i \tmp, a1, 2
     l16si \tmp, a1, 10
     s16i \tmp, a1, 4
-    l16si \tmp, a1, 15
+    addi \tmp, a1, 15
+    l16si \tmp, \tmp, 0
     s16i \tmp, a1, 6
     l16si \tmp, a1, 32
     s16i \tmp, a1, 8
-    l16si \tmp, a1, 37
+    addi \tmp, a1, 37
+    l16si \tmp, \tmp, 0
     s16i \tmp, a1, 10
     l16si \tmp, a1, 42
     s16i \tmp, a1, 12
-    l16si \tmp, a1, 47
+    addi \tmp, a1, 47
+    l16si \tmp, \tmp, 0
     s16i \tmp, a1, 14
 
     EE.VLD.128.IP \output_v, a1, 0 # \output_v: odd 16 bit
@@ -431,11 +441,19 @@
 
 .macro tie728_s8_conv2d_1_1_unaligned_c_result operation_type output_v mac_shift bias_ptr activation_alpha activation_shift tmp tmp_q1 tmp_q2
 
-    bbci \operation_type, 3, 7f
-    bbci \operation_type, 2, 11f
+    bbsi \operation_type, 3, 701f
+    j 7f
+701:
+    bbsi \operation_type, 2, 702f
+    j 11f
+702:
 11:  # per_channel bias + prelu, 0x1011
-    bbci \operation_type, 1, 9f
-    bbci \operation_type, 0, 10f
+    bbsi \operation_type, 1, 703f
+    j 9f
+703:
+    bbsi \operation_type, 0, 704f
+    j 10f
+704:
 
     # tie728_s8_conv2d_per_channel_result \output_v, \tmp_q2, \mac_shift, \tmp, \tmp_q1
     # tie728_s8_conv2d_bias_prelu \output_v, \tmp_q1, \bias_ptr, \tmp_q2, \activation_alpha, \activation_shift
@@ -453,7 +471,9 @@
     j 16f  # jump to 16f
 
 9:  # per_channel bias, 0x1001
-    bbci \operation_type, 0, 8f
+    bbsi \operation_type, 0, 705f
+    j 8f
+705:
     # tie728_s8_conv2d_per_channel_result \output_v, \tmp_q2, \mac_shift, \tmp, \tmp_q1
     # tie728_s8_conv2d_bias \output_v, \tmp_q1, \bias_ptr
     tie728_s8_conv2d_per_channel_with_bias_result \output_v, \tmp_q2, \mac_shift, \bias_ptr, \tmp, \tmp_q1
@@ -466,9 +486,15 @@
     j 16f  # jump to 16f
 
 7: # per_channel no_bias + relu, 0x111
-    bbci \operation_type, 2, 3f
-    bbci \operation_type, 1, 5f
-    bbci \operation_type, 0, 6f
+    bbsi \operation_type, 2, 706f
+    j 3f
+706:
+    bbsi \operation_type, 1, 707f
+    j 5f
+707:
+    bbsi \operation_type, 0, 708f
+    j 6f
+708:
 
     tie728_s8_conv2d_per_channel_result \output_v, \tmp_q2, \mac_shift, \tmp, \tmp_q1
     tie728_s8_conv2d_relu \output_v, \activation_alpha, \activation_shift
@@ -531,3 +557,5 @@
     tie728_s8_vector_round_result \output_v, \mac_shift, \tmp, \tmp_q1
 16:
 .endm
+
+

@@ -99,13 +99,13 @@ dl_tie728_s8_unaligned_relu_11c:
     EE.LD.128.USAR.IP q5, a2, 0 #get output_ptr sar_byte
     rur.sar_byte a13
 
-    blti a5, 0, dl_tie718_s8_unaligned_relu_11c_small_remainder # channel < 16
+    bltz a5, dl_tie718_s8_unaligned_relu_11c_small_remainder # channel < 16
 
 
     EE.LD.128.USAR.IP q0, a3, 16
     EE.LD.128.USAR.IP q1, a3, 16
 
-    beqi a13, 0, dl_tie718_s8_unaligned_relu_11c_0
+    beqz a13, dl_tie718_s8_unaligned_relu_11c_0
     beqi a13, 8, dl_tie718_s8_unaligned_relu_11c_1
 
 

@@ -74,13 +74,16 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 /// SRAM bench arena (rows whose working set fits internal SRAM).
 static mut SRAM_ARENA: [u8; 256 * 1024] = [0u8; 256 * 1024];
 
-/// PSRAM bench arena (large MobileNetV2-style rows).
+/// PSRAM bench arena (large MobileNetV2-style rows) — runtime-mapped.
 ///
-/// BRING-UP: `.dram1.psram` is the ESP32-S3 PSRAM linker section used by
-/// esp-hal's memory.x; if the section name differs in the pinned esp-hal
-/// version the linker fails loudly and the section name is the one-line fix.
-#[link_section = ".dram1.psram"]
-static mut PSRAM_ARENA: [u8; 4 * 1024 * 1024] = [0u8; 4 * 1024 * 1024];
+/// esp-hal 1.1.1 has NO static `.dram1.psram` linker section (that's an
+/// esp-idf concept; esp-hal PSRAM is memory-mapped at runtime). The arena is a
+/// slice over the mapped PSRAM region returned by
+/// [`esp_hal::psram::Psram::raw_parts`], set once in [`run_benchmarks`].
+/// If no PSRAM is present at boot, `raw_parts` yields an empty slice and the
+/// PSRAM-tier benchmarks panic with "arena too small" — an honest runtime
+/// failure, never a fabricated measurement.
+static mut PSRAM_ARENA: &'static mut [u8] = &mut [];
 
 /// Stack-canary slot.  BRING-UP: extend the linker script so this section is
 /// placed at the top of the stack region for true overflow detection; without
@@ -159,7 +162,7 @@ fn bench_kernel(spec: &KernelSpec, clock: &mut RealClock, canary: &mut StackCana
     let arena = unsafe {
         match spec.tier {
             MemoryTier::Sram => &mut SRAM_ARENA[..],
-            MemoryTier::Psram => &mut PSRAM_ARENA[..],
+            MemoryTier::Psram => &mut **core::ptr::addr_of_mut!(PSRAM_ARENA),
         }
     };
     let mut bufs = match carve_into(arena, &lay) {
@@ -262,7 +265,21 @@ pub fn run_benchmarks() -> ! {
     // esp-hal 1.1 documented init (context7: `Config::default()
     // .with_cpu_clock(CpuClock::max())` + `esp_hal::init`).
     let config = Config::default().with_cpu_clock(CpuClock::max());
-    let _peripherals = esp_hal::init(config);
+    let peripherals = esp_hal::init(config);
+
+    // Map PSRAM at runtime and back the PSRAM-tier bench arena with the
+    // mapped region (esp-hal 1.1.1 has no static `.dram1.psram` section).
+    let psram = esp_hal::psram::Psram::new(
+        peripherals.PSRAM,
+        esp_hal::psram::PsramConfig::default(),
+    );
+    let (psram_ptr, psram_len) = psram.raw_parts();
+    // SAFETY: single-threaded firmware; PSRAM stays mapped for program
+    // lifetime (psram is held in scope). The slice is only used as a scratch
+    // arena, never aliased.
+    unsafe {
+        PSRAM_ARENA = core::slice::from_raw_parts_mut(psram_ptr, psram_len);
+    }
 
     // 1. Boot-profile guardrail — panic on any drift from the locked profile.
     let profile = read_boot_profile();

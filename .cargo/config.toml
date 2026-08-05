@@ -15,6 +15,21 @@
 
 [target.xtensa-esp32s3-none-elf]
 runner = "espflash flash --monitor"
+# esp-hal 1.1.x binary-crate linker integration (canonical esp-hal template):
+#  - `-Wl,-Tlinkall.x`: esp-hal's linker script (INCLUDEs memory.x/alias.x/esp32s3.x/
+#    hal-defaults.x; via esp-hal build.rs OUT_DIR on the link-search path). Defines the
+#    memory regions and `_stack_start_cpu0`/`_stack_end_cpu0`/`__stack_chk_guard`
+#    (ld/sections/stack.x) — without it the binary link fails with undefined stack symbols.
+#  - `-Tdefmt.x`: defmt's linker script (emitted by defmt 1.1.1 build.rs). PROVIDEs
+#    `_defmt_panic` and places the defmt log sections.
+#  - `-nostartfiles`: don't link the C runtime startup — xtensa-lx-rt provides the
+#    reset/vector table instead (its build.rs emits link.x; the `rt` feature of esp-hal
+#    pulls xtensa-lx-rt, default-enabled).
+rustflags = [
+  "-C", "link-arg=-Wl,-Tlinkall.x",
+  "-C", "link-arg=-Tdefmt.x",
+  "-C", "link-arg=-nostartfiles",
+]
 
 [alias]
 xtensa-check = "check -Zbuild-std=core,alloc --target xtensa-esp32s3-none-elf"

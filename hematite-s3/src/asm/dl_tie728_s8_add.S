@@ -185,7 +185,9 @@ dl_tie728_s8_add_w1_16_w2_16_unaligned:
 
     beqz a7, dl_tie728_s8_add_w1_16_w2_16_unaligned_128b
     movi a14, 8
-    beq a7, a14, dl_tie728_s8_add_w1_16_w2_16_unaligned_64b
+    bne a7, a14, 700f
+    j dl_tie728_s8_add_w1_16_w2_16_unaligned_64b
+700:
 
         mov  a14, a6
         beqz a14, 1f
@@ -476,3 +478,4 @@ dl_tie728_s8_add_w1_1_w2_16_unaligned:
     dl_tie728_s8_add_w1_1_w2_16_unaligned_end:
         addi a4, a4, -16
     retw
+

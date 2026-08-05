@@ -1,0 +1,6 @@
+# Build artifacts — not committed
+*.o
+*.elf
+*.bin
+serial.log
+qemu-stdout.log
