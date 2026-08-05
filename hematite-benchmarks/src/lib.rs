@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Hematite Contributors.
+//
+//! hematite-benchmarks — ESP32-S3 hardware benchmark suite (plan T5.3 / T5.3a).
+//!
+//! Crate layout (Phase 3 cfg-gating convention — device code is gated behind
+//! `cfg(target_arch = "xtensa")`, everything else is host-compilable and
+//! host-tested):
+//!
+//! * [`timing`] — CCOUNT/wall-clock timing methodology (warm-up, N ≥ 10,
+//!   min + median, integer-only conversions).
+//! * [`spec`] — per-kernel benchmark table (ember-esp-nn + ESP-DL/MobileNetV2
+//!   shapes), buffer layouts, and the s3 dispatch (the real public ABI).
+//! * [`model_bench`] — model-level benchmark registry + harness (model path
+//!   is a parameter; zoo `.tflite` files land with T5.2).
+//! * [`report`] — three-column raw format (cycles / ms@240 MHz / wall-ms),
+//!   three speedup columns, SRAM/PSRAM tier labels, reference bars.
+//! * [`guardrails`] — C3 methodology guardrails (boot profile, CCOUNT
+//!   calibration, stack canary, watchdog policy) — pure, host-tested logic.
+//! * [`firmware`] — device-only ESP32-S3 firmware (esp-hal + defmt/RTT).
+
+#![cfg_attr(target_arch = "xtensa", no_std)]
+
+pub mod guardrails;
+pub mod model_bench;
+pub mod report;
+pub mod spec;
+pub mod timing;
+
+#[cfg(target_arch = "xtensa")]
+pub mod firmware;

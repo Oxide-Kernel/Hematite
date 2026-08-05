@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# hematite-core is needed by the per-op integration tests to build the
+# op_params structs and to bring the KernelBackend trait methods into scope
+# when calling through RefBackend (T5.1).
+hematite-core = { path = "../hematite-core" }
 hematite-ref = { path = "../hematite-ref" }
 hematite-codegen = { path = "../hematite-codegen" }
 hematite-s3 = { path = "../hematite-s3", optional = true }

@@ -198,6 +198,74 @@ impl FixtureWriter {
         std::fs::write(&path, buf).expect("write fixture");
         println!("  Wrote {}", path.display());
     }
+
+    /// Write a per-model golden fixture captured from an executed TFLite
+    /// interpreter (ai-edge-litert) via `zoo/run_model.py`.
+    ///
+    /// Unlike op fixtures, model fixtures carry REAL executed-TFLite
+    /// provenance: the output was captured by running the model, not by
+    /// tool-internal reimplementation. Emitted under `goldens/models/`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_model(
+        &mut self,
+        name: &str,
+        input_shape: &[i32],
+        output_shape: &[i32],
+        input_data: &[i8],
+        expected_output: &[i8],
+        runtime_version: &str,
+        model_rel_path: &str,
+    ) {
+        let mut buf = String::with_capacity(16384);
+        buf.push_str(SPDX_HEADER);
+        buf.push('\n');
+        buf.push_str(&format!(
+            "// ═══════════════════════════════════════════════════════════════\n\
+             // CAPTURED FROM EXECUTED TFLITE — REAL MODEL OUTPUT\n\
+             //\n\
+             // This fixture is a per-model golden: INPUT_DATA was run through\n\
+             // the model {model_rel_path} via the TFLite interpreter\n\
+             // (ai-edge-litert {runtime_version}), and EXPECTED_OUTPUT is the\n\
+             // exact int8 output captured from that execution. This is NOT the\n\
+             // tool-internal reimplementation path used by per-op fixtures.\n\
+             // ═══════════════════════════════════════════════════════════════\n\n"
+        ));
+
+        buf.push_str(&format!(
+            "/// TFLite Micro pin that defines this golden corpus.\n\
+             pub const GOLDEN_TFLM_VERSION: &str = \"{TFLM_VERSION}\";\n\n"
+        ));
+        buf.push_str(&format!(
+            "/// Interpreter that produced these values.\n\
+             pub const GOLDEN_RUNTIME_VERSION: &str = \"{runtime_version}\";\n\n"
+        ));
+        buf.push_str(
+            "/// Provenance: captured from an executed TFLite interpreter.\n\
+             pub const GOLDEN_PROVENANCE: &str = \"captured-from-executed-TFLite-interpreter; see tools/generate_goldens/zoo/run_model.py\";\n\n"
+        );
+
+        buf.push_str(&format!(
+            "/// Path to the model relative to the workspace root.\n\
+             pub const MODEL_PATH: &str = \"{model_rel_path}\";\n\n"
+        ));
+        buf.push_str(&format!(
+            "pub const INPUT_SHAPE: [i32; {}] = {:?};\n",
+            input_shape.len(), input_shape
+        ));
+        buf.push_str(&format!(
+            "pub const OUTPUT_SHAPE: [i32; {}] = {:?};\n\n",
+            output_shape.len(), output_shape
+        ));
+
+        emit_const_array(&mut buf, "INPUT_DATA", "i8", input_data);
+        emit_const_array(&mut buf, "EXPECTED_OUTPUT", "i8", expected_output);
+
+        let dir = self.output_dir.join("models");
+        std::fs::create_dir_all(&dir).expect("create goldens/models dir");
+        let path = dir.join(format!("{name}.rs"));
+        std::fs::write(&path, buf).expect("write model fixture");
+        println!("  Wrote {}", path.display());
+    }
 }
 
 pub fn emit_const_array<T: std::fmt::Display>(buf: &mut String, name: &str, ty: &str, data: &[T]) {

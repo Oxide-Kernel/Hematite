@@ -38,6 +38,11 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --locked
 
+      - name: cargo test (hematite-s3 feature)
+        # T5.1 QA: the per-op test crate must also pass with the s3 backend
+        # feature enabled (host-compilable s3 scalar kernels vs goldens).
+        run: cargo test -p hematite-tests --features hematite-s3 --locked
+
       - name: Install cargo-vet
         uses: taiki-e/install-action@v2.84.0
         with:

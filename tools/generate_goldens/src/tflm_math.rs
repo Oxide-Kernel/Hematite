@@ -492,9 +492,170 @@ pub fn tanh_i16_q011(x_q526: i32) -> i16 {
     (i32::from(sig_2x) * 2 - 2048) as i16
 }
 
+// ── gemmlowp scalar masks (used by logistic/tanh activation paths) ──────────
+
+/// gemmlowp `MaskIfGreaterThan(a, b)` for scalar i32 — all-ones if `a > b`, else 0.
+#[inline]
+fn mask_if_greater_than(a: i32, b: i32) -> i32 {
+    if a > b { -1 } else { 0 }
+}
+
+/// gemmlowp `MaskIfLessThan(a, b)` for scalar i32 — all-ones if `a < b`, else 0.
+#[inline]
+fn mask_if_less_than(a: i32, b: i32) -> i32 {
+    if a < b { -1 } else { 0 }
+}
+
+/// gemmlowp `MaskIfZero(a)` for scalar i32 — all-ones if `a == 0`, else 0.
+#[inline]
+fn mask_if_zero(a: i32) -> i32 {
+    if a == 0 { -1 } else { 0 }
+}
+
+/// gemmlowp `SelectUsingMask(mask, then, else)` — `(mask & then) | (~mask & else)`.
+#[inline]
+fn select_using_mask(mask: i32, then_val: i32, else_val: i32) -> i32 {
+    (mask & then_val) | (!mask & else_val)
+}
+
+/// gemmlowp `one_minus_x_over_one_plus_x_for_x_in_0_1` — (1-x)/(1+x) for x in [0, 1).
+///
+/// Input `a` is Q0.31 in [0, i32::MAX]. Returns (1-a)/(1+a) as Q0.31.
+/// Mirrors `gemmlowp/fixedpoint/fixedpoint.h` exactly: identical Newton-Raphson
+/// loop to [`one_over_one_plus_x_for_x_in_0_1`], but the final rescale is
+/// `Rescale<0>(x - F2::One())` (left-shift by 2 after subtracting 1<<29)
+/// instead of `Rescale<0>(ExactMulByPot<-1>(x))`.
+pub fn one_minus_x_over_one_plus_x_for_x_in_0_1(a: i32) -> i32 {
+    let half_denom_q031 = rounding_half_sum(a, i32::MAX);
+
+    const C48_OVER_17: i32 = 1515870810;
+    const CNEG32_OVER_17: i32 = -1010580540;
+    const ONE_Q229: i32 = 1i32 << 29;
+
+    let term = saturating_rounding_doubling_high_mul(half_denom_q031, CNEG32_OVER_17);
+    let mut x: i32 = C48_OVER_17.wrapping_add(term);
+
+    for _ in 0..3 {
+        let hd_x = saturating_rounding_doubling_high_mul(half_denom_q031, x);
+        let one_minus_hd_x = ONE_Q229.wrapping_sub(hd_x);
+        let correction = saturating_rounding_doubling_high_mul(x, one_minus_hd_x);
+        x = x.wrapping_add(saturating_rounding_left_shift(correction, 2));
+    }
+
+    // Rescale<0>(x - F2::One()): subtract 1<<29 (Q2.29 1.0), then
+    // SaturatingRoundingMultiplyByPOT<2> → left shift by 2.
+    saturating_rounding_left_shift(x.wrapping_sub(ONE_Q229), 2)
+}
+
+/// gemmlowp `logistic` on a Q4.27 input — returns sigmoid(x) as Q0.31.
+///
+/// Mirrors `gemmlowp::logistic(FixedPoint<int32_t, 4>)` (the int8 activation
+/// path used by `reference_integer_ops::Logistic` at the pinned SHA):
+/// mask-and-select on sign, exp via `exp_on_negative_values(-|x|, 4)`, then
+/// `1/(1+exp)` (Newton-Raphson) or its mirror, with the `x == 0 → 0.5` special
+/// case.
+pub fn logistic_q4_27(input_q427: i32) -> i32 {
+    let mask_if_positive = mask_if_greater_than(input_q427, 0);
+    let mask_if_zero = mask_if_zero(input_q427);
+    let abs_input = select_using_mask(mask_if_positive, input_q427, -input_q427);
+
+    // logistic_on_positive_values(abs) = 1/(1+exp(-abs))
+    let result_if_positive =
+        one_over_one_plus_x_for_x_in_0_1(exp_on_negative_values(-abs_input, 4));
+
+    // ResultF::One() for Q0.31 = ScalarRawMax = i32::MAX
+    let result_if_negative = i32::MAX.wrapping_sub(result_if_positive);
+
+    // one_half = 0.5 in Q0.31
+    let one_half = 1i32 << 30;
+
+    select_using_mask(
+        mask_if_zero,
+        one_half,
+        select_using_mask(mask_if_positive, result_if_positive, result_if_negative),
+    )
+}
+
+/// gemmlowp `tanh` on a Q4.27 input — returns tanh(x) as Q0.31.
+///
+/// Mirrors `gemmlowp::tanh(FixedPoint<int32_t, 4>)` (the int8 activation path
+/// used by `reference_integer_ops::Tanh` at the pinned SHA): uses the identity
+/// `tanh(x) = (1 - exp(-2x)) / (1 + exp(-2x))` via
+/// `one_minus_x_over_one_plus_x(exp_on_negative_values(2·|x|))`.
+pub fn tanh_q4_27(input_q427: i32) -> i32 {
+    let mask_if_negative = mask_if_less_than(input_q427, 0);
+    let mask_if_zero = mask_if_zero(input_q427);
+    let n = select_using_mask(mask_if_negative, input_q427, -input_q427);
+
+    // ExactMulByPot<1> on Q4.27 → Q5.26 (same raw, value doubled) →
+    // exp_on_negative_values with integer_bits=5.
+    let t = one_minus_x_over_one_plus_x_for_x_in_0_1(exp_on_negative_values(n, 5));
+
+    select_using_mask(
+        mask_if_zero,
+        0,
+        select_using_mask(mask_if_negative, -t, t),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_one_minus_x_over_one_plus_x_landmarks() {
+        // (1-x)/(1+x): x=0 → 1.0 (Q0.31 ≈ i32::MAX); x=1/3 → 0.5; x=1 → 0
+        let f = one_minus_x_over_one_plus_x_for_x_in_0_1;
+        // x = 0 → 1.0
+        let r0 = f(0);
+        assert!((r0 as i64 - i32::MAX as i64).abs() < 4096,
+            "1/(1) should be ~1.0, got {r0}");
+        // x = 1/3 → (2/3)/(4/3) = 0.5 → 1<<30
+        let x_third = (i32::MAX as f64 / 3.0) as i32;
+        let r1 = f(x_third);
+        assert!((r1 - (1i32 << 30)).abs() < 4096,
+            "(1-1/3)/(1+1/3)=0.5, got {r1}");
+        // x ≈ 1 → ~0
+        let x_near_one = i32::MAX - 1;
+        let r2 = f(x_near_one);
+        assert!((r2 as i64).abs() < 4096, "near-1 input → ~0, got {r2}");
+    }
+
+    #[test]
+    fn test_logistic_q4_27_matches_f64() {
+        // Q4.27 raw → real value = raw / 2^27. Compare against f64 sigmoid.
+        for raw in [-3i64 << 27, -2 << 27, -1 << 27, -1 << 25, -1 << 23, 0,
+                    1 << 23, 1 << 25, 1 << 27, 2 << 27, 3 << 27] {
+            let real = raw as f64 / (1u64 << 27) as f64;
+            let expect = 1.0 / (1.0 + f64::exp(-real));
+            let got = logistic_q4_27(raw as i32) as f64 / (1u64 << 31) as f64;
+            assert!((got - expect).abs() < 1e-3,
+                "logistic({real}) = {got}, expected {expect}");
+        }
+    }
+
+    #[test]
+    fn test_logistic_q4_27_zero_is_half() {
+        // logistic(0) = 0.5 exactly → 1<<30 in Q0.31
+        assert_eq!(logistic_q4_27(0), 1i32 << 30);
+    }
+
+    #[test]
+    fn test_tanh_q4_27_matches_f64() {
+        for raw in [-3i64 << 27, -2 << 27, -1 << 27, -1 << 25, -1 << 23, 0,
+                    1 << 23, 1 << 25, 1 << 27, 2 << 27, 3 << 27] {
+            let real = raw as f64 / (1u64 << 27) as f64;
+            let expect = f64::tanh(real);
+            let got = tanh_q4_27(raw as i32) as f64 / (1u64 << 31) as f64;
+            assert!((got - expect).abs() < 1e-3,
+                "tanh({real}) = {got}, expected {expect}");
+        }
+    }
+
+    #[test]
+    fn test_tanh_q4_27_zero_is_zero() {
+        assert_eq!(tanh_q4_27(0), 0);
+    }
 
     #[test]
     fn test_quantize_multiplier_exact_half() {

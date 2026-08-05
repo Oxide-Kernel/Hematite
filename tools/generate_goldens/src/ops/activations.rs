@@ -243,3 +243,112 @@ pub fn generate_prelu(w: &mut FixtureWriter) {
     std::fs::write(&path, buf).expect("write fixture");
     println!("  Wrote {}", path.display());
 }
+
+/// Sigmoid (int8): TFLM `reference_integer_ops::Logistic` path.
+///
+/// Algorithm (pinned SHA `tensorflow/lite/kernels/internal/reference/integer_ops/logistic.h`):
+/// 1. `input = input_data[i] - input_zero_point`
+/// 2. Saturing: `input <= -input_range_radius → -128`, `input >= input_range_radius → 127`
+/// 3. `input_in_q4 = MultiplyByQuantizedMultiplier(input, input_multiplier, input_left_shift)`
+///    — converts to Q4.27 fixed-point.
+/// 4. `output_in_q0 = gemmlowp::logistic(FixedPoint4::FromRaw(input_in_q4)).raw()` — Q0.31.
+/// 5. `output_in_q23 = RoundingDivideByPOT(output_in_q0, 31 - 8)` — rescale (kOutputIntegerBits=8).
+/// 6. `output = clamp(output_in_q23 + kOutputZeroPoint(-128), -128, 127)`.
+///
+/// Quantization params chosen to match a TFLite int8 LOGISTIC node with
+/// input_scale = 1/16 (covers the Q4.27 ±8 real range in int8 [-128,127]):
+/// - input_real_multiplier = input_scale · 2^(31-4) = 2^23
+/// - frexp(2^23) → (0.5, 24) → input_multiplier = round(0.5·2^31) = 2^30, input_left_shift = 24
+/// - input_range_radius = floor(15 · 2^27 / 2^24) = 120
+pub fn generate_sigmoid(w: &mut FixtureWriter) {
+    let input_shape = [1i32, 1, 1, 11];
+    let output_shape = [1i32, 1, 1, 11];
+
+    let input_scale = 1.0f64 / 16.0;
+    // input_real_multiplier = input_scale * 2^(31-4) = 2^23
+    let input_real_multiplier = input_scale * ((1i64 << 27) as f64);
+    let (input_multiplier, input_left_shift) = tflm_math::quantize_multiplier(input_real_multiplier);
+    // CalculateInputRadius(4, input_left_shift, 31) = floor(15 * 2^27 / 2^shift)
+    let input_range_radius =
+        ((15i64 * (1i64 << 27)) >> input_left_shift) as i32;
+
+    let input_zero_point: i32 = 0;
+    let output_zero_point: i32 = -128; // kOutputZeroPoint = int8::min
+
+    // Real values: ±7.5, ±5, ±2.5, ±1.25, ±0.625, 0 (scale 1/16)
+    let input: Vec<i8> = vec![-120, -80, -40, -20, -10, 0, 10, 20, 40, 80, 120];
+
+    let output: Vec<i8> = input.iter().map(|&x| {
+        let input_val = i32::from(x) - input_zero_point;
+        if input_val <= -input_range_radius {
+            return -128i8;
+        }
+        if input_val >= input_range_radius {
+            return 127i8;
+        }
+        let input_in_q4 = tflm_math::multiply_by_quantized_multiplier(
+            input_val, input_multiplier, input_left_shift);
+        let output_in_q0 = tflm_math::logistic_q4_27(input_in_q4);
+        let output_in_q23 = tflm_math::rounding_divide_by_pot(output_in_q0, 31 - 8);
+        (output_in_q23 + output_zero_point).clamp(-128, 127) as i8
+    }).collect();
+
+    w.write_simple("sigmoid", &input_shape, &output_shape, &input, &output,
+        &[("input_offset", input_zero_point),
+          ("output_offset", output_zero_point),
+          ("input_multiplier", input_multiplier),
+          ("input_left_shift", input_left_shift),
+          ("input_range_radius", input_range_radius)],
+        "// Sigmoid: TFLM reference_integer_ops::Logistic — gemmlowp logistic on Q4.27 input, RoundingDivideByPOT(31-8), zero_point=-128.");
+}
+
+/// Tanh (int8): TFLM `reference_integer_ops::Tanh` path.
+///
+/// Algorithm (pinned SHA `tensorflow/lite/kernels/internal/reference/integer_ops/tanh.h`):
+/// 1. `input = input_data[i] - input_zero_point`
+/// 2. Saturing: `input <= -input_range_radius → -128`, `input >= input_range_radius → 127`
+/// 3. `input_in_q4 = MultiplyByQuantizedMultiplier(input, input_multiplier, input_shift)`
+///    — converts to Q4.27 fixed-point.
+/// 4. `output_in_q0 = gemmlowp::tanh(FixedPoint4::FromRaw(input_in_q4)).raw()` — Q0.31.
+/// 5. `output_in_q24 = RoundingDivideByPOT(output_in_q0, 31 - 7)` — rescale (kOutputScale=7).
+/// 6. `output = clamp(output_in_q24, -128, 127)` — NO zero-point offset for tanh.
+///
+/// Same quantization params as sigmoid (input_scale = 1/16 → multiplier 2^30,
+/// shift 24, radius 120).
+pub fn generate_tanh(w: &mut FixtureWriter) {
+    let input_shape = [1i32, 1, 1, 11];
+    let output_shape = [1i32, 1, 1, 11];
+
+    let input_scale = 1.0f64 / 16.0;
+    let input_real_multiplier = input_scale * ((1i64 << 27) as f64);
+    let (input_multiplier, input_left_shift) = tflm_math::quantize_multiplier(input_real_multiplier);
+    let input_range_radius =
+        ((15i64 * (1i64 << 27)) >> input_left_shift) as i32;
+
+    let input_zero_point: i32 = 0;
+
+    let input: Vec<i8> = vec![-120, -80, -40, -20, -10, 0, 10, 20, 40, 80, 120];
+
+    let output: Vec<i8> = input.iter().map(|&x| {
+        let input_val = i32::from(x) - input_zero_point;
+        if input_val <= -input_range_radius {
+            return -128i8;
+        }
+        if input_val >= input_range_radius {
+            return 127i8;
+        }
+        let input_in_q4 = tflm_math::multiply_by_quantized_multiplier(
+            input_val, input_multiplier, input_left_shift);
+        let output_in_q0 = tflm_math::tanh_q4_27(input_in_q4);
+        let output_in_q24 = tflm_math::rounding_divide_by_pot(output_in_q0, 31 - 7);
+        output_in_q24.clamp(-128, 127) as i8
+    }).collect();
+
+    w.write_simple("tanh", &input_shape, &output_shape, &input, &output,
+        &[("input_offset", input_zero_point),
+          ("output_offset", 0),
+          ("input_multiplier", input_multiplier),
+          ("input_left_shift", input_left_shift),
+          ("input_range_radius", input_range_radius)],
+        "// Tanh: TFLM reference_integer_ops::Tanh — gemmlowp tanh on Q4.27 input, RoundingDivideByPOT(31-7), no zero-point offset.");
+}

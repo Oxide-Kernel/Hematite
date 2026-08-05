@@ -3,13 +3,30 @@ name = "hematite-benchmarks"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "ESP32-S3 hardware benchmark suite: per-kernel + model-level CCOUNT benchmarks"
 
 [[bin]]
 name = "hematite-benchmarks"
 path = "src/main.rs"
 
 [dependencies]
+hematite-core = { path = "../hematite-core" }
+hematite-int8 = { path = "../hematite-int8" }
 hematite-ref = { path = "../hematite-ref" }
 hematite-s3 = { path = "../hematite-s3" }
-hematite-codegen = { path = "../hematite-codegen" }
-hematite-tests = { path = "../hematite-tests" }
+
+# Device-only dependencies (T5.3 / T5.3a — benchmark firmware on ESP32-S3).
+#
+# These are gated to the xtensa target so a host `cargo check --workspace`
+# / `cargo test --workspace` never compiles them (Phase 3 convention: device
+# code is cfg-gated and only structurally reviewed on host).
+#
+# The hematite-codegen dependency (the `#[model]` proc-macro) is deliberately
+# NOT yet linked: the zoo .tflite files arrive with T5.2, and the model-level
+# bench currently consumes the generated `Model<B>` API shape through the
+# `GeneratedModel` trait in `src/model_bench.rs`. T5.2 adds the macro wiring
+# (one `#[model("models/x.tflite")]` annotation per zoo model).
+[target.'cfg(target_arch = "xtensa")'.dependencies]
+esp-hal = { workspace = true, features = ["esp32s3", "defmt"] }
+defmt = { workspace = true }
+defmt-rtt = "0.4"

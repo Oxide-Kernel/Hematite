@@ -55,6 +55,7 @@ fn main() {
     ops::conv2d::generate_conv2d_3x3(&mut w);
     ops::depthwise_conv2d::generate(&mut w);
     ops::fully_connected::generate(&mut w);
+    ops::matmul::generate_matmul(&mut w);
 
     // ── T1 — Supporting ops ──
     println!("\n── T1: Pooling ──");
@@ -70,6 +71,8 @@ fn main() {
     ops::activations::generate_hard_swish(&mut w);
     ops::activations::generate_leaky_relu(&mut w);
     ops::activations::generate_prelu(&mut w);
+    ops::activations::generate_sigmoid(&mut w);
+    ops::activations::generate_tanh(&mut w);
 
     println!("\n── T1: Elementwise ──");
     ops::elementwise::generate_add(&mut w);
@@ -103,12 +106,19 @@ fn main() {
     ops::reductions::generate_argmax(&mut w);
     ops::reductions::generate_argmin(&mut w);
     ops::reductions::generate_l2_norm(&mut w);
+    ops::reductions::generate_reduce_max(&mut w);
+    ops::reductions::generate_reduce_min(&mut w);
+
+    // ── Model goldens (executed TFLite cross-check) ──
+    ops::zoo::generate_model_goldens(&mut w, &workspace_root);
 
     // ── Self-check ──
     println!("\n── Self-check ──");
     self_check_conv2d_1x1();
     self_check_mean();
     self_check_recurrent();
+    self_check_matmul();
+    self_check_sigmoid_tanh();
     guard_generated_fixtures(&goldens_dir);
 
     println!("\nDone. Generated {} fixture files in {}", count_files(&goldens_dir), goldens_dir.display());
@@ -200,8 +210,7 @@ fn self_check_mean() {
 
 /// Verify GRU sigmoid/tanh fixed-point landmarks: sigmoid(0)=0.5,
 /// tanh(0)=0, endpoints saturate; plus update-gate monotonicity.
-fn self_check_recurrent() {
-    use tflm_math::{logistic_i16_q011, tanh_i16_q011};
+fn self_check_recurrent() {    use tflm_math::{logistic_i16_q011, tanh_i16_q011};
 
     // logistic_i16_q011: sigmoid(x)·2^11 → i16 in [0, 2047] (0.0→0, 0.5→1024, 1.0→2047)
     // Input is in Q5.26: value / 2^26 = real value
@@ -237,6 +246,56 @@ fn self_check_recurrent() {
     println!("     sigmoid monotonicity verified");
 }
 
+/// Assert the matmul fixture against hand-computed values.
+fn self_check_matmul() {
+    use tflm_math::multiply_by_quantized_multiplier;
+
+    // A = [[-8,-7,-6,-5],[1,2,3,4]], B = [[1,2,-1],[-1,1,2],[2,-1,1],[1,1,-1]]
+    // Output (2×3), all offsets 0, multiplier = quantize_multiplier(0.5) = (2^30, 0).
+    let a: Vec<i8> = vec![-8, -7, -6, -5, 1, 2, 3, 4];
+    let b: Vec<i8> = vec![1, 2, -1, -1, 1, 2, 2, -1, 1, 1, 1, -1];
+
+    // out[0][0] = Σ a[0][k]·b[k][0] = (-8)(1)+(-7)(-1)+(-6)(2)+(-5)(1) = -8+7-12-5 = -18
+    let mut acc: i32 = 0;
+    for k in 0..4 {
+        acc += i32::from(a[k]) * i32::from(b[k * 3]);
+    }
+    assert_eq!(acc, -18, "matmul out[0][0] acc = -18, got {acc}");
+    // mbm(-18, 2^30, 0) = round-half-up(-18·0.5) = -9
+    assert_eq!(multiply_by_quantized_multiplier(acc, 1 << 30, 0), -9);
+
+    // out[1][1] = Σ a[1][k]·b[k][1] = (1)(2)+(2)(1)+(3)(-1)+(4)(1) = 2+2-3+4 = 5
+    let mut acc2: i32 = 0;
+    for k in 0..4 {
+        acc2 += i32::from(a[4 + k]) * i32::from(b[k * 3 + 1]);
+    }
+    assert_eq!(acc2, 5, "matmul out[1][1] acc = 5, got {acc2}");
+    assert_eq!(multiply_by_quantized_multiplier(acc2, 1 << 30, 0), 3);
+
+    println!("  ✅ matmul self-check passed:");
+    println!("     out[0][0]: acc=-18 → -9");
+    println!("     out[1][1]: acc=5 → 3");
+}
+
+/// Assert the sigmoid/tanh fixtures against f64 references.
+fn self_check_sigmoid_tanh() {
+    use tflm_math::{logistic_q4_27, tanh_q4_27};
+
+    // Q4.27 raw = real · 2^27.
+    let raw = 1i64 << 27; // real = 1.0
+    let sig = logistic_q4_27(raw as i32) as f64 / (1u64 << 31) as f64;
+    let expected_sig = 1.0 / (1.0 + std::f64::consts::E.powf(-1.0));
+    assert!((sig - expected_sig).abs() < 1e-3, "logistic(1.0) = {sig}, expected {expected_sig}");
+
+    let t = tanh_q4_27(raw as i32) as f64 / (1u64 << 31) as f64;
+    let expected_t = (std::f64::consts::E.powf(1.0) - std::f64::consts::E.powf(-1.0))
+        / (std::f64::consts::E.powf(1.0) + std::f64::consts::E.powf(-1.0));
+    assert!((t - expected_t).abs() < 1e-3, "tanh(1.0) = {t}, expected {expected_t}");
+
+    println!("  ✅ sigmoid/tanh self-check passed:");
+    println!("     logistic(1.0) ≈ {sig:.6}, tanh(1.0) ≈ {t:.6}");
+}
+
 fn find_workspace_root() -> PathBuf {
     // Walk up from current dir to find Cargo.toml with [workspace]
     let mut current = std::env::current_dir().expect("current dir");
@@ -263,27 +322,49 @@ fn count_files(dir: &PathBuf) -> usize {
 
 // ── Permanent guard pass: validate generated fixtures on disk ──
 
-fn guard_generated_fixtures(goldens_dir: &PathBuf) {
+fn guard_generated_fixtures(goldens_dir: &std::path::Path) {
     println!("  ── Fixture integrity guards ──");
-    for entry in std::fs::read_dir(goldens_dir).expect("read goldens dir") {
+    guard_fixture_dir(goldens_dir, "");
+}
+
+fn guard_fixture_dir(dir: &std::path::Path, prefix: &str) {
+    for entry in std::fs::read_dir(dir).expect("read goldens dir") {
         let entry = entry.expect("dir entry");
         let path = entry.path();
+        if path.is_dir() {
+            guard_fixture_dir(&path, &format!("{prefix}/{}", entry.file_name().to_string_lossy()));
+            continue;
+        }
         if path.extension().is_none_or(|e| e != "rs") {
             continue;
         }
         let content = std::fs::read_to_string(&path).expect("read fixture");
         let name = path.file_stem().unwrap().to_str().unwrap();
+        let label = format!("{prefix}/{name}");
+
+        // Guard Z (B3): GOLDEN_TFLM_VERSION must match the pinned SHA on
+        // every fixture — a drifted pin would silently produce a mismatched
+        // corpus and break the bit-exactness contract.
+        let pinned = format!("pub const GOLDEN_TFLM_VERSION: &str = \"{}\";", fixture::TFLM_VERSION);
+        assert!(content.contains(&pinned),
+            "FIXTURE GUARD FAILED: {label}.rs GOLDEN_TFLM_VERSION != pinned SHA {} — corpus pin drift",
+            fixture::TFLM_VERSION);
 
         // Guard A: every MULTIPLIER const must be > 0 (catches sign-bit overflow)
         for m in parse_multipliers(&content) {
-            assert!(m > 0, "FIXTURE GUARD FAILED: {name}.rs has a multiplier {m} ≤ 0 — sign-bit overflow like 1i32<<31");
+            assert!(m > 0, "FIXTURE GUARD FAILED: {label}.rs has a multiplier {m} ≤ 0 — sign-bit overflow like 1i32<<31");
         }
 
-        // Guard B: EXPECTED_OUTPUT must not be all zeros (catches degenerate oracles)
+        // Guard B: EXPECTED_OUTPUT must not be all zeros (catches degenerate
+        // synthetic oracles). EXEMPTION: model goldens under goldens/models/
+        // carry real captured interpreter output — an all-zero output is a
+        // legitimate runtime result, not a generator bug.
         let expected = parse_i8_array(&content, "EXPECTED_OUTPUT");
-        assert!(!expected.is_empty(), "FIXTURE GUARD FAILED: {name}.rs has no EXPECTED_OUTPUT");
+        assert!(!expected.is_empty(), "FIXTURE GUARD FAILED: {label}.rs has no EXPECTED_OUTPUT");
+        let is_model_golden = prefix.starts_with("/models");
         let all_zero = expected.iter().all(|&v| v == 0);
-        assert!(!all_zero, "FIXTURE GUARD FAILED: {name}.rs EXPECTED_OUTPUT is all zeros — degenerate oracle");
+        assert!(is_model_golden || !all_zero,
+            "FIXTURE GUARD FAILED: {label}.rs EXPECTED_OUTPUT is all zeros — degenerate oracle");
 
         // Guard C: op-specific invariants
         match name {
@@ -291,7 +372,7 @@ fn guard_generated_fixtures(goldens_dir: &PathBuf) {
                 let output_offset = parse_scalar_i32(&content, "OUTPUT_OFFSET").unwrap_or(0);
                 for (i, &v) in expected.iter().enumerate() {
                     assert!(i32::from(v) >= output_offset,
-                        "FIXTURE GUARD FAILED: {name}.rs output[{i}] = {v} < output_offset {output_offset}");
+                        "FIXTURE GUARD FAILED: {label}.rs output[{i}] = {v} < output_offset {output_offset}");
                 }
             }
             "relu6" => {
@@ -299,15 +380,15 @@ fn guard_generated_fixtures(goldens_dir: &PathBuf) {
                 let quantized_six = parse_scalar_i32(&content, "QUANTIZED_SIX").expect("relu6 QUANTIZED_SIX");
                 for (i, &v) in expected.iter().enumerate() {
                     assert!(i32::from(v) >= output_offset,
-                        "FIXTURE GUARD FAILED: {name}.rs output[{i}] = {v} < output_offset {output_offset}");
+                        "FIXTURE GUARD FAILED: {label}.rs output[{i}] = {v} < output_offset {output_offset}");
                     assert!(i32::from(v) <= quantized_six,
-                        "FIXTURE GUARD FAILED: {name}.rs output[{i}] = {v} > QUANTIZED_SIX {quantized_six}");
+                        "FIXTURE GUARD FAILED: {label}.rs output[{i}] = {v} > QUANTIZED_SIX {quantized_six}");
                 }
             }
             "leaky_relu" | "prelu" => {
                 let input_data = parse_i8_array(&content, "INPUT_DATA");
                 assert!(input_data.len() == expected.len(),
-                    "FIXTURE GUARD FAILED: {name}.rs INPUT_DATA/EXPECTED_OUTPUT length mismatch");
+                    "FIXTURE GUARD FAILED: {label}.rs INPUT_DATA/EXPECTED_OUTPUT length mismatch");
                 for i in 0..input_data.len() {
                     let inp = i32::from(input_data[i]);
                     let out = i32::from(expected[i]);
@@ -315,11 +396,11 @@ fn guard_generated_fixtures(goldens_dir: &PathBuf) {
                     // positive input → positive-or-zero output; zero is fine either way.
                     if inp > 0 {
                         assert!(out >= 0,
-                            "FIXTURE GUARD FAILED: {name}.rs input[{i}]={inp} > 0 but output[{i}]={out} < 0");
+                            "FIXTURE GUARD FAILED: {label}.rs input[{i}]={inp} > 0 but output[{i}]={out} < 0");
                     }
                     if inp < 0 {
                         assert!(out <= 0,
-                            "FIXTURE GUARD FAILED: {name}.rs input[{i}]={inp} < 0 but output[{i}]={out} > 0");
+                            "FIXTURE GUARD FAILED: {label}.rs input[{i}]={inp} < 0 but output[{i}]={out} > 0");
                     }
                 }
             }
@@ -380,7 +461,7 @@ fn guard_generated_fixtures(goldens_dir: &PathBuf) {
             _ => {}
         }
 
-        println!("  ✅ {name}.rs: multiplier>0 / output-non-zero / op-invariant passed");
+        println!("  ✅ {label}.rs: multiplier>0 / output-non-zero / op-invariant passed");
     }
 }
 

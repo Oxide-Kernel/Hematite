@@ -330,3 +330,75 @@ pub fn generate_l2_norm(w: &mut FixtureWriter) {
         extra_params,
     );
 }
+
+/// ReduceMax over axis.
+///
+/// Pure int8 comparison — no quantization, output scale/zp must equal input
+/// (TFLM `EvalMinMaxHelper` `TF_LITE_ENSURE_EQ` on scale and zp).
+/// Initial value = `lowest()` (-128); compare `(in > current) ? in : current`.
+/// Mirrors `MinMaxReducerCompare<int8_t>` in
+/// `tensorflow/lite/micro/kernels/reduce_common.cc` at the pinned SHA.
+pub fn generate_reduce_max(w: &mut FixtureWriter) {
+    let input_shape = [1i32, 2, 3, 1];
+    let output_shape = [1i32, 1, 3, 1];
+
+    let input: Vec<i8> = vec![
+        5, 1, 7,
+        -3, 9, -2,
+    ];
+
+    let input_w = 3i32;
+
+    let mut output: Vec<i8> = vec![0i8; 3];
+
+    for w_i in 0..input_w {
+        let idx = w_i as usize;
+        let mut current: i8 = i8::MIN;
+        for h in 0..2 {
+            let v = input[(h * input_w + w_i) as usize];
+            if v > current {
+                current = v;
+            }
+        }
+        output[idx] = current;
+    }
+
+    w.write_simple("reduce_max", &input_shape, &output_shape, &input, &output,
+        &[("AXIS_0", 1), ("AXIS_COUNT", 1)],
+        "// ReduceMax: max of elements along axis 1 (pure int8 comparison, no requantize)");
+}
+
+/// ReduceMin over axis.
+///
+/// Pure int8 comparison — no quantization. Initial value = `max()` (127);
+/// compare `(in < current) ? in : current`. Mirrors
+/// `MinMaxReducerCompare<int8_t>` in `reduce_common.cc` at the pinned SHA.
+pub fn generate_reduce_min(w: &mut FixtureWriter) {
+    let input_shape = [1i32, 2, 3, 1];
+    let output_shape = [1i32, 1, 3, 1];
+
+    let input: Vec<i8> = vec![
+        5, 1, 7,
+        -3, 9, -2,
+    ];
+
+    let input_w = 3i32;
+
+    let mut output: Vec<i8> = vec![0i8; 3];
+
+    for w_i in 0..input_w {
+        let idx = w_i as usize;
+        let mut current: i8 = i8::MAX;
+        for h in 0..2 {
+            let v = input[(h * input_w + w_i) as usize];
+            if v < current {
+                current = v;
+            }
+        }
+        output[idx] = current;
+    }
+
+    w.write_simple("reduce_min", &input_shape, &output_shape, &input, &output,
+        &[("AXIS_0", 1), ("AXIS_COUNT", 1)],
+        "// ReduceMin: min of elements along axis 1 (pure int8 comparison, no requantize)");
+}

@@ -13,3 +13,6 @@ pub mod elementwise;
 pub mod data_movement;
 pub mod reductions;
 pub mod recurrent;
+pub mod backend;
+
+pub use backend::RefBackend;

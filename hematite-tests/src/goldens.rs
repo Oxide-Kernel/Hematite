@@ -102,3 +102,66 @@ pub mod slice {
 pub mod resize_nearest_neighbor {
     include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../hematite-tests/goldens/resize_nearest_neighbor.rs"));
 }
+
+// T0 — MatMul (BatchMatMul reference path)
+pub mod matmul {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../hematite-tests/goldens/matmul.rs"));
+}
+
+// T1 — standalone activations added in T5.0
+pub mod sigmoid {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../hematite-tests/goldens/sigmoid.rs"));
+}
+
+pub mod tanh {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../hematite-tests/goldens/tanh.rs"));
+}
+
+// T3 — Recurrent
+pub mod lstm {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../hematite-tests/goldens/lstm.rs"));
+}
+
+pub mod svdf {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../hematite-tests/goldens/svdf.rs"));
+}
+
+pub mod gru {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../hematite-tests/goldens/gru.rs"));
+}
+
+// T4 — Reductions
+pub mod mean {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../hematite-tests/goldens/mean.rs"));
+}
+
+pub mod sum {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../hematite-tests/goldens/sum.rs"));
+}
+
+pub mod argmax {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../hematite-tests/goldens/argmax.rs"));
+}
+
+pub mod argmin {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../hematite-tests/goldens/argmin.rs"));
+}
+
+pub mod l2_norm {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../hematite-tests/goldens/l2_norm.rs"));
+}
+
+pub mod reduce_max {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../hematite-tests/goldens/reduce_max.rs"));
+}
+
+pub mod reduce_min {
+    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../hematite-tests/goldens/reduce_min.rs"));
+}
+
+// ── Model goldens (captured from executed TFLite interpreter) ──
+pub mod models {
+    pub mod sine {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../hematite-tests/goldens/models/sine.rs"));
+    }
+}

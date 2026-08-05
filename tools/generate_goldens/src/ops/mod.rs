@@ -1,6 +1,7 @@
 pub mod conv2d;
 pub mod depthwise_conv2d;
 pub mod fully_connected;
+pub mod matmul;
 pub mod pool;
 pub mod softmax;
 pub mod activations;
@@ -9,3 +10,4 @@ pub mod quantize;
 pub mod data_movement;
 pub mod reductions;
 pub mod recurrent;
+pub mod zoo;

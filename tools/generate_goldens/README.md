@@ -44,6 +44,9 @@ T5.0 must:
 tools/generate_goldens/
 ├── Cargo.toml        # Standalone workspace member
 ├── README.md         # This file
+├── zoo/
+│   ├── run_model.py      # Executed-TFLite model golden harness (ai-edge-litert)
+│   └── fetch_espdl.sh    # Downloads the 15 esp-dl .espdl zoo artifacts + SHA256
 └── src/
     ├── main.rs       # CLI entry point, self-check assertions
     ├── tflm_math.rs  # TFLM arithmetic primitives (MultiplyByQuantizedMultiplier, etc.)
@@ -53,15 +56,37 @@ tools/generate_goldens/
         ├── conv2d.rs            # Conv2D 1×1 + 3×3
         ├── depthwise_conv2d.rs  # DepthwiseConv2D
         ├── fully_connected.rs   # FullyConnected
+        ├── matmul.rs            # BatchMatMul (int8, FullyConnectedParams path)
         ├── pool.rs              # AveragePool2D, MaxPool2D
         ├── softmax.rs           # Softmax (int8 polynomial)
-        ├── activations.rs       # ReLU, ReLU6, HardSwish, LeakyReLU, PReLU
+        ├── activations.rs       # ReLU, ReLU6, HardSwish, LeakyReLU, PReLU, Sigmoid, Tanh
         ├── elementwise.rs       # Add, Mul, Sub (requantized)
         ├── quantize.rs          # Quantize, Dequantize
         ├── data_movement.rs     # Reshape, Transpose, Concat, Split, Pad, Slice, ResizeNearest
-        ├── reductions.rs        # Mean, Sum, ArgMax, ArgMin, L2Normalization
-        └── recurrent.rs         # LSTM, SVDF, GRU (hand-rolled gate math)
+        ├── reductions.rs        # Mean, Sum, ArgMax, ArgMin, L2Normalization, ReduceMax, ReduceMin
+        ├── recurrent.rs         # LSTM, SVDF, GRU (hand-rolled gate math)
+        └── zoo.rs               # Per-model goldens via executed TFLite interpreter
 ```
+
+## Model goldens (T5.0) — executed TFLite cross-check path
+
+Model-level fixtures are captured from a **real executed TFLite interpreter**
+(ai-edge-litert, the successor to tflite-runtime), not the tool-internal
+reimplementation:
+
+- `src/ops/zoo.rs` scans `models/` for runnable `.tflite` files and invokes
+  `zoo/run_model.py` (project venv at `zoo/.venv`, `pip install ai-edge-litert`)
+  as a subprocess, then writes the captured int8 output via
+  `FixtureWriter::write_model` into `hematite-tests/goldens/models/<name>.rs`.
+- These fixtures carry distinct provenance:
+  `GOLDEN_PROVENANCE = "captured-from-executed-TFLite-interpreter; see
+  tools/generate_goldens/zoo/run_model.py"` plus `GOLDEN_RUNTIME_VERSION`.
+- **The 18-model zoo is NOT runnable through this path as of T5.0.** All 15
+  esp-dl artifacts are the proprietary `.espdl` format (zero `.tflite` files
+  exist anywhere in esp-dl — verified across all branches/tags/history), and
+  the 6 edge-ml models are not publicly available. Full accounting in
+  `models/zoo/DEFERRED_MODELS.md`. The mechanism is proven end-to-end with
+  `models/sine.tflite` (the workspace's only runnable TFLite model).
 
 ## TFLM Reference Pin
 
@@ -71,6 +96,9 @@ Repository:       https://github.com/tensorflow/tflite-micro
 ```
 
 Every generated fixture embeds this SHA in a `GOLDEN_TFLM_VERSION` const.
+The generator asserts this pin at startup (T5.0 requirement B3) — if the
+constant in `src/fixture.rs` ever drifts from the corpus, regeneration fails
+loudly instead of silently producing a mismatched corpus.
 
 ## License / SPDX
 
@@ -108,6 +136,7 @@ All fixture files are written to `hematite-tests/goldens/`:
 | `conv2d_3x3.rs` | Conv2D (3×3 kernel, SAME pad) | T0 |
 | `depthwise_conv2d.rs` | DepthwiseConv2D | T0 |
 | `fully_connected.rs` | FullyConnected | T0 |
+| `matmul.rs` | BatchMatMul (int8) | T0 |
 | `average_pool_2d.rs` | AveragePool2D | T1 |
 | `max_pool_2d.rs` | MaxPool2D | T1 |
 | `softmax.rs` | Softmax (int8) | T1 |
@@ -116,6 +145,8 @@ All fixture files are written to `hematite-tests/goldens/`:
 | `hard_swish.rs` | HardSwish | T1 |
 | `leaky_relu.rs` | LeakyReLU | T1 |
 | `prelu.rs` | PReLU | T1 |
+| `sigmoid.rs` | Sigmoid / Logistic (int8) | T1 |
+| `tanh.rs` | Tanh (int8) | T1 |
 | `elementwise_add.rs` | Add (int8, requantized) | T1 |
 | `elementwise_mul.rs` | Mul (int8, requantized) | T1 |
 | `elementwise_sub.rs` | Sub (int8, requantized) | T1 |
@@ -136,6 +167,8 @@ All fixture files are written to `hematite-tests/goldens/`:
 | `argmax.rs` | ArgMax | T4 |
 | `argmin.rs` | ArgMin | T4 |
 | `l2_norm.rs` | L2Normalization | T4 |
+| `reduce_max.rs` | ReduceMax (int8 comparison) | T4 |
+| `reduce_min.rs` | ReduceMin (int8 comparison) | T4 |
 
 ### GRU Provenance (T3)
 
