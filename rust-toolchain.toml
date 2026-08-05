@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Hematite Contributors.
+#
+# Pin the workspace to the esp-rs Xtensa fork toolchain (plan T0.2).
+#
+# Channel name "esp" is the espup-installed custom toolchain
+# (rustc 1.95.0-nightly, esp-rs release 1.95.0.0, 2026-04-15).
+# rustup cannot manage components/targets for custom toolchains, so none are
+# listed here — the fork already ships rust-src, rustfmt, clippy (see
+# ~/.rustup/toolchains/esp/bin) and xtensa-esp32s3-none-elf is a built-in
+# target. Host builds keep working: the fork is a full nightly rustc.
+#
+# NOTE: the plan's research-derived channel was "esp-1.97.0.0"; adjusted to
+# the actual espup-installed channel per the T0.2 "adjust if drifted" note.
+[toolchain]
+channel = "esp"
