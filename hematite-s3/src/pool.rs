@@ -484,7 +484,7 @@ mod pool_simd {
     /// * `input_y_offset` = input_w * input_c (row stride in bytes).
     /// * `input_x_offset` = input_c (column stride in bytes).
     #[allow(dead_code)]
-    unsafe fn max_pool_2d_simd(
+    pub unsafe fn max_pool_2d_simd(
         output: *mut i8,
         input: *const i8,
         input_channel: i32,
@@ -531,7 +531,7 @@ mod pool_simd {
     ///   the filter area for each lane position. For a 2×2 filter (area=4):
     ///   each element = round(256.0 / 4.0) = 64 → [64; 16].
     #[allow(dead_code)]
-    unsafe fn avg_pool_2d_simd(
+    pub unsafe fn avg_pool_2d_simd(
         output: *mut i8,
         input: *const i8,
         input_channel: i32,

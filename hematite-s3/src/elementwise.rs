@@ -292,6 +292,15 @@ mod elementwise_simd {
         length: u32,           // offset 44: total element count
     }
 
+    impl Default for AddSubAlignedArgs {
+        fn default() -> Self {
+            Self {
+                _pad0: [0u8; 44],
+                length: 0,
+            }
+        }
+    }
+
     /// Args for aligned mul — matches `dl_tie728_s8_mul_w1_16_w2_16`.
     ///
     /// ABI verified against vendored .S:
@@ -306,6 +315,17 @@ mod elementwise_simd {
         c_div_x_1: i32,        // offset 64: (num_elements / 16) - 1
         _pad1: [u8; 12],       // offset 68-79
         mul_shift: i32,        // offset 80: requantize right-shift
+    }
+
+    impl Default for MulAlignedArgs {
+        fn default() -> Self {
+            Self {
+                _pad0: [0u8; 64],
+                c_div_x_1: 0,
+                _pad1: [0u8; 12],
+                mul_shift: 0,
+            }
+        }
     }
 
     // ── SIMD kernel glue ──────────────────────────────────────────────────
@@ -328,7 +348,7 @@ mod elementwise_simd {
     /// * `num_elements` must be a multiple of 16 (16-wide SIMD lanes).
     /// * All pointers must be 16-byte aligned for EE.VLD.128.IP / EE.VST.128.IP.
     #[allow(dead_code)]
-    unsafe fn add_simd_aligned(
+    pub unsafe fn add_simd_aligned(
         output: *mut i8,
         input1: *const i8,
         input2: *const i8,
@@ -336,6 +356,7 @@ mod elementwise_simd {
     ) {
         let args = AddSubAlignedArgs {
             length: num_elements,
+            ..Default::default()
         };
         core::arch::asm!(
             "mov a2, {output}",
@@ -370,7 +391,7 @@ mod elementwise_simd {
     /// * `mul_shift`: right-shift for requantize rounding
     ///   (`tie728_s8_vector_round_result` macro). Set to 0 for no shift.
     #[allow(dead_code)]
-    unsafe fn mul_simd_aligned(
+    pub unsafe fn mul_simd_aligned(
         output: *mut i8,
         input1: *const i8,
         input2: *const i8,
@@ -380,6 +401,7 @@ mod elementwise_simd {
         let args = MulAlignedArgs {
             c_div_x_1: (num_elements / 16) as i32 - 1,
             mul_shift,
+            ..Default::default()
         };
         core::arch::asm!(
             "mov a2, {output}",
@@ -412,7 +434,7 @@ mod elementwise_simd {
     /// * `num_elements` must be a multiple of 16.
     /// * All pointers 16-byte aligned.
     #[allow(dead_code)]
-    unsafe fn sub_simd_aligned(
+    pub unsafe fn sub_simd_aligned(
         output: *mut i8,
         input1: *const i8,
         input2: *const i8,
@@ -420,6 +442,7 @@ mod elementwise_simd {
     ) {
         let args = AddSubAlignedArgs {
             length: num_elements,
+            ..Default::default()
         };
         core::arch::asm!(
             "mov a2, {output}",

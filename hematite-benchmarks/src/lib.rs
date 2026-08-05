@@ -20,6 +20,9 @@
 //! * [`firmware`] — device-only ESP32-S3 firmware (esp-hal + defmt/RTT).
 
 #![cfg_attr(target_arch = "xtensa", no_std)]
+// Xtensa inline asm (CCOUNT read in timing.rs) needs the experimental-arch
+// gate on the esp-rs fork toolchain — same gate as hematite-s3.
+#![cfg_attr(target_arch = "xtensa", feature(asm_experimental_arch))]
 
 pub mod guardrails;
 pub mod model_bench;

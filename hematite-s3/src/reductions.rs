@@ -188,7 +188,7 @@ mod reduction_simd {
     /// ## ABI (unverified — T5.3 device verification required)
     #[allow(dead_code)]
     #[repr(C)]
-    struct Tie728ReduceArgs {
+    pub struct Tie728ReduceArgs {
         output: *mut i8,
         input: *const i8,
         _pad: [u8; 64], // reserved
@@ -201,7 +201,7 @@ mod reduction_simd {
     /// ABI-unverified. Inline global_asm! with ee.vld.128.ip +
     /// ee.vst.128.ip.
     #[allow(dead_code)]
-    unsafe fn mean_simd(_output: *mut i8, _input: *const i8, _args: &Tie728ReduceArgs) {
+    pub unsafe fn mean_simd(_output: *mut i8, _input: *const i8, _args: &Tie728ReduceArgs) {
         core::arch::asm!(
             // Placeholder — real SIMD loop:
             // 1. ee.vld.128.ip to load 16 int8 values

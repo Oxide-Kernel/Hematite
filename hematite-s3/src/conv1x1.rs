@@ -253,7 +253,7 @@ mod conv1x1_simd {
     /// | +104 | filter_channel_factor | i16* per-channel scale factor ptr |
     #[repr(C)]
     #[allow(dead_code)]
-    struct Tie728ConvArgs {
+    pub struct Tie728ConvArgs {
         // Layout verified against the vendored .S — fields are referenced by
         // byte offset (l32i a5, a4, 48 etc.), not by struct access.
         _pad0: [u8; 48],               // offset 0-47: unused by the .S
@@ -302,7 +302,7 @@ mod conv1x1_simd {
     /// * The `Tie728ConvArgs` struct must be correctly populated per the
     ///   vendored .S ABI.
     #[allow(dead_code)]
-    unsafe fn conv2d_1x1_simd_aligned(
+    pub unsafe fn conv2d_1x1_simd_aligned(
         output: *mut i8,
         input: *const i8,
         args: &Tie728ConvArgs,
@@ -344,7 +344,7 @@ mod conv1x1_simd {
     /// `args.activation_alpha` and `args.activation_shift` must be set for
     /// ReLU (alpha=0 means standard ReLU; non-zero means LeakyReLU).
     #[allow(dead_code)]
-    unsafe fn conv2d_1x1_simd_relu(
+    pub unsafe fn conv2d_1x1_simd_relu(
         output: *mut i8,
         input: *const i8,
         args: &Tie728ConvArgs,

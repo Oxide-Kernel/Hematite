@@ -33,6 +33,9 @@
 
 use esp_hal::clock::CpuClock;
 use esp_hal::Config;
+// defmt-rtt 0.4 registers its global logger by linkage only (no init fn);
+// defmt 0.3.100 re-exports defmt 1.1.1 so esp-hal's messages share the RTT sink.
+use defmt_rtt as _;
 
 use crate::guardrails::{
     assert_ccount_calibration, verify_boot_profile, watchdog_disabled_policy, BootProfile,
@@ -56,11 +59,9 @@ use crate::timing::{
 /// independent wall source that backs report column 3 and the CCOUNT
 /// calibration assert.
 pub fn read_wall_ns_impl() -> u64 {
-    let now = esp_hal::time::now();
+    let now = esp_hal::time::Instant::now();
     let dur = now.duration_since_epoch();
-    // BRING-UP: if `as_micros` is not the 1.1 name, the equivalent integer
-    // ns conversion goes here.  Integer-only (no f32 timing drift).
-    (dur.as_micros() as u64).saturating_mul(1000)
+    dur.as_micros().saturating_mul(1000)
 }
 
 /// Device panic handler — logs through defmt and halts.
@@ -96,7 +97,8 @@ static mut STACK_CANARY_SLOT: u32 = 0;
 /// config and are asserted against the locked constants here.  The returned
 /// values must be validated on hardware against the actual registers.
 fn read_boot_profile() -> BootProfile {
-    let cpu_mhz = CpuClock::max().mhz();
+    // CpuClock enum discriminants are the MHz values (80/160/240) on the S3.
+    let cpu_mhz = CpuClock::max() as u32;
     defmt::info!("boot: CpuClock::max() reports {} MHz", cpu_mhz);
     BootProfile {
         cpu_mhz,
@@ -143,7 +145,7 @@ fn calibrate_and_assert() {
     let wall_ns = w1.saturating_sub(w0);
     defmt::info!("ccount calibration: {} cycles / {} ns", cycles, wall_ns);
     // 1000 ppm tolerance (0.1%).
-    if let Err(e) = assert_ccount_calibration(cycles, wall_ns, CPU_HZ_240MHZ, 1000) {
+    if let Err(e) = assert_ccount_calibration(u64::from(cycles), wall_ns, CPU_HZ_240MHZ, 1000) {
         panic!("CCOUNT calibration guardrail: {}", e.describe());
     }
 }
@@ -156,8 +158,8 @@ fn bench_kernel(spec: &KernelSpec, clock: &mut RealClock, canary: &mut StackCana
     // duration of this benchmark; the arena is re-carved per spec.
     let arena = unsafe {
         match spec.tier {
-            MemoryTier::Sram => &mut SRAM_ARENA,
-            MemoryTier::Psram => &mut PSRAM_ARENA,
+            MemoryTier::Sram => &mut SRAM_ARENA[..],
+            MemoryTier::Psram => &mut PSRAM_ARENA[..],
         }
     };
     let mut bufs = match carve_into(arena, &lay) {
@@ -257,8 +259,6 @@ fn emit_model_row(spec: &ModelBenchSpec) {
 
 /// Firmware entry point — runs the full benchmark suite and never returns.
 pub fn run_benchmarks() -> ! {
-    defmt_rtt::defmt_rtt_init();
-
     // esp-hal 1.1 documented init (context7: `Config::default()
     // .with_cpu_clock(CpuClock::max())` + `esp_hal::init`).
     let config = Config::default().with_cpu_clock(CpuClock::max());
@@ -285,7 +285,7 @@ pub fn run_benchmarks() -> ! {
 
     // 4. Stack canary.
     // SAFETY: single-threaded firmware; unique static.
-    let mut canary = StackCanary::new(unsafe { &mut STACK_CANARY_SLOT });
+    let mut canary = StackCanary::new(unsafe { &mut *core::ptr::addr_of_mut!(STACK_CANARY_SLOT) });
     canary.arm();
 
     // 5. Per-kernel benchmarks.

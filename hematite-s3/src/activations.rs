@@ -259,7 +259,7 @@ mod activation_simd {
     /// * `activation_alpha = 0` for standard ReLU (non-zero = LeakyReLU slope).
     /// * `activation_shift ≥ 0` enables ReLU; negative disables activation.
     #[allow(dead_code)]
-    unsafe fn relu_simd(
+    pub unsafe fn relu_simd(
         output: *mut i8,
         input: *const i8,
         num_elements: u32,
