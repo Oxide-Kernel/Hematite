@@ -826,6 +826,7 @@ dependencies = [
  "hematite-int8",
  "hematite-ref",
  "hematite-s3",
+ "xtensa-lx-rt",
 ]
 
 [[package]]

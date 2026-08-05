@@ -15,10 +15,16 @@
 
 /// ESP32-S3 entry point — runs the benchmark suite, never returns.
 ///
-/// Flash via probe-rs / espflash; results stream over RTT (defmt).
+/// Flash via probe-rs / espflash; results stream over RTT (defmt) or, under
+/// the `qemu` feature, over UART0.
+///
+/// `#[xtensa_lx_rt::entry]` generates the reset vector that calls this
+/// function — this roots the Reset → main chain so the firmware survives
+/// `--gc-sections` even when no `esp_hal::init` call pulls the rt machinery
+/// (the qemu build bypasses init).
 #[cfg(target_arch = "xtensa")]
-#[no_mangle]
-pub extern "C" fn main() -> ! {
+#[xtensa_lx_rt::entry]
+fn main() -> ! {
     hematite_benchmarks::firmware::run_benchmarks()
 }
 

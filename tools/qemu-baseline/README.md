@@ -150,3 +150,86 @@ one of the 10 timed runs (the min — the robust stat — is stable).
 The remaining `segment 2: vaddr=00000000` in the boot log is espflash's
 64 KB-alignment gap filler for the irom segment (zeros written to address 0,
 benign; the bootloader prints it without a load/map tag).
+
+## Rust firmware run (`rust_run1.log`) — QEMU-EMULATION
+
+The Rust bench firmware (`hematite-benchmarks` ELF, `--features qemu`) boots
+under the same Espressif QEMU fork with the same methodology (1 untimed
+warm-up + N≥10 timed runs, min+median, integer `cycles*1000/240_000_000`).
+Serial log: `rust_run1.log`.
+
+```sh
+cd <repo root>
+export PATH="$HOME/.cargo/bin:$PATH" && source ~/export-esp.sh >/dev/null 2>&1
+cargo xtensa-build -p hematite-benchmarks --features qemu   # debug profile
+~/.cargo/bin/espflash save-image --chip esp32s3 --merge \
+  target/xtensa-esp32s3-none-elf/debug/hematite-benchmarks tools/qemu-baseline/rust.bin
+~/.esp-qemu/qemu/bin/qemu-system-xtensa -nographic -machine esp32s3 \
+  -drive file=tools/qemu-baseline/rust.bin,if=mtd,format=raw \
+  -monitor none -serial file:tools/qemu-baseline/rust_run1.log -icount 3 &
+sleep 60; kill -INT %1
+```
+
+Captured output (min cycles):
+
+```
+| conv_s8 8x8,64x3x3x3 (ember-esp-nn)          | SRAM | 22720033/23720033 | ...
+| depthwise_conv_s8 18x18,1x3x3x16 (ember-esp-nn) | SRAM | 16057231/16057231 | ...
+| fc_s8 271row,3out (ember-esp-nn)             | SRAM | 55483/55483 | ...
+| conv1x1_s8 64x1x1x64 (ember-esp-nn 15.57x bar) | SRAM | 389918/389919 | ...
+PANIC: panicked at hematite-benchmarks/src/firmware.rs:373:19:
+arena too small for spec 'conv_s8 224x224x3->32 (ESP-DL/MobileNetV2 first layer)'
+```
+
+The firmware boots, runs all four SRAM rows, then panics honestly on the
+first PSRAM row (QEMU has no PSRAM; the arena is empty). That panic is the
+expected no-PSRAM behavior, not a defect.
+
+Determinism: three consecutive runs gave byte-identical min values for all
+four kernels.
+
+### QEMU-EMULATION comparison — C (-O2) vs Rust (debug)
+
+⚠️ **QEMU emulation smoke — NOT hardware measurements.** The Rust firmware
+was built in the **debug profile (`opt-level=0`)**; the C baseline is `-O2`.
+The absolute gap is dominated by the optimization-level difference, not by
+language. Use this table for *relative* C-vs-Rust behavior under identical
+emulation only; the true hardware comparison requires a release Rust build.
+
+| Kernel | C min cycles (-O2) | Rust min cycles (debug) | Rust/C | Delta % |
+|---|---|---|---|---|
+| conv_s8 8x8, 64×3×3×3 | 737,287 | 22,720,033 | 30.8× | +2981.6% |
+| depthwise_conv_s8 18×18, 1×3×3×16 | 572,272 | 16,057,231 | 28.1× | +2705.9% |
+| fc_s8 271→3 | 2,425 | 55,483 | 22.9× | +2188.0% |
+| conv1x1_s8 64×1×1×64 | 14,794 | 389,918 | 26.4× | +2535.6% |
+
+Notes:
+- Both columns are CCOUNT min cycles under `-icount 3` on the same QEMU fork.
+- The Rust `col1` (scalar-ref vs s3) reports `Some(100)` = 1.00×: under QEMU
+  the s3 kernels run the scalar fallback (no SIMD in the emulator), so the
+  two paths are the same code — expected, not a measurement error.
+- Wall-ms column is 0 under the `qemu` feature (esp-hal systimer is not
+  initialized; CCOUNT columns are unaffected).
+- The Rust run bypasses the CCOUNT-calibration guardrail and PSRAM init via
+  the documented `qemu` feature (see hematite-benchmarks/Cargo.toml).
+
+## Boot journey — Rust firmware (what had to be fixed)
+
+The Rust firmware needed the same boot-descriptor fix as the C baseline plus
+two QEMU-specific firmware changes:
+
+1. **`.flash.appdesc` app descriptor (256-byte espflash layout)** — esp-hal's
+   linker script places `.flash.appdesc` first in DROM; espflash 4.5.0
+   auto-detects that section and parses it as its 256-byte `AppDescriptor`
+   (a different layout than the IDF struct the C baseline hand-rolled).
+   Mismatched size → `save-image` panics. The Rust `EspAppDesc` in
+   `firmware.rs` matches espflash exactly (see its doc comment for offsets).
+2. **`esp_hal::init` hangs under QEMU** — its PLL reconfiguration polls
+   `bbpll_cal_done`, which QEMU never asserts. The `qemu` feature bypasses
+   `esp_hal::init` entirely (freestanding like the C baseline): CCOUNT, SRAM
+   and UART0 work without it; PSRAM and the wall clock are unavailable.
+3. **Link rooting** — with `esp_hal::init` bypassed, cargo would prune the
+   esp-hal dependency (dropping the rt startup hooks xtensa-lx-rt's reset
+   vector needs). Referencing `CpuClock::max()` (a const fn, no PLL) under
+   `qemu` keeps esp-hal linked; `#[xtensa_lx_rt::entry]` on `main` roots the
+   Reset→main chain. Full detail in learnings.md.

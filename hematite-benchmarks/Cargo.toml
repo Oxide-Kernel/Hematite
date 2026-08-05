@@ -35,4 +35,23 @@ hematite-s3 = { path = "../hematite-s3" }
 # cannot be linked.
 esp-hal = { workspace = true, features = ["esp32s3", "defmt", "unstable"] }
 defmt = { workspace = true }
+# xtensa-lx-rt: provides `#[entry]` (reset vector) and the runtime startup.
+# esp-hal re-exports it under `__macro_implementation`, but the firmware's
+# `main` uses the attribute directly so the reset→main chain is rooted even
+# in the qemu build (which bypasses `esp_hal::init`).
+xtensa-lx-rt = "0.22.0"
+# defmt-rtt provides the defmt global logger over RTT. It is linked in BOTH
+# builds: the hardware build reads RTT; under QEMU the RTT sink is invisible
+# but the crate still supplies the `_defmt_acquire`/`_defmt_write`/
+# `_defmt_release` symbols that esp-hal's `defmt` feature requires at link
+# time (the firmware's own report output goes to UART0 via `firmware_log!`).
 defmt-rtt = "0.4"
+
+[features]
+# QEMU smoke-run mode: the firmware writes the report through direct UART0
+# register writes (defmt-rtt emits nothing under QEMU — no RTT sink) and
+# bypasses the CCOUNT-calibration guardrail (which fails under `-icount`
+# timer skew). Every printed number still carries the QEMU-EMULATION label;
+# this feature changes ONLY the output transport and guardrail bypass, never
+# the benchmark methodology (spec.rs / timing.rs / report.rs are untouched).
+qemu = []
