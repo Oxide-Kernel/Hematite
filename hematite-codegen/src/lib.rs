@@ -20,37 +20,72 @@
 use proc_macro::TokenStream;
 
 pub(crate) mod flatbuffer;
+pub(crate) mod generate;
+// T4.2a fusion now compiles (see optimize/fusion.rs) — optimize module
+// restored into the shared build per the gating comment below.
+pub(crate) mod optimize;
 
 /// Parses the `#[model("path.tflite")]` attribute, reads and validates the
-/// TFLite model at compile time, then emits a minimal expansion proving the
-/// parse succeeded.  Real code emission is T4.1's job — T4.0 only validates.
+/// TFLite model at compile time, then emits the typed inference code for
+/// `subgraph[0]` (T4.1: straight-line `KernelBackend` call sequence +
+/// `Model<B>` wrapper) alongside the annotated item.
 #[proc_macro_attribute]
 pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let model_result = parse_model_from_attr(attr);
-    match model_result {
-        Ok((tensors, ops)) => {
-            let proc_item = proc_macro2::TokenStream::from(item);
-            let expanded = quote::quote! {
-                const _: () = {
-                    const TENSOR_COUNT: usize = #tensors;
-                    const OP_COUNT: usize = #ops;
-                };
-                #proc_item
-            };
-            expanded.into()
+    let proc_item = proc_macro2::TokenStream::from(item);
+    parse_and_emit(attr, proc_item).into()
+}
+
+/// Read + parse the model and route through the emitter, all within one
+/// scope so the parsed model (which borrows the file bytes) stays alive
+/// through emission.
+fn parse_and_emit(
+    attr: TokenStream,
+    proc_item: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let path = match model_path_from_attr(&attr) {
+        Ok(p) => p,
+        Err(msg) => return compile_error_with_item(msg, proc_item),
+    };
+    let data = match std::fs::read(&path) {
+        Ok(d) => d,
+        Err(e) => {
+            return compile_error_with_item(format!("cannot read {}: {e}", path.display()), proc_item);
         }
-        Err(msg) => {
-            let proc_item = proc_macro2::TokenStream::from(item);
-            let expanded = quote::quote! {
-                compile_error!(#msg);
-                #proc_item
-            };
-            expanded.into()
+    };
+    let model = match flatbuffer::parse(&data) {
+        Ok(m) => m,
+        Err(e) => {
+            return compile_error_with_item(
+                format!(
+                    "TFLite parse error in {}: {e}\n\
+                     ─ help: verify the model is a valid TFLite file with 'TFL3' identifier",
+                    path.display()
+                ),
+                proc_item,
+            );
         }
+    };
+    match generate::emit_model(&model) {
+        Ok(generated) => {
+            quote::quote! {
+                #generated
+                #proc_item
+            }
+        }
+        Err(msg) => compile_error_with_item(msg, proc_item),
     }
 }
 
-fn parse_model_from_attr(attr: TokenStream) -> Result<(usize, usize), String> {
+fn compile_error_with_item(msg: String, proc_item: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+    quote::quote! {
+        compile_error!(#msg);
+        #proc_item
+    }
+}
+
+/// Resolve the attribute string literal to a filesystem path, relative to the
+/// consumer crate's `CARGO_MANIFEST_DIR`.
+fn model_path_from_attr(attr: &TokenStream) -> Result<std::path::PathBuf, String> {
     let attr_str = attr.to_string();
     let lit: syn::LitStr = syn::parse_str(&attr_str)
         .map_err(|e| format!("expected string literal: {e}"))?;
@@ -58,20 +93,7 @@ fn parse_model_from_attr(attr: TokenStream) -> Result<(usize, usize), String> {
     let path_str = lit.value();
     let cargo_dir = std::env::var("CARGO_MANIFEST_DIR")
         .unwrap_or_else(|_| ".".to_string());
-    let full_path = std::path::Path::new(&cargo_dir).join(&path_str);
-
-    let data = std::fs::read(&full_path)
-        .map_err(|e| format!("cannot read {}: {e}", full_path.display()))?;
-
-    let model = flatbuffer::parse(&data).map_err(|e| {
-        format!(
-            "TFLite parse error in {}: {e}\n\
-             ─ help: verify the model is a valid TFLite file with 'TFL3' identifier",
-            full_path.display()
-        )
-    })?;
-
-    Ok((model.tensors().len(), model.ops().len()))
+    Ok(std::path::Path::new(&cargo_dir).join(&path_str))
 }
 
 // ---------------------------------------------------------------------------

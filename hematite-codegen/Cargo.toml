@@ -9,6 +9,10 @@ proc-macro = true
 
 [dependencies]
 hematite-core = { path = "../hematite-core" }
+# T4.2b: arena planning delegates to hematite-memory's liveness_plan (T1.3) —
+# codegen never re-implements the algorithm. Wired even before `mod arena;`
+# lands so the arena module compiles the moment the orchestrator wires it.
+hematite-memory = { path = "../hematite-memory" }
 proc-macro2 = { workspace = true }
 quote = { workspace = true }
 syn = { workspace = true }

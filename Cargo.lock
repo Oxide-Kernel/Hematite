@@ -21,6 +21,7 @@ name = "hematite-codegen"
 version = "0.1.0"
 dependencies = [
  "hematite-core",
+ "hematite-memory",
  "proc-macro2",
  "quote",
  "syn",
