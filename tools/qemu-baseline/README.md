@@ -213,6 +213,28 @@ Notes:
 - The Rust run bypasses the CCOUNT-calibration guardrail and PSRAM init via
   the documented `qemu` feature (see hematite-benchmarks/Cargo.toml).
 
+### Release profile comparison
+
+⚠️ **QEMU emulation smoke — NOT hardware measurements.** The 22.9–30.8× gap
+in the debug table above is an artifact of comparing the Rust **debug
+profile (`opt-level=0`)** against the C `-O2` baseline. With a `--release`
+build the same scalar kernels close the gap to 1.30–1.76×.
+
+| Kernel | C min cycles (-O2) | Rust min cycles (release) | Rust/C |
+|---|---|---|---|
+| conv_s8 8x8, 64×3×3×3 | 737,287 | 1,045,880 | 1.42× |
+| depthwise_conv_s8 18×18, 1×3×3×16 | 572,272 | 744,236 | 1.30× |
+| fc_s8 271→3 | 2,425 | 3,498 | 1.44× |
+| conv1x1_s8 64×1×1×64 | 14,794 | 25,981 | 1.76× |
+
+Both profiles run the same int8 scalar algorithm (mirroring `hematite-ref`),
+the same deterministic inputs, and the same emulator (`-icount 3`, Espressif
+QEMU fork), so the Rust/C ratio is meaningful *within* emulation — but the
+absolute cycles are emulator-virtual, not hardware. Build with `cargo
+xtensa-build --release -p hematite-benchmarks --features qemu`, then
+save-image and run QEMU exactly as in the debug section above (release log:
+`rust_release.log`).
+
 ## Boot journey — Rust firmware (what had to be fixed)
 
 The Rust firmware needed the same boot-descriptor fix as the C baseline plus
