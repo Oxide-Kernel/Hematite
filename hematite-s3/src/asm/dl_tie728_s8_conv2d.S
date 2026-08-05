@@ -13,6 +13,8 @@
 //
 // CONTENT BELOW THIS LINE IS VERBATIM FROM THE SOURCE COMMIT.
 // DO NOT MODIFY. Re-vendor from a newer commit by replacing this file entirely.
+.ifndef __HEMATITE_CONV2D_BODY__
+.set __HEMATITE_CONV2D_BODY__, 1
 // ═══════════════════════════════════════════════════════════════════════════════
 #include "dl_tie728_s8.S"
 
@@ -2719,3 +2721,5 @@ dl_tie728_s8_unaligned_conv2d_hwcn:
 
 
 
+
+.endif

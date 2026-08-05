@@ -13,6 +13,8 @@
 //
 // CONTENT BELOW THIS LINE IS VERBATIM FROM THE SOURCE COMMIT.
 // DO NOT MODIFY. Re-vendor from a newer commit by replacing this file entirely.
+.ifndef __HEMATITE_S8_BODY__
+.set __HEMATITE_S8_BODY__, 1
 // ═══════════════════════════════════════════════════════════════════════════════
 
 .macro dl_tie728_s8_unaligned_store0 output_v, output_ptr, tmp32
@@ -559,3 +561,5 @@
 .endm
 
 
+
+.endif

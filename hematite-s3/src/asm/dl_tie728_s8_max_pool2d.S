@@ -12,6 +12,8 @@
 //
 // CONTENT BELOW THIS LINE IS VERBATIM FROM THE SOURCE COMMIT.
 // DO NOT MODIFY. Re-vendor from a newer commit by replacing this file entirely.
+.ifndef __HEMATITE_MAXPOOL_BODY__
+.set __HEMATITE_MAXPOOL_BODY__, 1
 // ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -519,3 +521,5 @@ dl_tie728_s8_unaligned_max_pool2d_h1_remainder:
 dl_tie728_s8_unaligned_max_pool2d_h1_remainder_end:
     retw
 
+
+.endif
