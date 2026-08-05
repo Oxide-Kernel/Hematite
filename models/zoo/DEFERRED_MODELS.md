@@ -90,3 +90,74 @@ obtained for golden capture or T5.2 compilation.
 
 - **motion_detect**, **color_detect**: algorithmic, no `.espdl`/`.tflite`
   artifact — noted not tested here (plan T5.2).
+
+## 5. T5.2 substitutions — REAL public int8 .tflite models
+
+The plan's 18-model list was unobtainable as `.tflite` (sections 1–2), so T5.2
+obtained real public int8 models covering the same op families. **Per-op
+families table** (plan model → substitution → ops exercised → status):
+
+| Plan family (T5.2) | Substitution | Source | Ops | Status |
+|---|---|---|---|---|
+| `person_detect_v2` | `vww_96_int8.tflite` (VWW person detector) | mlcommons/tiny | conv, depthwise, avgpool, reshape, fc, softmax | compiled; not bit-exact |
+| `keyword_spotting_v1` | `micro_speech_quantized.tflite` | tflite-micro @ pin | reshape, depthwise, fc, softmax | ✅ bit-exact |
+| `imagenet_cls` / `mobilenetv2_cls` | `mobilenet_v2_quantized_1x3x224x224.tflite` | tflite-micro @ pin (xtensa) | transpose, pad, conv, depthwise, add, mean, reshape, fc, softmax | compiled; not bit-exact |
+| `anomaly_detect_v2` | `ad01_int8.tflite` (MLPerf AD01 AE) | mlcommons/tiny | fc ×10 | ✅ bit-exact |
+| (sine regression) | `hello_world_int8.tflite` | tflite-micro @ pin | fc ×3 | ✅ bit-exact |
+
+All 5 have per-directory SHA256 provenance READMEs under `models/zoo/`.
+Goldens captured via the executed ai-edge-litert 2.1.6 interpreter
+(`tools/generate_goldens/zoo/run_model.py`).
+
+## 6. Why two substitutions compile but are NOT bit-exact (T5.2 finding)
+
+`person_detect_vww` and `mobilenet_v2` compile through `#[model]` and execute,
+but their outputs diverge from the executed-TFLite golden at kernel level.
+Root-caused (per-op chained comparison of every intermediate tensor against
+the interpreter at `BUILTIN_REF` — matches bit-exactly through 14 consecutive
+conv/depthwise ops on person_detect, then diverges):
+
+1. **Requantization rounding**: the hematite kernels implement TFLM
+   single-rounding `MultiplyByQuantizedMultiplier` (the 64-bit
+   `(x*mult + round) >> shift` form, `TFLITE_SINGLE_ROUNDING` path). The host
+   ai-edge-litert reference kernels use the **double-rounding** form
+   (`SaturatingRoundingDoublingHighMul` + `RoundingDivideByPOT`,
+   gemmlowp path). The two agree except at exact rounding boundaries, where
+   they differ by ±1 (observed: depthwise op15 on person_detect −95 vs −96;
+   FC 115 vs 114 on identical input).
+2. **Softmax**: the TFLM reference int8 softmax saturates wide-dynamic-range
+   logits to −128 (verified: TFLM semantics on person_detect's [115,−122]
+   logits give [127,−128] — exactly what hematite produces). The LiteRT
+   (ai-edge-litert) int8 softmax uses a different scaling and produces
+   [120,−120]. Algorithmic kernel difference, not a params/emitter gap.
+
+**Why not fixed here**: both differences live in `hematite-ref` kernels
+(`MultiplyByQuantizedMultiplier` rounding + softmax), which are owned by the
+kernel workstream and explicitly out of scope for T5.2 (see `local-notes/plans/hematite-nn.md`
+MUST-NOT). The emitter/parser produced bit-exact parameter streams (verified
+op-by-op).
+
+**Fix path (kernel workstream)**: adopt the `TFLITE_SINGLE_ROUNDING`-consistent
+gemmlowp double-rounding `MultiplyByQuantizedMultiplier` to match host TFLite,
+OR build tflite-micro at the pinned SHA and capture model goldens from a real
+TFLM binary (the T5.0 remediation path in `tools/generate_goldens/README.md`).
+With either fix, all 6 models should assert bit-exact.
+
+## 7. Emitter/parser gaps closed by T5.2 (for the record)
+
+The zoo models exposed three real emitter/parser gaps, all now implemented and
+tested (`cargo test -p hematite-codegen` → 55 tests):
+
+- **Legacy opcode encoding**: xtensa models store the code in
+  `deprecated_builtin_code` (field 0) and omit it entirely for ADD (schema
+  default) — `parse_opcodes` now resolves missing fields to ADD.
+- **PAD (34) + TRANSPOSE (39)**: both emit consts from their const int32
+  input buffers (pad amounts `[rank,2]`, perm `[rank]`).
+- **Multi-axis MEAN**: `ParsedOptions::Mean.axis` is now `Vec<i32>` with
+  `axis_count` (MobileNetV2 global-average-pool reduces over axes [1,2]).
+  Also: softmax accepts a `beta = 1.0` options table; RESHAPE falls back to
+  the output shape when the options carry 0/−1 dims.
+
+**Note**: the mobilenet_v2 model's 18 PAD ops additionally expose a PAD
+kernel-semantics difference (LiteRT pads with the input zero point, the
+`pad_op` kernel fills raw 0) — kernel-owned, same fix path as section 6.

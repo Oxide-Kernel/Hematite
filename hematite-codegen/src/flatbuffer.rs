@@ -176,7 +176,7 @@ pub(crate) enum ParsedOptions {
     /// MEAN — has no options table in the v23.1-era schema; `axis` is
     /// resolved from the `inputs[1]` tensor's buffer, `keep_dims` from the
     /// optional `MeanOptions` table (or `false` when absent).
-    Mean { axis: i32, keep_dims: bool },
+    Mean { axis: Vec<i32>, keep_dims: bool },
     /// `ResizeNearestNeighborOptions`.
     ResizeNearest {
         align_corners: bool,
@@ -186,6 +186,12 @@ pub(crate) enum ParsedOptions {
     LeakyRelu { alpha: f32 },
     /// PRELU — no options table in the v23.1-era schema.
     Prelu,
+    /// PAD / PADV2 — no options table (`TfLitePadParams` is empty); the
+    /// padding amounts live in the `inputs[1]` const tensor's buffer.
+    Pad,
+    /// TRANSPOSE — no options table; the permutation lives in the
+    /// `inputs[1]` const tensor's buffer.
+    Transpose,
     /// Any op whose options are not decoded here: the raw options-table
     /// bytes (empty when no options table was present).
     Custom(Vec<u8>),
@@ -472,9 +478,11 @@ fn parse_opcodes(bytes: &[u8], opcodes_off: usize) -> Result<Vec<i32>, ParseErro
                 context: format!("opcode[{i}].deprecated_builtin_code"),
             })? as i32
         } else {
-            return Err(ParseError::BadField {
-                context: format!("opcode[{i}] has no builtin_code"),
-            });
+            // Neither field present: both schema fields default to 0 (ADD),
+            // and the flatbuffers builder omits fields equal to their default.
+            // Legacy-encoded models (code only in `deprecated_builtin_code`)
+            // omit it for ADD. Resolve to the schema default.
+            0
         };
         out.push(code);
     }
@@ -701,6 +709,8 @@ fn parse_builtin_options<'a>(
                 keep_dims: false,
             }),
             54 => Some(ParsedOptions::Prelu),
+            34 => Some(ParsedOptions::Pad),
+            39 => Some(ParsedOptions::Transpose),
             _ => None,
         });
     }
@@ -735,19 +745,26 @@ fn parse_builtin_options<'a>(
     }))
 }
 
-/// MEAN's reduction axis lives in the `inputs[1]` tensor's buffer (int32).
+/// MEAN's reduction axes live in the `inputs[1]` tensor's buffer (int32).
 fn mean_axis<'a>(
     inputs: &[u32],
     tensors: &[ParsedTensor<'a>],
     buffers: &[ParsedBuffer<'a>],
-) -> i32 {
-    inputs
-        .get(1)
-        .and_then(|&t| tensors.get(t as usize))
-        .and_then(|t| buffers.get(t.buffer_index as usize))
-        .and_then(|b| b.data.get(0..4))
-        .map(|x| i32::from_le_bytes([x[0], x[1], x[2], x[3]]))
-        .unwrap_or(0)
+) -> Vec<i32> {
+    let Some(&t) = inputs.get(1) else {
+        return vec![];
+    };
+    let Some(tensor) = tensors.get(t as usize) else {
+        return vec![];
+    };
+    let Some(buffer) = buffers.get(tensor.buffer_index as usize) else {
+        return vec![];
+    };
+    buffer
+        .data
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
 }
 
 /// Raw bytes of an options table (used for the `Custom` fallback).
@@ -912,5 +929,45 @@ mod tests {
         assert_eq!(pc.scales, vec![0.5, 1.0]);
         assert_eq!(pc.zero_points, vec![-128, 0]);
         assert_eq!(pc.quantized_dimension, 1);
+    }
+
+    /// An `OperatorCode` table whose vtable omits BOTH `builtin_code` (field
+    /// 3) and `deprecated_builtin_code` (field 0) resolves to the schema
+    /// default ADD (0). Legacy-encoded models (the xtensa
+    /// `pytorch_to_tflite` artifacts) omit the field entirely for ADD, since
+    /// flatbuffers drops fields equal to their default.
+    #[test]
+    fn opcode_missing_fields_defaults_to_add() {
+        // vector at 0: len=1, element uoffset at 4 → table at 12 (V=8)
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        // vtable at 8: vt_len=4 (no field slots), table_size=12
+        buf.extend_from_slice(&4u16.to_le_bytes());
+        buf.extend_from_slice(&12u16.to_le_bytes());
+        // table at 12: SOffsetT → vtable at 8
+        buf.extend_from_slice(&4i32.to_le_bytes());
+        let codes = parse_opcodes(&buf, 0).expect("should parse");
+        assert_eq!(codes, vec![0]); // ADD
+    }
+
+    /// A legacy-encoded opcode table (code in `deprecated_builtin_code`,
+    /// field 3 absent) resolves from field 0.
+    #[test]
+    fn opcode_legacy_deprecated_field() {
+        // vector at 0: len=1, element uoffset at 4 → table at 14 (V=10)
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&10u32.to_le_bytes());
+        // vtable at 8: vt_len=6 (one field slot), table_size=12, field[0] at table+4
+        buf.extend_from_slice(&6u16.to_le_bytes());
+        buf.extend_from_slice(&12u16.to_le_bytes());
+        buf.extend_from_slice(&4u16.to_le_bytes());
+        // table at 14: SOffsetT → vtable at 8, then deprecated code 34 (PAD)
+        buf.extend_from_slice(&6i32.to_le_bytes());
+        buf.push(34u8);
+        buf.extend_from_slice(&[0u8; 3]);
+        let codes = parse_opcodes(&buf, 0).expect("should parse");
+        assert_eq!(codes, vec![34]); // PAD
     }
 }

@@ -1,4 +1,4 @@
-# models/zoo — ESP-DL + edge-ml model zoo (T5.0)
+# models/zoo — ESP-DL + edge-ml model zoo (T5.0/T5.2)
 
 Golden-corpus model zoo for hematite-nn Phase 5 (T5.2 model-level inference).
 
@@ -22,39 +22,58 @@ Source: `github.com/espressif/esp-dl`, commit `12c0616de145b704e1149c474b9a1e852
 (`master`), path `models/<name>/models/s3/`. Each subdirectory has its own
 `README.md` with per-file SHA256 and raw source URLs.
 
-### edge-ml-model-zoo — 0 files (see below)
+### T5.2 substitution models — REAL public int8 `.tflite` (5)
 
-## ⚠️ Critical format finding (read before using this zoo)
+The plan's named 18-model list is not obtainable as `.tflite` (esp-dl = `.espdl`
+only; edge-ml-model-zoo has no binaries). These public int8 models cover the
+same op families; see `DEFERRED_MODELS.md` for the per-family substitution table.
+
+| Zoo family (plan name) | Model dir | `.tflite` | Ops exercised | Bit-exact |
+|---|---|---|---|---|
+| `person_detect_v2` | `person_detect_vww/` | person_detect_int8.tflite (VWW, 96²) | conv, depthwise, avgpool, reshape, fc, softmax | ⚠️ compiled, not bit-exact |
+| `keyword_spotting_v1` | `keyword_spotting/` | kws_micro_speech_int8.tflite | reshape, depthwise, fc, softmax | ✅ bit-exact |
+| `imagenet_cls` / `mobilenetv2_cls` | `mobilenetv2_cls/` | mobilenet_v2_1.0_224_int8.tflite | transpose, pad, conv, depthwise, add, mean, reshape, fc, softmax | ⚠️ compiled, not bit-exact |
+| `anomaly_detect_v2` | `anomaly_detect/` | anomaly_detect_int8.tflite (MLPerf AD01 AE) | fc ×10 | ✅ bit-exact |
+| (sine regression) | `sine_regression/` | hello_world_int8.tflite | fc ×3 | ✅ bit-exact |
+
+Each dir has its own `README.md` with per-file SHA256, source URL, and the
+substitution rationale. **The model goldens in
+`hematite-tests/goldens/models/*.rs` are captured from a real executed
+ai-edge-litert 2.1.6 interpreter** (`tools/generate_goldens/zoo/run_model.py`),
+not from hand computation.
+
+## ⚠️ Format finding (esp-dl zoo — unchanged)
 
 **The esp-dl model zoo ships NO `.tflite` files.** Every model is in the
 proprietary `.espdl` format (EDL2 magic; a custom FlatBuffers schema,
 `esp-dl/fbs_loader/espdl.fbs`, IR version 2023-12-22). This was verified
 exhaustively against the esp-dl repository: zero `.tflite` files in the tree,
-across all branches, all tags (v0.x–v3.x), or any release asset.
+across all branches, all tags (v0.x–v3.x), or any release asset. T5.2 therefore
+substituted the 5 public int8 `.tflite` models above (full accounting in
+`DEFERRED_MODELS.md`).
 
-Consequences:
+## ⚠️ Bit-exactness status of model-level tests (T5.2)
 
-1. **Per-model golden capture via TFLite/TFLM Interpreter is impossible for
-   these artifacts.** The `.espdl` format cannot be loaded by any TFLite
-   runtime. `tools/generate_goldens` zoo golden path therefore has no
-   esp-dl models to execute.
-2. The plan's assumption (".espdl archives containing multiple tflite
-   sub-models") does not match the current esp-dl v3.x format. The `.espdl`
-   file IS the model; there is no embedded TFLite.
-3. T5.2 `#[model("models/x.tflite")]` compilation will require either a
-   `.espdl` → TFLite conversion path (out of scope: ESP-PPQ is a proprietary
-   Python quantizer requiring the original ONNX/PyTorch source, which esp-dl
-   does not distribute for these models) or an esp-dl runtime loader on the
-   device.
-
-The artifacts are preserved here anyway: they are the canonical, versioned
-ESP-DL S3 model binaries (source of truth for on-device deployment), and T5.2
-can use them via ESP-DL's own loader if a device-side golden path is
-established. See `DEFERRED_MODELS.md` for the full accounting.
+`cargo test -p hematite-tests -- models` asserts **6 model-level tests**:
+4 models **bit-exact** vs their executed-TFLite golden (sine smoke,
+hello_world, kws_micro_speech, anomaly_detect) + 2 models that **compile and
+execute** through `#[model]` but are **NOT asserted bit-exact**
+(person_detect_vww, mobilenet_v2). The 2 non-bit-exact models diverge at
+rounding boundaries where the hematite kernels (TFLM single-rounding
+`MultiplyByQuantizedMultiplier`) differ ±1 from the host ai-edge-litert
+reference kernels (double-rounding), and at their softmax where the LiteRT int8
+softmax algorithm differs from the TFLM reference on wide-dynamic-range logits.
+These are kernel-semantics differences in `hematite-ref` (owned by the kernel
+workstream), not emitter/parser gaps — the emitter compiles all 6 models and
+matches the interpreter bit-exactly through 14 consecutive conv/depthwise ops
+on person_detect. Fix path documented in `DEFERRED_MODELS.md`.
 
 ## Regenerating this directory
 
 ```sh
 # From workspace root — downloads all 15 esp-dl artifacts + recomputes SHA256.
 bash tools/generate_goldens/zoo/fetch_espdl.sh
+
+# Regenerate the executed-TFLite model goldens (all runnable .tflite under models/):
+cargo run -p generate-goldens
 ```

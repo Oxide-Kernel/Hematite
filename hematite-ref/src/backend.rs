@@ -16,9 +16,6 @@
 //!
 //! | Trait method            | Reason                                                                 |
 //! |-------------------------|------------------------------------------------------------------------|
-//! | `matmul`                | No scalar kernel and no golden fixture exist (T0.5 corpus gap).         |
-//! | `sigmoid` / `tanh`      | No scalar kernel and no golden fixture exist (not in T0.5 corpus).      |
-//! | `reduce_max`/`reduce_min` | No scalar kernel and no golden fixture exist (T2.5 generated only mean/sum/argmax/argmin/l2_norm). |
 //! | `unidirectional_sequence_lstm` / `svdf` / `gru` | The trait signatures cannot carry the fixture-specific fixed-point quant constants (gate/cell/output multiplier+shift pairs) that the scalar recurrent kernels require; these live in the per-op tests, not in `LstmParams`/`SvdfParams`/`GruParams`. The recurrent kernels are still bit-exact tested via direct free-function calls in `hematite-tests/tests/`. |
 //!
 //! # Trait-signature adaptations
@@ -47,11 +44,13 @@ use hematite_core::op_params::{
 use hematite_core::{KernelBackend, KernelError};
 
 use crate::activation;
+use crate::activation_ext;
 use crate::conv;
 use crate::data_movement;
 use crate::depthwise_conv;
 use crate::elementwise;
 use crate::fully_connected;
+use crate::matmul;
 use crate::pool;
 use crate::reductions;
 use crate::resize;
@@ -185,19 +184,18 @@ impl KernelBackend for RefBackend {
         fully_connected::fully_connected(input, weights, bias, params, output, scratch)
     }
 
-    /// Not wired: no scalar `matmul` kernel and no golden fixture exist
-    /// (see module docs). Model-level codegen does not emit MatMul for the
-    /// in-scope zoo models (fully_connected covers the dense case).
+    /// Forwards to [`matmul::matmul`] — TFLM int8 BatchMatMul reference
+    /// path (per-tensor requantize, no bias term).
     fn matmul(
         &self,
-        _input: &[i8],
-        _weights: &[i8],
-        _bias: &[i32],
-        _params: &MatMulParams,
-        _output: &mut [i8],
-        _scratch: &mut [u8],
+        input: &[i8],
+        weights: &[i8],
+        bias: &[i32],
+        params: &MatMulParams,
+        output: &mut [i8],
+        scratch: &mut [u8],
     ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported)
+        matmul::matmul(input, weights, bias, params, output, scratch)
     }
 
     // ── Tier1 — Pooling ─────────────────────────────────────────────────
@@ -263,24 +261,26 @@ impl KernelBackend for RefBackend {
         activation::hard_swish(input, params, output, &mut [])
     }
 
-    /// Not wired: no scalar sigmoid kernel and no golden fixture exist.
+    /// Forwards to [`activation_ext::sigmoid`] — gemmlowp Q4.27 logistic
+    /// (input scale 1/16, `output_offset = -128`).
     fn sigmoid(
         &self,
-        _input: &[i8],
-        _params: &ActivationParams,
-        _output: &mut [i8],
+        input: &[i8],
+        params: &ActivationParams,
+        output: &mut [i8],
     ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported)
+        activation_ext::sigmoid(input, params, output)
     }
 
-    /// Not wired: no scalar tanh kernel and no golden fixture exist.
+    /// Forwards to [`activation_ext::tanh`] — gemmlowp Q4.27 tanh (same
+    /// input scale as sigmoid, **no output offset**).
     fn tanh(
         &self,
-        _input: &[i8],
-        _params: &ActivationParams,
-        _output: &mut [i8],
+        input: &[i8],
+        params: &ActivationParams,
+        output: &mut [i8],
     ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported)
+        activation_ext::tanh(input, params, output)
     }
 
     fn leaky_relu(
@@ -522,26 +522,26 @@ impl KernelBackend for RefBackend {
         reductions::sum(input, params, output)
     }
 
-    /// Not wired: no scalar `reduce_max` kernel and no golden fixture exist
-    /// (T2.5 generated only mean/sum/argmax/argmin/l2_norm).
+    /// Forwards to [`reductions::reduce_max`] — pure int8 comparison
+    /// (no requantize; output zero-point equals input zero-point).
     fn reduce_max(
         &self,
-        _input: &[i8],
-        _params: &ReduceParams,
-        _output: &mut [i8],
+        input: &[i8],
+        params: &ReduceParams,
+        output: &mut [i8],
     ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported)
+        reductions::reduce_max(input, params, output)
     }
 
-    /// Not wired: no scalar `reduce_min` kernel and no golden fixture exist
-    /// (same T2.5 corpus gap as `reduce_max`).
+    /// Forwards to [`reductions::reduce_min`] — pure int8 comparison
+    /// (no requantize).
     fn reduce_min(
         &self,
-        _input: &[i8],
-        _params: &ReduceParams,
-        _output: &mut [i8],
+        input: &[i8],
+        params: &ReduceParams,
+        output: &mut [i8],
     ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported)
+        reductions::reduce_min(input, params, output)
     }
 
     fn arg_max(

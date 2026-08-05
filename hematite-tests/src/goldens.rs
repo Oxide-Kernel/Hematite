@@ -160,8 +160,31 @@ pub mod reduce_min {
 }
 
 // ── Model goldens (captured from executed TFLite interpreter) ──
+// The model INPUT_DATA consts are the raw model input tensors (up to 150k
+// elements for MobileNetV2-224) — intentionally const, not static.
+#[allow(clippy::large_const_arrays)]
 pub mod models {
     pub mod sine {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../hematite-tests/goldens/models/sine.rs"));
+    }
+
+    pub mod hello_world_int8 {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../hematite-tests/goldens/models/hello_world_int8.rs"));
+    }
+
+    pub mod kws_micro_speech_int8 {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../hematite-tests/goldens/models/kws_micro_speech_int8.rs"));
+    }
+
+    pub mod person_detect_int8 {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../hematite-tests/goldens/models/person_detect_int8.rs"));
+    }
+
+    pub mod mobilenet_v2_1_0_224_int8 {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../hematite-tests/goldens/models/mobilenet_v2_1.0_224_int8.rs"));
+    }
+
+    pub mod anomaly_detect_int8 {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../hematite-tests/goldens/models/anomaly_detect_int8.rs"));
     }
 }

@@ -22,6 +22,13 @@
 //!    dimension, `integer_sqrt` to get the norm, then per-channel
 //!    scaling via integer division (same rounding as the generator).
 //!
+//! 6. **reduce_max / reduce_min:** pure int8 comparison over the reduced
+//!    axes — no quantization, no requantize. Output zero-point equals the
+//!    input zero-point implicitly (TFLM `EvalMinMaxHelper` requires
+//!    `TF_LITE_ENSURE_EQ` on scale and zero-point). Mirrors
+//!    `MinMaxReducerCompare<int8_t>` in
+//!    `tensorflow/lite/micro/kernels/reduce_common.cc` at the pinned SHA.
+//!
 //! # Batch constraint
 //!
 //! Only batch = 1 is supported. `batch > 1` returns [`KernelError::Unsupported`].
@@ -562,6 +569,169 @@ pub fn l2_norm(
             };
             let val = (result + out_off).max(act_min).min(act_max);
             output[base + c] = clamp_i8(val, act_min, act_max);
+        }
+    }
+
+    Ok(())
+}
+
+/// Reduce-max — scalar reference kernel.
+///
+/// Mirrors `tools/generate_goldens/src/ops/reductions.rs::generate_reduce_max`
+/// (TFLM `MinMaxReducerCompare<int8_t>`): pure int8 comparison over the
+/// reduced axes, initial value `i8::MIN`, update on `in > current`.
+/// No quantization, no requantize — the output zero-point equals the input
+/// zero-point implicitly.
+///
+/// # Errors
+///
+/// * [`KernelError::Unsupported`] if `input_shape[0] > 1`.
+/// * [`KernelError::ShapeMismatch`] if slice lengths disagree.
+pub fn reduce_max(
+    input: &[i8],
+    params: &ReduceParams,
+    output: &mut [i8],
+) -> Result<(), KernelError> {
+    if params.input_shape[0] != 1 {
+        return Err(KernelError::Unsupported);
+    }
+
+    let in_len = shape_product(&params.input_shape);
+    let out_len = shape_product(&params.output_shape);
+    if input.len() != in_len || output.len() != out_len {
+        return Err(KernelError::ShapeMismatch);
+    }
+
+    let mut reduce_mask = [false; 4];
+    for i in 0..(params.axis_count as usize).min(4) {
+        let ax = params.axis[i] as usize;
+        if ax < 4 {
+            reduce_mask[ax] = true;
+        }
+    }
+
+    let in_shape = params.input_shape;
+    let out_shape = params.output_shape;
+    let in_h = in_shape[1] as usize;
+    let in_w = in_shape[2] as usize;
+    let in_c = in_shape[3] as usize;
+
+    let in_stride_c: usize = 1;
+    let in_stride_w: usize = in_c;
+    let in_stride_h: usize = in_w * in_c;
+
+    let out_h = out_shape[1] as usize;
+    let out_w = out_shape[2] as usize;
+    let out_c = out_shape[3] as usize;
+
+    for oh in 0..out_h {
+        for ow in 0..out_w {
+            for oc in 0..out_c {
+                let mut current: i8 = i8::MIN;
+
+                let h_start = if reduce_mask[1] { 0 } else { oh * (in_h / out_h.max(1)) };
+                let h_end = if reduce_mask[1] { in_h } else { h_start + 1 };
+                let w_start = if reduce_mask[2] { 0 } else { ow * (in_w / out_w.max(1)) };
+                let w_end = if reduce_mask[2] { in_w } else { w_start + 1 };
+                let c_start = if reduce_mask[3] { 0 } else { oc * (in_c / out_c.max(1)) };
+                let c_end = if reduce_mask[3] { in_c } else { c_start + 1 };
+
+                for ih in h_start..h_end {
+                    for iw in w_start..w_end {
+                        for ic in c_start..c_end {
+                            let idx = ih * in_stride_h + iw * in_stride_w + ic * in_stride_c;
+                            let val = input[idx];
+                            if val > current {
+                                current = val;
+                            }
+                        }
+                    }
+                }
+
+                let out_idx = oh * (out_w * out_c) + ow * out_c + oc;
+                output[out_idx] = current;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Reduce-min — scalar reference kernel.
+///
+/// Mirrors `tools/generate_goldens/src/ops/reductions.rs::generate_reduce_min`
+/// (TFLM `MinMaxReducerCompare<int8_t>`): pure int8 comparison over the
+/// reduced axes, initial value `i8::MAX`, update on `in < current`.
+/// No quantization, no requantize.
+///
+/// # Errors
+///
+/// * [`KernelError::Unsupported`] if `input_shape[0] > 1`.
+/// * [`KernelError::ShapeMismatch`] if slice lengths disagree.
+pub fn reduce_min(
+    input: &[i8],
+    params: &ReduceParams,
+    output: &mut [i8],
+) -> Result<(), KernelError> {
+    if params.input_shape[0] != 1 {
+        return Err(KernelError::Unsupported);
+    }
+
+    let in_len = shape_product(&params.input_shape);
+    let out_len = shape_product(&params.output_shape);
+    if input.len() != in_len || output.len() != out_len {
+        return Err(KernelError::ShapeMismatch);
+    }
+
+    let mut reduce_mask = [false; 4];
+    for i in 0..(params.axis_count as usize).min(4) {
+        let ax = params.axis[i] as usize;
+        if ax < 4 {
+            reduce_mask[ax] = true;
+        }
+    }
+
+    let in_shape = params.input_shape;
+    let out_shape = params.output_shape;
+    let in_h = in_shape[1] as usize;
+    let in_w = in_shape[2] as usize;
+    let in_c = in_shape[3] as usize;
+
+    let in_stride_c: usize = 1;
+    let in_stride_w: usize = in_c;
+    let in_stride_h: usize = in_w * in_c;
+
+    let out_h = out_shape[1] as usize;
+    let out_w = out_shape[2] as usize;
+    let out_c = out_shape[3] as usize;
+
+    for oh in 0..out_h {
+        for ow in 0..out_w {
+            for oc in 0..out_c {
+                let mut current: i8 = i8::MAX;
+
+                let h_start = if reduce_mask[1] { 0 } else { oh * (in_h / out_h.max(1)) };
+                let h_end = if reduce_mask[1] { in_h } else { h_start + 1 };
+                let w_start = if reduce_mask[2] { 0 } else { ow * (in_w / out_w.max(1)) };
+                let w_end = if reduce_mask[2] { in_w } else { w_start + 1 };
+                let c_start = if reduce_mask[3] { 0 } else { oc * (in_c / out_c.max(1)) };
+                let c_end = if reduce_mask[3] { in_c } else { c_start + 1 };
+
+                for ih in h_start..h_end {
+                    for iw in w_start..w_end {
+                        for ic in c_start..c_end {
+                            let idx = ih * in_stride_h + iw * in_stride_w + ic * in_stride_c;
+                            let val = input[idx];
+                            if val < current {
+                                current = val;
+                            }
+                        }
+                    }
+                }
+
+                let out_idx = oh * (out_w * out_c) + ow * out_c + oc;
+                output[out_idx] = current;
+            }
         }
     }
 

@@ -74,19 +74,24 @@ Model-level fixtures are captured from a **real executed TFLite interpreter**
 (ai-edge-litert, the successor to tflite-runtime), not the tool-internal
 reimplementation:
 
-- `src/ops/zoo.rs` scans `models/` for runnable `.tflite` files and invokes
-  `zoo/run_model.py` (project venv at `zoo/.venv`, `pip install ai-edge-litert`)
-  as a subprocess, then writes the captured int8 output via
-  `FixtureWriter::write_model` into `hematite-tests/goldens/models/<name>.rs`.
+- `src/ops/zoo.rs` scans `models/` (recursively, including `models/zoo/`) for
+  runnable `.tflite` files and invokes `zoo/run_model.py` (project venv at
+  `zoo/.venv`, `pip install ai-edge-litert`) as a subprocess, then writes the
+  captured int8 output via `FixtureWriter::write_model` into
+  `hematite-tests/goldens/models/<name>.rs`.
 - These fixtures carry distinct provenance:
   `GOLDEN_PROVENANCE = "captured-from-executed-TFLite-interpreter; see
   tools/generate_goldens/zoo/run_model.py"` plus `GOLDEN_RUNTIME_VERSION`.
-- **The 18-model zoo is NOT runnable through this path as of T5.0.** All 15
-  esp-dl artifacts are the proprietary `.espdl` format (zero `.tflite` files
-  exist anywhere in esp-dl — verified across all branches/tags/history), and
-  the 6 edge-ml models are not publicly available. Full accounting in
-  `models/zoo/DEFERRED_MODELS.md`. The mechanism is proven end-to-end with
-  `models/sine.tflite` (the workspace's only runnable TFLite model).
+- **The esp-dl zoo is NOT runnable through this path**: all 15 artifacts are
+  the proprietary `.espdl` format (zero `.tflite` files exist anywhere in
+  esp-dl — verified across all branches/tags/history), and the 6 edge-ml
+  models are not publicly available. Full accounting in
+  `models/zoo/DEFERRED_MODELS.md`.
+- **T5.2 added 5 real public int8 `.tflite` substitutions** under
+  `models/zoo/` (person_detect_vww, keyword_spotting, mobilenetv2_cls,
+  anomaly_detect, sine_regression) — all now captured here, giving 6 model
+  goldens total (`sine.rs` + 5). Bit-exactness status per model in
+  `models/zoo/README.md`.
 
 ## TFLM Reference Pin
 

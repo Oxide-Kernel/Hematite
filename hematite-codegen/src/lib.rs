@@ -317,7 +317,7 @@ mod tests {
         assert_eq!(op2.builtin_code, 40);
         match &op2.options {
             Some(flatbuffer::ParsedOptions::Mean { axis, keep_dims }) => {
-                assert_eq!(*axis, 1);
+                assert_eq!(*axis, vec![1]);
                 assert!(!*keep_dims);
             }
             other => panic!("expected Mean options, got {other:?}"),

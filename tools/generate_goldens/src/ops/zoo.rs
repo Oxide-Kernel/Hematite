@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Scan `models/` (workspace root) for runnable `.tflite` models and emit a
-/// golden fixture for each. Skips `.espdl` artifacts (format barrier, logged).
+/// golden fixture for each. `.espdl` artifacts (format barrier, logged) are
+/// filtered by extension; `models/zoo/` is recursed so its `.tflite`
+/// substitutions (T5.2) are captured.
 pub fn generate_model_goldens(w: &mut FixtureWriter, workspace_root: &Path) {
     let models_dir = workspace_root.join("models");
 
@@ -56,10 +58,6 @@ fn collect_tflite(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            if path.ends_with("zoo") {
-                // zoo contains .espdl only; skip recursion (no .tflite exists)
-                continue;
-            }
             collect_tflite(&path, out);
         } else if path.extension().is_some_and(|e| e == "tflite") {
             out.push(path);

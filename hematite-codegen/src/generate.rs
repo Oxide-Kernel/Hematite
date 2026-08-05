@@ -469,6 +469,12 @@ fn arr4(v: [i32; 4]) -> TokenStream {
     quote!([#a, #b, #c, #d])
 }
 
+/// Token stream for a `[i32; 8]` array literal.
+fn arr8(v: [i32; 8]) -> TokenStream {
+    let [a, b, c, d, e, f, g, h] = v;
+    quote!([#a, #b, #c, #d, #e, #f, #g, #h])
+}
+
 /// Weight const for op `i`: the int8 filter buffer (raw bytes → i8).
 fn weight_const(model: &ParsedModel, tensor_idx: u32, name: &Ident) -> Result<TokenStream, String> {
     let tensor = model
@@ -592,6 +598,8 @@ fn emit_op(
         21 => emit_activation(model, storage, i, op, quote!(relu6), 3),
         22 => emit_reshape(model, storage, i, op),
         25 => emit_softmax(model, storage, i, op),
+        34 => emit_pad(model, storage, i, op),
+        39 => emit_transpose(model, storage, i, op),
         40 => emit_mean(model, storage, i, op),
         41 => emit_elementwise(model, storage, i, op, quote!(sub), ElementwiseKind::AddSub),
         54 => emit_prelu(model, storage, i, op),
@@ -926,8 +934,16 @@ fn emit_pool(
 }
 
 fn emit_softmax(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
-    if let Some(other) = op.options.as_ref() {
-        return Err(format!("op {i}: unexpected options {other:?} for softmax"));
+    // TFLM int8 softmax only supports beta = 1.0; a SoftmaxOptions table
+    // carrying exactly that (the converter default) is accepted and ignored.
+    match op.options.as_ref() {
+        None => {}
+        Some(ParsedOptions::Softmax { beta }) if (beta - 1.0).abs() < 1e-6 => {}
+        Some(other) => {
+            return Err(format!(
+                "op {i}: softmax beta != 1.0 is not supported (T4.1 dispatch scope), got {other:?}"
+            ));
+        }
     }
     let in_t = *op.inputs.first().ok_or("softmax missing input tensor")?;
     let out_t = *op.outputs.first().ok_or("softmax missing output tensor")?;
@@ -1256,10 +1272,17 @@ fn emit_elementwise(
 
 fn emit_mean(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
     let (axis, keep_dims) = match op.options.as_ref() {
-        Some(ParsedOptions::Mean { axis, keep_dims }) => (*axis, *keep_dims),
+        Some(ParsedOptions::Mean { axis, keep_dims }) => (axis.clone(), *keep_dims),
         other => return Err(format!("op {i}: expected Mean options, got {other:?}")),
     };
-    let axis_i16: i16 = i16::try_from(axis).map_err(|_| format!("op {i}: mean axis {axis} out of i16 range"))?;
+    if axis.is_empty() || axis.len() > 4 {
+        return Err(format!("op {i}: mean axis count {} out of range (1..=4)", axis.len()));
+    }
+    let axis_count = axis.len() as i8;
+    let mut axis_arr = [0i16; 4];
+    for (k, &a) in axis.iter().enumerate() {
+        axis_arr[k] = i16::try_from(a).map_err(|_| format!("op {i}: mean axis {a} out of i16 range"))?;
+    }
     let in_t = *op.inputs.first().ok_or("mean missing input tensor")?;
     let out_t = *op.outputs.first().ok_or("mean missing output tensor")?;
     let input = tensor_at(model.tensors(), in_t)?;
@@ -1273,12 +1296,16 @@ fn emit_mean(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) 
     let (om, os) = quantize_multiplier(in_scale / out_scale);
 
     let p_name = Ident::new(&format!("REDUCE_PARAMS_{i}"), proc_macro2::Span::call_site());
+    let axis_arr_0 = axis_arr[0];
+    let axis_arr_1 = axis_arr[1];
+    let axis_arr_2 = axis_arr[2];
+    let axis_arr_3 = axis_arr[3];
     let params_c = quote! {
         const #p_name: ::hematite_core::op_params::ReduceParams =
             ::hematite_core::op_params::ReduceParams {
                 keep_dims: #keep_dims,
-                axis: [#axis_i16, 0, 0, 0],
-                axis_count: 1,
+                axis: [#axis_arr_0, #axis_arr_1, #axis_arr_2, #axis_arr_3],
+                axis_count: #axis_count,
                 input_shape: #input_shape,
                 output_shape: #output_shape,
                 output_type: 0,
@@ -1306,8 +1333,16 @@ fn emit_reshape(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedO
     let out_t = *op.outputs.first().ok_or("reshape missing output tensor")?;
     let in_t = *op.inputs.first().ok_or("reshape missing input tensor")?;
     let output = tensor_at(model.tensors(), out_t)?;
+    // ReshapeOptions may carry a target with 0 (copy-from-input) or -1
+    // (infer-from-count) entries; the model's output tensor shape IS the
+    // resolved shape, so fall back to it whenever the target is not fully
+    // static-positive.
     let target: Vec<i32> = match op.options.as_ref() {
-        Some(ParsedOptions::Reshape { new_shape }) if !new_shape.is_empty() => new_shape.clone(),
+        Some(ParsedOptions::Reshape { new_shape })
+            if !new_shape.is_empty() && new_shape.iter().all(|&d| d > 0) =>
+        {
+            new_shape.clone()
+        }
         _ => output.shape.clone(),
     };
     if target.len() > 4 {
@@ -1342,8 +1377,127 @@ fn emit_reshape(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedO
     })
 }
 
-fn emit_resize(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
-    let (align_corners, half_pixel_centers) = match op.options.as_ref() {
+/// PAD — the padding amounts come from a const int32 tensor of shape
+/// `[rank, 2]` (`[before, after]` per dim); the kernel pads with value 0.
+fn emit_pad(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
+    let in_t = *op.inputs.first().ok_or("pad missing input tensor")?;
+    let pad_t = *op.inputs.get(1).ok_or("pad missing padding tensor")?;
+    let out_t = *op.outputs.first().ok_or("pad missing output tensor")?;
+    let input = tensor_at(model.tensors(), in_t)?;
+    let padding = tensor_at(model.tensors(), pad_t)?;
+    let output = tensor_at(model.tensors(), out_t)?;
+    let rank = input.shape.len();
+    if !(1..=4).contains(&rank) {
+        return Err(format!("op {i}: pad input rank {rank} outside the static-shape range 1..=4"));
+    }
+    let bytes = model.buffer_data(padding).ok_or_else(|| {
+        format!("op {i}: padding tensor '{}' has no const buffer", padding.name)
+    })?;
+    if bytes.len() != rank * 2 * 4 {
+        return Err(format!(
+            "op {i}: padding tensor '{}' buffer length {} != rank*2*4 = {}",
+            padding.name,
+            bytes.len(),
+            rank * 2 * 4
+        ));
+    }
+    let mut left = [0i32; 4];
+    let mut right = [0i32; 4];
+    for d in 0..rank {
+        let lo = d * 8;
+        left[d] = i32::from_le_bytes([bytes[lo], bytes[lo + 1], bytes[lo + 2], bytes[lo + 3]]);
+        right[d] = i32::from_le_bytes([bytes[lo + 4], bytes[lo + 5], bytes[lo + 6], bytes[lo + 7]]);
+    }
+    let input_shape = arr4(shape4(&input.shape)?);
+    let output_shape = arr4(shape4(&output.shape)?);
+    let left = arr4(left);
+    let right = arr4(right);
+    let count = rank as i8;
+
+    let p_name = Ident::new(&format!("PAD_PARAMS_{i}"), proc_macro2::Span::call_site());
+    let params_c = quote! {
+        const #p_name: ::hematite_core::op_params::PadParams =
+            ::hematite_core::op_params::PadParams {
+                input_shape: #input_shape,
+                output_shape: #output_shape,
+                left_padding: #left,
+                left_padding_count: #count,
+                right_padding: #right,
+                right_padding_count: #count,
+            };
+    };
+    let src = src_expr(storage, in_t as usize)?;
+    let dst = dst_expr(storage, out_t as usize)?;
+    let call = quote! {
+        backend.pad(#src, &#p_name, #dst)?;
+    };
+    Ok(OpEmission {
+        consts: vec![params_c],
+        call,
+        scratch: 0,
+    })
+}
+
+/// TRANSPOSE — the permutation comes from a const int32 tensor of length
+/// `rank`; the kernel computes the output shape from the permuted input.
+fn emit_transpose(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
+    let in_t = *op.inputs.first().ok_or("transpose missing input tensor")?;
+    let perm_t = *op.inputs.get(1).ok_or("transpose missing perm tensor")?;
+    let out_t = *op.outputs.first().ok_or("transpose missing output tensor")?;
+    let input = tensor_at(model.tensors(), in_t)?;
+    let perm_tensor = tensor_at(model.tensors(), perm_t)?;
+    let _ = tensor_at(model.tensors(), out_t)?;
+    let rank = input.shape.len();
+    if !(1..=4).contains(&rank) {
+        return Err(format!("op {i}: transpose input rank {rank} outside the static-shape range 1..=4"));
+    }
+    let bytes = model.buffer_data(perm_tensor).ok_or_else(|| {
+        format!("op {i}: perm tensor '{}' has no const buffer", perm_tensor.name)
+    })?;
+    if bytes.len() != rank * 4 {
+        return Err(format!(
+            "op {i}: perm tensor '{}' buffer length {} != rank*4 = {}",
+            perm_tensor.name,
+            bytes.len(),
+            rank * 4
+        ));
+    }
+    let mut perm = [0i32; 8];
+    let mut perm_count = 0i8;
+    for (d, slot) in perm.iter_mut().take(rank).enumerate() {
+        let lo = d * 4;
+        let p = i32::from_le_bytes([bytes[lo], bytes[lo + 1], bytes[lo + 2], bytes[lo + 3]]);
+        if p < 0 || p as usize >= rank {
+            return Err(format!("op {i}: transpose perm entry {p} out of range for rank {rank}"));
+        }
+        *slot = p;
+        perm_count += 1;
+    }
+    let input_shape = arr4(shape4(&input.shape)?);
+    let perm = arr8(perm);
+
+    let p_name = Ident::new(&format!("TRANSPOSE_PARAMS_{i}"), proc_macro2::Span::call_site());
+    let params_c = quote! {
+        const #p_name: ::hematite_core::op_params::TransposeParams =
+            ::hematite_core::op_params::TransposeParams {
+                input_shape: #input_shape,
+                perm: #perm,
+                perm_count: #perm_count,
+            };
+    };
+    let src = src_expr(storage, in_t as usize)?;
+    let dst = dst_expr(storage, out_t as usize)?;
+    let call = quote! {
+        backend.transpose(#src, &#p_name, #dst)?;
+    };
+    Ok(OpEmission {
+        consts: vec![params_c],
+        call,
+        scratch: 0,
+    })
+}
+
+fn emit_resize(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {    let (align_corners, half_pixel_centers) = match op.options.as_ref() {
         Some(ParsedOptions::ResizeNearest {
             align_corners,
             half_pixel_centers,
