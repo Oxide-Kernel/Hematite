@@ -960,7 +960,7 @@ mod tests {
     fn test_one_over_one_plus_x_at_zero() {
         // 1/(1+0) = 1.0 → Q0.31 ≈ i32::MAX
         let result = one_over_one_plus_x_for_x_in_0_1(0);
-        assert!(result >= i32::MAX - 2 && result <= i32::MAX,
+        assert!(result >= i32::MAX - 2,
             "1/(1+0) must be ~1.0 in Q0.31, got {result}");
     }
 
