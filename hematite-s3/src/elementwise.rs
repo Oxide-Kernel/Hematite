@@ -1,0 +1,445 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Hematite Contributors.
+//
+//! Elementwise operations — scalar fallback + TIE728 SIMD backend.
+//!
+//! # Bit-exact contract (Plan A4)
+//!
+//! | Leg | Contract | Runs on |
+//! |-----|----------|---------|
+//! | (a) | SIMD ≡ per-tensor TFLM golden bit-exact | Device (Phase 5) |
+//! | (b) | **Scalar ref ≡ per-tensor TFLM golden bit-exact** | **Host** (this test) |
+//! | (c) | SIMD vs ref cross-check ≤1 LSB on requantize | Device (Phase 5) |
+//!
+//! On host (stable-aarch64-apple-darwin), only leg (b) executes. The SIMD path
+//! (`#[cfg(target_arch = "xtensa")]`) is NEVER compiled on host — it exists in
+//! the tree for structural review and Phase 5 device verification.
+//!
+//! # Binary ops (add, mul, sub)
+//!
+//! Follow the TFLM `reference_integer_ops` AddFunc / MulElementwise / Sub
+//! formulations from `tensorflow/lite/kernels/internal/reference/integer_ops/`:
+//!
+//! * **Add / Sub**: Shifted per-input scaling → sum/diff → output requantize.
+//! * **Mul**: Direct product → single output requantize (no left_shift,
+//!   no per-input multiplier/shift).
+
+use hematite_core::op_params::ElementwiseParams;
+use hematite_core::KernelError;
+use hematite_int8::{multiply_by_quantized_multiplier, saturating_cast};
+
+/// Elementwise ADD — scalar kernel (host-compilable, bit-exact vs per-tensor golden).
+///
+/// Per-element `(input1 + input1_offset) + (input2 + input2_offset)` with
+/// per-input rescaling (left_shift + multiplier/shift), then output requantize.
+///
+/// Matches TFLM `reference_integer_ops::AddFunc`.
+///
+/// # Errors
+///
+/// * [`KernelError::ShapeMismatch`] if `input1.len()`, `input2.len()`, or
+///   `output.len()` does not equal `params.num_elements`.
+pub fn add(
+    input1: &[i8],
+    input2: &[i8],
+    params: &ElementwiseParams,
+    output: &mut [i8],
+    scratch: &mut [u8],
+) -> Result<(), KernelError> {
+    let n = params.num_elements as usize;
+    if input1.len() != n || input2.len() != n || output.len() != n {
+        return Err(KernelError::ShapeMismatch);
+    }
+
+    let left_shift = params.left_shift;
+    let shift_factor = if left_shift >= 0 {
+        1i32 << left_shift
+    } else {
+        1i32
+    };
+
+    for i in 0..n {
+        let mut val1 = i32::from(input1[i]) + params.input1_offset;
+        let mut val2 = i32::from(input2[i]) + params.input2_offset;
+
+        // left_shift before per-input rescaling (TFLM AddFunc step)
+        val1 *= shift_factor;
+        val2 *= shift_factor;
+
+        // Per-input rescaling
+        if params.input1_multiplier != 1i32 << 30 || params.input1_shift != 1 {
+            val1 = multiply_by_quantized_multiplier(
+                val1, params.input1_multiplier, params.input1_shift);
+        }
+        if params.input2_multiplier != 1i32 << 30 || params.input2_shift != 1 {
+            val2 = multiply_by_quantized_multiplier(
+                val2, params.input2_multiplier, params.input2_shift);
+        }
+
+        let raw_sum = val1 + val2;
+        let scaled = multiply_by_quantized_multiplier(
+            raw_sum, params.output_multiplier, params.output_shift);
+        let with_offset = scaled + params.output_offset;
+
+        let clamped = if with_offset > params.quantized_activation_max {
+            params.quantized_activation_max
+        } else if with_offset < params.quantized_activation_min {
+            params.quantized_activation_min
+        } else {
+            with_offset
+        };
+        output[i] = saturating_cast(clamped);
+    }
+
+    let _ = scratch;
+    Ok(())
+}
+
+/// Elementwise MUL — scalar kernel (host-compilable, bit-exact vs per-tensor golden).
+///
+/// Per-element `(input1 + input1_offset) * (input2 + input2_offset)`,
+/// then single output requantize.  No left_shift or per-input rescaling.
+///
+/// Matches TFLM `reference_integer_ops::MulElementwise`.
+///
+/// # Errors
+///
+/// * [`KernelError::ShapeMismatch`] if slice lengths ≠ `params.num_elements`.
+pub fn mul(
+    input1: &[i8],
+    input2: &[i8],
+    params: &ElementwiseParams,
+    output: &mut [i8],
+    scratch: &mut [u8],
+) -> Result<(), KernelError> {
+    let n = params.num_elements as usize;
+    if input1.len() != n || input2.len() != n || output.len() != n {
+        return Err(KernelError::ShapeMismatch);
+    }
+
+    for i in 0..n {
+        let val1 = i32::from(input1[i]) + params.input1_offset;
+        let val2 = i32::from(input2[i]) + params.input2_offset;
+        let product = val1 * val2;
+        let scaled = multiply_by_quantized_multiplier(
+            product, params.output_multiplier, params.output_shift);
+        let with_offset = scaled + params.output_offset;
+
+        let clamped = if with_offset > params.quantized_activation_max {
+            params.quantized_activation_max
+        } else if with_offset < params.quantized_activation_min {
+            params.quantized_activation_min
+        } else {
+            with_offset
+        };
+        output[i] = saturating_cast(clamped);
+    }
+
+    let _ = scratch;
+    Ok(())
+}
+
+/// Elementwise SUB — scalar kernel (host-compilable, bit-exact vs per-tensor golden).
+///
+/// Same chain as [`add`] but subtracts `scaled_input2` from `scaled_input1`.
+///
+/// Matches TFLM `reference_integer_ops::Sub` (uses same ArithmeticParams as Add).
+///
+/// # Errors
+///
+/// * [`KernelError::ShapeMismatch`] if slice lengths ≠ `params.num_elements`.
+pub fn sub(
+    input1: &[i8],
+    input2: &[i8],
+    params: &ElementwiseParams,
+    output: &mut [i8],
+    scratch: &mut [u8],
+) -> Result<(), KernelError> {
+    let n = params.num_elements as usize;
+    if input1.len() != n || input2.len() != n || output.len() != n {
+        return Err(KernelError::ShapeMismatch);
+    }
+
+    let left_shift = params.left_shift;
+    let shift_factor = if left_shift >= 0 {
+        1i32 << left_shift
+    } else {
+        1i32
+    };
+
+    for i in 0..n {
+        let mut val1 = i32::from(input1[i]) + params.input1_offset;
+        let mut val2 = i32::from(input2[i]) + params.input2_offset;
+
+        val1 *= shift_factor;
+        val2 *= shift_factor;
+
+        if params.input1_multiplier != 1i32 << 30 || params.input1_shift != 1 {
+            val1 = multiply_by_quantized_multiplier(
+                val1, params.input1_multiplier, params.input1_shift);
+        }
+        if params.input2_multiplier != 1i32 << 30 || params.input2_shift != 1 {
+            val2 = multiply_by_quantized_multiplier(
+                val2, params.input2_multiplier, params.input2_shift);
+        }
+
+        let raw_sub = val1 - val2;
+        let scaled = multiply_by_quantized_multiplier(
+            raw_sub, params.output_multiplier, params.output_shift);
+        let with_offset = scaled + params.output_offset;
+
+        let clamped = if with_offset > params.quantized_activation_max {
+            params.quantized_activation_max
+        } else if with_offset < params.quantized_activation_min {
+            params.quantized_activation_min
+        } else {
+            with_offset
+        };
+        output[i] = saturating_cast(clamped);
+    }
+
+    let _ = scratch;
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TIE728 SIMD backend — device-only (NEVER compiled on host)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// TIE728 SIMD backend for elementwise ops.
+///
+/// This module is **entirely cfg-gated** behind `#[cfg(target_arch = "xtensa")]`
+/// and is NEVER compiled on the host (stable-aarch64-apple-darwin). It exists
+/// in the tree for structural review and Phase 5 device verification (T5.3).
+///
+/// ## Architecture
+///
+/// The SIMD path calls the vendored `dl_tie728_s8_add_w1_16_w2_16` /
+/// `dl_tie728_s8_mul_w1_16_w2_16` / `dl_tie728_s8_sub_w1_16_w2_16` entry
+/// points from vendored .S files in `hematite-s3/src/asm/` via `global_asm!`.
+///
+/// Register convention (Xtensa XCC):
+/// * a2 = output pointer (i8*)
+/// * a3 = input1 pointer (i8*)
+/// * a4 = input2 pointer (i8*)
+/// * a5 = args pointer (packed struct)
+///
+/// ## Vendored .S files
+///
+/// Cell `hematite-s3/src/asm/` contains:
+/// * `dl_tie728_s8.S` — shared macros (pre-existing)
+/// * `dl_tie728_s8_add.S` — 6 add entry points (aligned/unaligned, broadcast)
+/// * `dl_tie728_s8_mul.S` — 6 mul entry points (aligned/unaligned, broadcast)
+/// * `dl_tie728_s8_sub.S` — 6 sub entry points (aligned/unaligned, broadcast)
+///
+/// All vendored from esp-dl @ 12c0616de145b704e1149c474b9a1e852e631d67 (MIT).
+///
+/// ## Args struct layouts (derived from vendored .S l32i offsets)
+///
+/// ### Add/Sub (aligned w1_16_w2_16)
+/// * +44: length (u32) — total element count (not div-16)
+///
+/// ### Add/Sub (unaligned)
+/// * +64: c_div_x_1 (i32) — number of full 16-byte chunks minus 1
+/// * +76: c_remainder (u32) — remainder elements (0–15)
+///
+/// ### Mul (aligned w1_16_w2_16)
+/// * +64: c_div_x_1 (i32) — number of full 16-byte chunks minus 1
+/// * +80: mul_shift (i32) — right-shift for round+requantize
+///
+/// ### Mul (unaligned)
+/// * +64: c_div_x_1 (i32)
+/// * +76: c_remainder (u32)
+/// * +80: mul_shift (i32)
+///
+/// ## A4 contract notes
+///
+/// * Leg (a): SIMD output must match a per-tensor TFLM golden (Phase 5 fixture
+///   with per-tensor OUTPUT_MULTIPLIER/SHIFT).
+/// * Leg (c): SIMD vs scalar ref cross-check tolerance ≤1 LSB on requantize.
+///
+/// These SIMD kernels do NOT handle quantization offsets (input1_offset,
+/// input2_offset, output_offset) or per-input rescaling. They compute raw
+/// int8 add/mul/sub. The calling layer is responsible for quant-affine
+/// preprocessing and postprocessing.
+#[cfg(target_arch = "xtensa")]
+mod elementwise_simd {
+    /// Include the vendored TIE728 shared macros and elementwise entry points.
+    ///
+    /// The shared `dl_tie728_s8.S` provides macros used by all three
+    /// elementwise files (`dl_tie728_s8_unaligned_store0`,
+    /// `tie728_s8_vector_round_result`, etc.).
+    core::arch::global_asm!(
+        include_str!("../src/asm/dl_tie728_s8.S"),
+        include_str!("../src/asm/dl_tie728_s8_add.S"),
+        include_str!("../src/asm/dl_tie728_s8_mul.S"),
+        include_str!("../src/asm/dl_tie728_s8_sub.S"),
+    );
+
+    // ── Args structs — derived from vendored .S l32i offsets ──────────────
+
+    /// Args for aligned add/sub — matches `dl_tie728_s8_add_w1_16_w2_16`
+    /// and `dl_tie728_s8_sub_w1_16_w2_16`.
+    ///
+    /// ABI verified against vendored .S at +44:
+    /// `l32i a6, a5, 44` → length, then `srai a5, a6, 4` → loop count.
+    ///
+    /// ABI unverified on device — validate at T5.3.
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct AddSubAlignedArgs {
+        _pad0: [u8; 44],       // offset 0-43: unused by these entry points
+        length: u32,           // offset 44: total element count
+    }
+
+    /// Args for aligned mul — matches `dl_tie728_s8_mul_w1_16_w2_16`.
+    ///
+    /// ABI verified against vendored .S:
+    /// * `l32i a6, a5, 64` → c_div_x_1
+    /// * `l32i a7, a5, 80` → mul_shift
+    ///
+    /// ABI unverified on device — validate at T5.3.
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct MulAlignedArgs {
+        _pad0: [u8; 64],       // offset 0-63: unused
+        c_div_x_1: i32,        // offset 64: (num_elements / 16) - 1
+        _pad1: [u8; 12],       // offset 68-79
+        mul_shift: i32,        // offset 80: requantize right-shift
+    }
+
+    // ── SIMD kernel glue ──────────────────────────────────────────────────
+
+    /// SIMD elementwise add (aligned) — calls the vendored TIE728 entry point.
+    ///
+    /// Calls `dl_tie728_s8_add_w1_16_w2_16`:
+    /// * a2 = output (i8*)
+    /// * a3 = input1 (i8*)
+    /// * a4 = input2 (i8*)
+    /// * a5 = &AddSubAlignedArgs { length: num_elements }
+    ///
+    /// # Safety
+    ///
+    /// This function is inherently unsafe: it calls into foreign assembly
+    /// via the C ABI. ABI unverified — validate at T5.3 on device.
+    ///
+    /// # Preconditions (caller MUST guarantee)
+    ///
+    /// * `num_elements` must be a multiple of 16 (16-wide SIMD lanes).
+    /// * All pointers must be 16-byte aligned for EE.VLD.128.IP / EE.VST.128.IP.
+    #[allow(dead_code)]
+    unsafe fn add_simd_aligned(
+        output: *mut i8,
+        input1: *const i8,
+        input2: *const i8,
+        num_elements: u32,
+    ) {
+        let args = AddSubAlignedArgs {
+            length: num_elements,
+        };
+        core::arch::asm!(
+            "mov a2, {output}",
+            "mov a3, {input1}",
+            "mov a4, {input2}",
+            "mov a5, {args}",
+            "call8 dl_tie728_s8_add_w1_16_w2_16",
+            output = in(reg) output,
+            input1 = in(reg) input1,
+            input2 = in(reg) input2,
+            args = in(reg) &args,
+            clobber_abi("C"),
+        );
+    }
+
+    /// SIMD elementwise mul (aligned) — calls the vendored TIE728 entry point.
+    ///
+    /// Calls `dl_tie728_s8_mul_w1_16_w2_16`:
+    /// * a2 = output (i8*)
+    /// * a3 = input1 (i8*)
+    /// * a4 = input2 (i8*)
+    /// * a5 = &MulAlignedArgs { c_div_x_1, mul_shift }
+    ///
+    /// # Safety
+    ///
+    /// Same safety contract as `add_simd_aligned`. ABI unverified.
+    ///
+    /// # Preconditions
+    ///
+    /// * `num_elements` must be a multiple of 16 and ≥ 16.
+    /// * All pointers 16-byte aligned.
+    /// * `mul_shift`: right-shift for requantize rounding
+    ///   (`tie728_s8_vector_round_result` macro). Set to 0 for no shift.
+    #[allow(dead_code)]
+    unsafe fn mul_simd_aligned(
+        output: *mut i8,
+        input1: *const i8,
+        input2: *const i8,
+        num_elements: u32,
+        mul_shift: i32,
+    ) {
+        let args = MulAlignedArgs {
+            c_div_x_1: (num_elements / 16) as i32 - 1,
+            mul_shift,
+        };
+        core::arch::asm!(
+            "mov a2, {output}",
+            "mov a3, {input1}",
+            "mov a4, {input2}",
+            "mov a5, {args}",
+            "call8 dl_tie728_s8_mul_w1_16_w2_16",
+            output = in(reg) output,
+            input1 = in(reg) input1,
+            input2 = in(reg) input2,
+            args = in(reg) &args,
+            clobber_abi("C"),
+        );
+    }
+
+    /// SIMD elementwise sub (aligned) — calls the vendored TIE728 entry point.
+    ///
+    /// Calls `dl_tie728_s8_sub_w1_16_w2_16`:
+    /// * a2 = output (i8*)
+    /// * a3 = input1 (i8*)
+    /// * a4 = input2 (i8*)
+    /// * a5 = &AddSubAlignedArgs { length: num_elements }
+    ///
+    /// # Safety
+    ///
+    /// Same safety contract as `add_simd_aligned`. ABI unverified.
+    ///
+    /// # Preconditions
+    ///
+    /// * `num_elements` must be a multiple of 16.
+    /// * All pointers 16-byte aligned.
+    #[allow(dead_code)]
+    unsafe fn sub_simd_aligned(
+        output: *mut i8,
+        input1: *const i8,
+        input2: *const i8,
+        num_elements: u32,
+    ) {
+        let args = AddSubAlignedArgs {
+            length: num_elements,
+        };
+        core::arch::asm!(
+            "mov a2, {output}",
+            "mov a3, {input1}",
+            "mov a4, {input2}",
+            "mov a5, {args}",
+            "call8 dl_tie728_s8_sub_w1_16_w2_16",
+            output = in(reg) output,
+            input1 = in(reg) input1,
+            input2 = in(reg) input2,
+            args = in(reg) &args,
+            clobber_abi("C"),
+        );
+    }
+}
+
+// Re-export the SIMD entry points at the crate level.
+#[cfg(target_arch = "xtensa")]
+pub use elementwise_simd::add_simd_aligned;
+#[cfg(target_arch = "xtensa")]
+pub use elementwise_simd::mul_simd_aligned;
+#[cfg(target_arch = "xtensa")]
+pub use elementwise_simd::sub_simd_aligned;
