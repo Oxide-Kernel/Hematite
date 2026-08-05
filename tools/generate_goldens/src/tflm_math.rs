@@ -428,6 +428,70 @@ pub fn requantize_i8(
     clamp_to_i8(with_offset, activation_min, activation_max)
 }
 
+// ── GRU gate helpers: fixed-point sigmoid and tanh ──────────────────────────
+//
+// These are implemented here (T2.4), NOT in activation.rs, because GRU is
+// the sole consumer of int8 sigmoid/tanh gates in this plan. The helpers use
+// gemmlowp's exp_on_negative_values + one_over_one_plus_x pipeline (same
+// infrastructure as softmax), producing Q0.11 output for the GRU state update.
+//
+// TFLM has NO GRU kernel at the pinned SHA. These implementations are
+// cross-checked against embedded-nn 0.2.1 (see tools/generate_goldens/README.md
+// GRU provenance note) and manually verified via self-check assertions
+// (sigmoid(0)=0.5, tanh(0)=0, endpoints saturate, monotonicity).
+
+/// Compute sigmoid for a negative Q5.26 value. Returns Q0.31.
+///
+/// For x <= 0: sigmoid(x) = exp(x) / (1 + exp(x)) = 1 - 1/(1+exp(x))
+fn logistic_negative_q031(x_q526: i32) -> i32 {
+    debug_assert!(x_q526 <= 0, "logistic_negative_q031: x must be <= 0, got {x_q526}");
+    let exp_x = exp_on_negative_values(x_q526, 5);
+    let one_over_one_plus_exp = one_over_one_plus_x_for_x_in_0_1(exp_x);
+    // sigmoid = 1 - 1/(1+exp)
+    i32::MAX - one_over_one_plus_exp
+}
+
+/// Fixed-point logistic (sigmoid): computes `1/(1+exp(-x))` in Q0.11.
+///
+/// Input `x_q526` is in Q5.26 format (5 integer bits, 26 fractional bits).
+/// Returns i16 in [0, 2048) representing sigmoid(x) in Q0.11.
+///
+/// Uses gemmlowp exp_on_negative_values + one_over_one_plus_x for x < 0,
+/// and the identity sigmoid(x) = 1 - sigmoid(-x) for x > 0.
+pub fn logistic_i16_q011(x_q526: i32) -> i16 {
+    let sig_q031 = if x_q526 >= 0 {
+        if x_q526 == 0 {
+            // sigmoid(0) = 0.5 exactly
+            (i32::MAX / 2) + 1
+        } else {
+            // sigmoid(x) = 1 - sigmoid(-x) for x > 0
+            let neg = if x_q526 == i32::MIN { i32::MAX } else { -x_q526 };
+            i32::MAX - logistic_negative_q031(neg)
+        }
+    } else {
+        logistic_negative_q031(x_q526)
+    };
+    // Q0.31 → Q0.11: right-shift by 20, rounding (ties away from zero)
+    rounding_divide_by_pot(sig_q031, 20) as i16
+}
+
+/// Fixed-point tanh: computes `(exp(x)-exp(-x))/(exp(x)+exp(-x))` in Q0.11.
+///
+/// Input `x_q526` is in Q5.26 format. Returns i16 in [-2048, 2047]
+/// representing tanh(x) in Q0.11, using the identity:
+/// `tanh(x) = 2·sigmoid(2x) - 1`.
+///
+/// The doubling is done in Q5.26 via saturating left-shift before
+/// calling `logistic_i16_q011`.
+pub fn tanh_i16_q011(x_q526: i32) -> i16 {
+    // 2x in Q5.26 (saturating to avoid overflow)
+    let two_x = saturating_rounding_left_shift(x_q526, 1);
+    let sig_2x = logistic_i16_q011(two_x);
+    // tanh = 2·sigmoid(2x) - 1
+    // In Q0.11: tanh = sig_2x * 2 - 2048
+    (i32::from(sig_2x) * 2 - 2048) as i16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

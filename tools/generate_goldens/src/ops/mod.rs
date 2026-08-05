@@ -8,3 +8,4 @@ pub mod elementwise;
 pub mod quantize;
 pub mod data_movement;
 pub mod reductions;
+pub mod recurrent;

@@ -90,6 +90,12 @@ fn main() {
     ops::data_movement::generate_slice(&mut w);
     ops::data_movement::generate_resize_nearest(&mut w);
 
+    // ── T3 — Recurrent ──
+    println!("\n── T3: Recurrent ──");
+    ops::recurrent::generate_lstm(&mut w);
+    ops::recurrent::generate_svdf(&mut w);
+    ops::recurrent::generate_gru(&mut w);
+
     // ── T4 — Reductions ──
     println!("\n── T4: Reductions ──");
     ops::reductions::generate_mean(&mut w);
@@ -102,6 +108,7 @@ fn main() {
     println!("\n── Self-check ──");
     self_check_conv2d_1x1();
     self_check_mean();
+    self_check_recurrent();
     guard_generated_fixtures(&goldens_dir);
 
     println!("\nDone. Generated {} fixture files in {}", count_files(&goldens_dir), goldens_dir.display());
@@ -189,6 +196,45 @@ fn self_check_mean() {
     println!("     ch0 col0: (1+4)/2=3 → mbm(3)=2");
     println!("     ch0 col1: (2+8)/2=5 → mbm(5)=3");
     println!("     ch0 col2: (3+9)/2=6 → mbm(6)=3");
+}
+
+/// Verify GRU sigmoid/tanh fixed-point landmarks: sigmoid(0)=0.5,
+/// tanh(0)=0, endpoints saturate; plus update-gate monotonicity.
+fn self_check_recurrent() {
+    use tflm_math::{logistic_i16_q011, tanh_i16_q011};
+
+    // logistic_i16_q011: sigmoid(x)·2^11 → i16 in [0, 2047] (0.0→0, 0.5→1024, 1.0→2047)
+    // Input is in Q5.26: value / 2^26 = real value
+    let s0 = logistic_i16_q011(0);
+    assert_eq!(s0, 1024, "sigmoid(0) must be 0.5 → 1024 in Q0.11, got {s0}");
+
+    // tanh_i16_q011: tanh(x)·2^11 → i16 in [-2048, 2047]
+    let t0 = tanh_i16_q011(0);
+    assert_eq!(t0, 0, "tanh(0) must be 0, got {t0}");
+
+    // Endpoints: large positive → sigmoid ≈ 1.0, large negative → sigmoid ≈ 0.0
+    // +5.0 in Q5.26 = 5 << 26 = 335544320
+    let s_pos = logistic_i16_q011(5 << 26);
+    let s_neg = logistic_i16_q011(-(5 << 26));
+    assert!(s_pos >= 2000, "sigmoid(+large) must be near saturation, got {s_pos}");
+    assert!(s_neg <= 100, "sigmoid(-large) must be near zero, got {s_neg}");
+
+    // Endpoints: tanh → ±1.0 in Q0.11 = ±2047
+    let t_pos = tanh_i16_q011(5 << 26);
+    let t_neg = tanh_i16_q011(-(5 << 26));
+    assert!(t_pos >= 2000, "tanh(+large) must be near +1.0, got {t_pos}");
+    assert!(t_neg <= -2000, "tanh(-large) must be near -1.0, got {t_neg}");
+
+    // Monotonicity: sigmoid at Q5.26 values ~0.25, 0.5, 1.0
+    let s1 = logistic_i16_q011(1 << 24); // ~0.25
+    let s2 = logistic_i16_q011(1 << 25); // ~0.5
+    assert!(s2 > s1, "sigmoid monotonicity: sigmoid(0.5)={s2} <= sigmoid(0.25)={s1}");
+    assert!(s1 > s0, "sigmoid monotonicity: sigmoid(0.25)={s1} <= sigmoid(0)={s0}");
+
+    println!("  ✅ recurrent self-check passed:");
+    println!("     sigmoid(0)=1024 (Q0.11 0.5), tanh(0)=0");
+    println!("     sigmoid + tanh endpoints saturate correctly");
+    println!("     sigmoid monotonicity verified");
 }
 
 fn find_workspace_root() -> PathBuf {

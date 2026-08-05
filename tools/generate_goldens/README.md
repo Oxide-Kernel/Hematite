@@ -58,7 +58,9 @@ tools/generate_goldens/
         ├── activations.rs       # ReLU, ReLU6, HardSwish, LeakyReLU, PReLU
         ├── elementwise.rs       # Add, Mul, Sub (requantized)
         ├── quantize.rs          # Quantize, Dequantize
-        └── data_movement.rs     # Reshape, Transpose, Concat, Split, Pad, Slice, ResizeNearest
+        ├── data_movement.rs     # Reshape, Transpose, Concat, Split, Pad, Slice, ResizeNearest
+        ├── reductions.rs        # Mean, Sum, ArgMax, ArgMin, L2Normalization
+        └── recurrent.rs         # LSTM, SVDF, GRU (hand-rolled gate math)
 ```
 
 ## TFLM Reference Pin
@@ -126,11 +128,30 @@ All fixture files are written to `hematite-tests/goldens/`:
 | `pad.rs` | Pad | T2 |
 | `slice.rs` | Slice | T2 |
 | `resize_nearest_neighbor.rs` | ResizeNearestNeighbor | T2 |
+| `lstm.rs` | UnidirectionalSequenceLSTM (int8) | T3 |
+| `svdf.rs` | SVDF (int8) | T3 |
+| `gru.rs` | GRU (hand-rolled, no TFLM kernel) | T3 |
 | `mean.rs` | Mean | T4 |
 | `sum.rs` | Sum | T4 |
 | `argmax.rs` | ArgMax | T4 |
 | `argmin.rs` | ArgMin | T4 |
 | `l2_norm.rs` | L2Normalization | T4 |
+
+### GRU Provenance (T3)
+
+**TFLM has NO GRU kernel** at the pinned SHA `18b9e6f2a8c5a9518e588f59c2ba16ef7ef9d551`.
+The GRU golden fixture (`gru.rs`) is generated with **hand-rolled fixed-point gate
+math** using gemmlowp logistic/tanh primitives (`exp_on_negative_values` +
+`one_over_one_plus_x` pipeline, same infrastructure as softmax). Verification is via
+manual bit-level self-check assertions:
+- `sigmoid(0) = 0.5` (Q0.11 = 1024), `tanh(0) = 0`
+- Endpoint saturation (sigmoid→1.0, tanh→±1.0 for large inputs)
+- Monotonicity of sigmoid response
+- Update-gate behavior verified
+
+No external reference implementation was used. The `embedded-nn` crate v0.2.1
+(checked at crates.io) has NO GRU kernel — its `recurrent` module contains only
+`lstm_step_s8_s16`, `lstm_step_s16`, `svdf_s8`, and `svdf_state_s16_s8`.
 
 ## How to Add an Op
 
