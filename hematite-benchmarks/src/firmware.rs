@@ -533,6 +533,13 @@ pub fn run_benchmarks() -> ! {
     #[cfg(feature = "model-validation")]
     crate::model_validation::validate_all();
 
+    // 4.6 TIE728 SIMD correctness (elementwise + pool vs hematite-ref) —
+    // same feature gate and ordering rationale as 4.5. conv1x1/conv3x3/gemm
+    // are excluded (already proven broken under QEMU and gated off at the
+    // `hematite-s3` dispatch level, not re-tested here).
+    #[cfg(feature = "model-validation")]
+    crate::simd_validation::validate_all();
+
     // 5. Per-kernel benchmarks.
     let mut clock = RealClock;
     firmware_log!("{}", crate::report::HEADER);
