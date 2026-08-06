@@ -56,7 +56,7 @@ use defmt_rtt as _;
 /// Only TXFIFO_CNT is polled (< 128 = room) before each write — no baud
 /// divisor math is needed for correct visible text under QEMU.
 #[cfg(feature = "qemu")]
-mod qemu_uart {
+pub(crate) mod qemu_uart {
     const UART0_BASE: usize = 0x6000_0000;
     const UART_STATUS: usize = 0x1C;
     const TX_FIFO: usize = 0x00;
@@ -107,6 +107,10 @@ macro_rules! firmware_log {
         }
     }};
 }
+
+// Re-export so sibling device modules (e.g. model_validation) can log through
+// the same path (qemu→UART0, hardware→defmt).
+pub(crate) use firmware_log;
 
 /// Display/Format adapter for `Option<u64>` so the same report row renders
 /// through both `core::fmt` (qemu UART path) and `defmt` (hardware RTT path).
@@ -522,6 +526,12 @@ pub fn run_benchmarks() -> ! {
     // SAFETY: single-threaded firmware; unique static.
     let mut canary = StackCanary::new(unsafe { &mut *core::ptr::addr_of_mut!(STACK_CANARY_SLOT) });
     canary.arm();
+
+    // 4.5 Model validation (model-validation feature) — runs BEFORE the
+    // kernel rows so every PASS/FAIL line prints even if a later row panics
+    // (the MobileNetV2 PSRAM row's "arena too small" panic stays last).
+    #[cfg(feature = "model-validation")]
+    crate::model_validation::validate_all();
 
     // 5. Per-kernel benchmarks.
     let mut clock = RealClock;

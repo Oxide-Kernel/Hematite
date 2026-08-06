@@ -30,5 +30,8 @@ pub mod report;
 pub mod spec;
 pub mod timing;
 
+#[cfg(all(target_arch = "xtensa", feature = "model-validation"))]
+pub mod model_validation;
+
 #[cfg(target_arch = "xtensa")]
 pub mod firmware;

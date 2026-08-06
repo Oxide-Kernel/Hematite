@@ -14,6 +14,10 @@ hematite-core = { path = "../hematite-core" }
 hematite-int8 = { path = "../hematite-int8" }
 hematite-ref = { path = "../hematite-ref" }
 hematite-s3 = { path = "../hematite-s3" }
+# `#[model]` proc-macro — compiles a real .tflite into a no_std, no-alloc
+# `Model<B>` inference bridge at build time. Enabled by the
+# `model-validation` feature (device/QEMU model-validation section).
+hematite-codegen = { path = "../hematite-codegen", optional = true }
 
 # Device-only dependencies (T5.3 / T5.3a — benchmark firmware on ESP32-S3).
 #
@@ -55,3 +59,8 @@ defmt-rtt = "0.4"
 # this feature changes ONLY the output transport and guardrail bypass, never
 # the benchmark methodology (spec.rs / timing.rs / report.rs are untouched).
 qemu = []
+# Model validation: compiles the runnable zoo .tflite models via `#[model]`
+# and runs each inference on the device (or QEMU) against the executed-TFLite
+# golden, printing PASS/FAIL + FNV-1a per model. Pure validation — does not
+# affect kernel benchmarks or report methodology.
+model-validation = ["dep:hematite-codegen"]

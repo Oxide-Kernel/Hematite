@@ -822,6 +822,7 @@ dependencies = [
  "defmt 0.3.100",
  "defmt-rtt",
  "esp-hal",
+ "hematite-codegen",
  "hematite-core",
  "hematite-int8",
  "hematite-ref",
