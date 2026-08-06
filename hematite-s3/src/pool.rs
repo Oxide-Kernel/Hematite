@@ -102,6 +102,48 @@ pub fn average_pool_2d(
     let pad_h = ((out_h - 1) * params.stride_height + filter_h - input_h) / 2;
     let pad_w = ((out_w - 1) * params.stride_width + filter_w - input_w) / 2;
 
+    // ── TIE728 SIMD dispatch (device-only; compiled out entirely on host) ──
+    // `dl_tie728_s8_avg_pool2d_22c1` hardcodes a 2x2/stride-2 4-corner
+    // access pattern and has no clamp field in its args struct, so it only
+    // matches the scalar path when the activation range is the full int8
+    // range (native saturating cast, matching the hardware's own int8
+    // arithmetic). area_inv=64/shift=8 are the exact reciprocal constants
+    // for a 2x2 (area=4) filter: round(2^8 / 4) = 64.
+    #[cfg(target_arch = "xtensa")]
+    {
+        if filter_h == 2
+            && filter_w == 2
+            && params.stride_height == 2
+            && params.stride_width == 2
+            && pad_h == 0
+            && pad_w == 0
+            && channels % 16 == 0
+            && params.quantized_activation_min == i8::MIN as i32
+            && params.quantized_activation_max == i8::MAX as i32
+        {
+            let in_ptr = input.as_ptr();
+            let out_ptr = output.as_mut_ptr();
+            if (in_ptr as usize) % 16 == 0 && (out_ptr as usize) % 16 == 0 {
+                let total_out = out_h * out_w * channels;
+                let area_inv = [64i8; 16];
+                unsafe {
+                    avg_pool_2d_simd(
+                        out_ptr,
+                        in_ptr,
+                        channels,
+                        input_w * channels,
+                        channels,
+                        8,
+                        &area_inv,
+                        total_out / 16 - 1,
+                    );
+                }
+                let _ = scratch;
+                return Ok(());
+            }
+        }
+    }
+
     let output_row_stride = out_w * channels;
 
     for oh in 0..out_h {
@@ -187,6 +229,42 @@ pub fn max_pool_2d(
 
     let pad_h = ((out_h - 1) * params.stride_height + filter_h - input_h) / 2;
     let pad_w = ((out_w - 1) * params.stride_width + filter_w - input_w) / 2;
+
+    // ── TIE728 SIMD dispatch (device-only; compiled out entirely on host) ──
+    // Same eligibility contract as `average_pool_2d`'s dispatch above —
+    // `dl_tie728_s8_max_pool2d_22c1` hardcodes 2x2/stride-2 and has no
+    // clamp field, so full-range activation bounds are required.
+    #[cfg(target_arch = "xtensa")]
+    {
+        if filter_h == 2
+            && filter_w == 2
+            && params.stride_height == 2
+            && params.stride_width == 2
+            && pad_h == 0
+            && pad_w == 0
+            && channels % 16 == 0
+            && params.quantized_activation_min == i8::MIN as i32
+            && params.quantized_activation_max == i8::MAX as i32
+        {
+            let in_ptr = input.as_ptr();
+            let out_ptr = output.as_mut_ptr();
+            if (in_ptr as usize) % 16 == 0 && (out_ptr as usize) % 16 == 0 {
+                let total_out = out_h * out_w * channels;
+                unsafe {
+                    max_pool_2d_simd(
+                        out_ptr,
+                        in_ptr,
+                        channels,
+                        input_w * channels,
+                        channels,
+                        total_out / 16 - 1,
+                    );
+                }
+                let _ = scratch;
+                return Ok(());
+            }
+        }
+    }
 
     let activation_min = params.quantized_activation_min;
     let activation_max = params.quantized_activation_max;
@@ -356,6 +434,19 @@ mod pool_simd {
         include_str!("../src/asm/dl_tie728_s8_max_pool2d.S"),
         include_str!("../src/asm/dl_tie728_s8_avg_pool2d.S"),
     );
+
+    // `call8 <label>` uses an 18-bit signed PC-relative encoding (±~512KB).
+    // Once these entry points are actually referenced (this task's whole
+    // point), the final binary's code layout can push the call site farther
+    // from the vendored .S symbol than that encoding allows ("dangerous
+    // relocation: call8: call target out of range"), which LLVM's Xtensa
+    // backend — unlike GCC's `-mlongcalls` — does not auto-relax. The fix is
+    // a register-indirect `callx8` through an ordinary Rust function-pointer
+    // load, which has no range limit; the vendored .S entry point itself is
+    // untouched.
+    extern "C" {
+        fn dl_tie728_s8_avg_pool2d_22c1();
+    }
 
     // ── Args structs — derived from vendored .S l32i offsets ──────────────
 
@@ -552,14 +643,16 @@ mod pool_simd {
             c_div_x_1,
             ..Default::default()
         };
+        let target = dl_tie728_s8_avg_pool2d_22c1 as unsafe extern "C" fn() as usize;
         core::arch::asm!(
             "mov a2, {output}",
             "mov a3, {input}",
             "mov a4, {args}",
-            "call8 dl_tie728_s8_avg_pool2d_22c1",
+            "callx8 {target}",
             output = in(reg) output,
             input = in(reg) input,
             args = in(reg) &args,
+            target = in(reg) target,
             clobber_abi("C"),
         );
     }

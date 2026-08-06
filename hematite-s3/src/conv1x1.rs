@@ -122,6 +122,70 @@ pub fn conv2d_1x1(
         return Err(KernelError::ShapeMismatch);
     }
 
+    // ── TIE728 SIMD dispatch (device-only; compiled out entirely on host) ──
+    // Eligibility per Plan A4 T5.3: zero offsets, uniform per-channel
+    // multiplier/shift collapsing to the hardware's fixed-multiplier fast
+    // path, 16-aligned channel counts, batch=1 (checked above), and runtime
+    // 16-byte pointer alignment. Padding is structurally 0 for a 1x1/stride-1
+    // conv, so it is not checked.
+    //
+    // ALSO gated off under the `qemu` feature: QEMU's xtensa/esp32s3 TIE728
+    // emulation does not correctly execute `EE.VSMULAS.S8.QACC.LD.INCP` (the
+    // fused MAC+load+increment instruction this kernel's MAC loop depends
+    // on) — confirmed by direct instruction-level bisection (see
+    // local-notes/notepads/hematite-nn/problems.md). This is a QEMU emulation gap,
+    // not a code defect, so QEMU builds fall through to the scalar path;
+    // real hardware (no `qemu` feature) still gets SIMD once T5.3 validates
+    // it there.
+    #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+    {
+        let mult = params.output_multiplier_per_channel;
+        let shift = params.output_shift_per_channel;
+        let mult_uniform = !mult.is_empty() && mult.iter().all(|&m| m == mult[0]) && mult[0] == 1 << 30;
+        let shift_uniform = !shift.is_empty() && shift.iter().all(|&s| s == shift[0]);
+        let full_range = params.quantized_activation_min == i8::MIN as i32
+            && params.quantized_activation_max == i8::MAX as i32;
+        let relu_range = params.quantized_activation_min == 0
+            && params.quantized_activation_max == i8::MAX as i32;
+
+        if params.input_offset == 0
+            && params.output_offset == 0
+            && (full_range || relu_range)
+            && mult_uniform
+            && shift_uniform
+            && input_c % 16 == 0
+            && input_c >= 16
+            && out_channels % 16 == 0
+        {
+            let in_ptr = input.as_ptr();
+            let w_ptr = weights.as_ptr();
+            let b_ptr = bias.as_ptr();
+            let out_ptr = output.as_mut_ptr();
+            let aligned = (in_ptr as usize) % 16 == 0
+                && (w_ptr as usize) % 16 == 0
+                && (b_ptr as usize) % 16 == 0
+                && (out_ptr as usize) % 16 == 0;
+
+            if aligned {
+                let use_relu = relu_range && !full_range;
+                unsafe {
+                    conv1x1_simd::dispatch_1x1(
+                        out_ptr,
+                        in_ptr,
+                        w_ptr,
+                        b_ptr,
+                        shift[0],
+                        out_channels / 16,
+                        input_c / 16 - 1,
+                        use_relu,
+                    );
+                }
+                let _ = scratch;
+                return Ok(());
+            }
+        }
+    }
+
     // ── Derived pad values (same formula as hematite-ref/src/conv.rs) ──
     let dilated_filter_h = (filter_h - 1) * params.dilation_height_factor + 1;
     let dilated_filter_w = (filter_w - 1) * params.dilation_width_factor + 1;
@@ -359,6 +423,49 @@ mod conv1x1_simd {
             args   = in(reg) args,
             clobber_abi("C"),
         );
+    }
+
+    /// Build a [`Tie728ConvArgs`] and dispatch — called from the public
+    /// scalar `conv2d_1x1` eligibility check in the parent module.
+    ///
+    /// `Tie728ConvArgs`'s fields are private to this module, so the
+    /// eligibility-gated caller in `conv2d_1x1` cannot construct the struct
+    /// itself; this wrapper does it with plain scalar arguments.
+    ///
+    /// # Safety
+    ///
+    /// Same safety contract as `conv2d_1x1_simd_aligned` / `_relu`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn dispatch_1x1(
+        output: *mut i8,
+        input: *const i8,
+        filter: *const i8,
+        bias: *const i32,
+        mac_shift: i32,
+        output_channel_div_8: i32,
+        c_div_x_1: i32,
+        use_relu: bool,
+    ) {
+        let args = Tie728ConvArgs {
+            _pad0: [0u8; 48],
+            filter,
+            _pad1: [0u8; 12],
+            mac_shift,
+            bias,
+            _pad2: [0u8; 4],
+            activation_alpha: 0,
+            _pad3: [0u8; 4],
+            activation_shift: if use_relu { 0 } else { -1 },
+            _pad4: [0u8; 8],
+            output_channel_div_8,
+            c_div_x_1,
+            filter_channel_factor: core::ptr::null(),
+        };
+        if use_relu {
+            conv2d_1x1_simd_relu(output, input, &args);
+        } else {
+            conv2d_1x1_simd_aligned(output, input, &args);
+        }
     }
 }
 

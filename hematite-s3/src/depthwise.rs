@@ -191,6 +191,10 @@ pub fn depthwise_conv2d(
 ///
 /// This module is cfg-gated behind `#[cfg(target_arch = "xtensa")]`.
 /// ABI unverified — validate at T5.3 on device.
+//
+// No real TIE728 depthwise-MAC entry point exists in the vendored asm
+// (depthwise_simd only has shared requantize macros) — scalar-only by
+// design, not a missing optimization.
 #[cfg(target_arch = "xtensa")]
 mod depthwise_simd {
     /// TIE728 depthwise args struct.

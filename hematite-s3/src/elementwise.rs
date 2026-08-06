@@ -51,6 +51,44 @@ pub fn add(
         return Err(KernelError::ShapeMismatch);
     }
 
+    // ── TIE728 SIMD dispatch (device-only; compiled out entirely on host) ──
+    // `add_simd_aligned` computes a raw int8 add with no offset/rescale/
+    // requantize step at all (see the struct doc above — AddSubAlignedArgs
+    // carries only `length`). It is bit-exact vs the scalar path below ONLY
+    // when every quant-affine step degenerates to the identity: zero
+    // offsets, no left_shift scaling, and both the per-input and output
+    // (multiplier, shift) pairs at (1<<30, 1) — the same identity pair the
+    // scalar loop itself already special-cases below.
+    #[cfg(target_arch = "xtensa")]
+    {
+        let identity = |m: i32, s: i32| m == 1 << 30 && s == 1;
+        if params.input1_offset == 0
+            && params.input2_offset == 0
+            && params.output_offset == 0
+            && params.quantized_activation_min == i8::MIN as i32
+            && params.quantized_activation_max == i8::MAX as i32
+            && params.left_shift <= 0
+            && identity(params.input1_multiplier, params.input1_shift)
+            && identity(params.input2_multiplier, params.input2_shift)
+            && identity(params.output_multiplier, params.output_shift)
+            && n % 16 == 0
+        {
+            let in1_ptr = input1.as_ptr();
+            let in2_ptr = input2.as_ptr();
+            let out_ptr = output.as_mut_ptr();
+            if (in1_ptr as usize) % 16 == 0
+                && (in2_ptr as usize) % 16 == 0
+                && (out_ptr as usize) % 16 == 0
+            {
+                unsafe {
+                    add_simd_aligned(out_ptr, in1_ptr, in2_ptr, n as u32);
+                }
+                let _ = scratch;
+                return Ok(());
+            }
+        }
+    }
+
     let left_shift = params.left_shift;
     let shift_factor = if left_shift >= 0 {
         1i32 << left_shift
@@ -117,6 +155,41 @@ pub fn mul(
         return Err(KernelError::ShapeMismatch);
     }
 
+    // ── TIE728 SIMD dispatch (device-only; compiled out entirely on host) ──
+    // `mul_simd_aligned` computes `round((input1[i] * input2[i]) >> mul_shift)`
+    // with no offsets. With output_multiplier fixed at 1<<30,
+    // `multiply_by_quantized_multiplier(product, 1<<30, output_shift)` reduces
+    // to `round(product >> (1 - output_shift))`, so `mul_shift = 1 -
+    // output_shift` reproduces the scalar path exactly; `output_shift <= 1`
+    // is exactly what keeps that `mul_shift` non-negative.
+    #[cfg(target_arch = "xtensa")]
+    {
+        if params.input1_offset == 0
+            && params.input2_offset == 0
+            && params.output_offset == 0
+            && params.quantized_activation_min == i8::MIN as i32
+            && params.quantized_activation_max == i8::MAX as i32
+            && params.output_multiplier == 1 << 30
+            && params.output_shift <= 1
+            && n % 16 == 0
+        {
+            let in1_ptr = input1.as_ptr();
+            let in2_ptr = input2.as_ptr();
+            let out_ptr = output.as_mut_ptr();
+            if (in1_ptr as usize) % 16 == 0
+                && (in2_ptr as usize) % 16 == 0
+                && (out_ptr as usize) % 16 == 0
+            {
+                let mul_shift = 1 - params.output_shift;
+                unsafe {
+                    mul_simd_aligned(out_ptr, in1_ptr, in2_ptr, n as u32, mul_shift);
+                }
+                let _ = scratch;
+                return Ok(());
+            }
+        }
+    }
+
     for i in 0..n {
         let val1 = i32::from(input1[i]) + params.input1_offset;
         let val2 = i32::from(input2[i]) + params.input2_offset;
@@ -158,6 +231,39 @@ pub fn sub(
     let n = params.num_elements as usize;
     if input1.len() != n || input2.len() != n || output.len() != n {
         return Err(KernelError::ShapeMismatch);
+    }
+
+    // ── TIE728 SIMD dispatch (device-only; compiled out entirely on host) ──
+    // Same identity contract as `add`'s dispatch above — `sub_simd_aligned`
+    // computes a raw int8 subtract with no offset/rescale/requantize step.
+    #[cfg(target_arch = "xtensa")]
+    {
+        let identity = |m: i32, s: i32| m == 1 << 30 && s == 1;
+        if params.input1_offset == 0
+            && params.input2_offset == 0
+            && params.output_offset == 0
+            && params.quantized_activation_min == i8::MIN as i32
+            && params.quantized_activation_max == i8::MAX as i32
+            && params.left_shift <= 0
+            && identity(params.input1_multiplier, params.input1_shift)
+            && identity(params.input2_multiplier, params.input2_shift)
+            && identity(params.output_multiplier, params.output_shift)
+            && n % 16 == 0
+        {
+            let in1_ptr = input1.as_ptr();
+            let in2_ptr = input2.as_ptr();
+            let out_ptr = output.as_mut_ptr();
+            if (in1_ptr as usize) % 16 == 0
+                && (in2_ptr as usize) % 16 == 0
+                && (out_ptr as usize) % 16 == 0
+            {
+                unsafe {
+                    sub_simd_aligned(out_ptr, in1_ptr, in2_ptr, n as u32);
+                }
+                let _ = scratch;
+                return Ok(());
+            }
+        }
     }
 
     let left_shift = params.left_shift;

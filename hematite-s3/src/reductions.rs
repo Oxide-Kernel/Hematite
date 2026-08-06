@@ -181,6 +181,9 @@ pub fn mean(
 ///
 /// * Mean: sum → requantize, partial SIMD (scalar accumulator with
 ///   SIMD load/store via `ee.vld.128.ip` / `ee.vst.128.ip`).
+//
+// mean_simd is an unimplemented placeholder stub (writes nothing) — do not
+// dispatch to it. Scalar-only until a real backend is vendored.
 #[cfg(target_arch = "xtensa")]
 mod reduction_simd {
     /// TIE728 reduction args struct.

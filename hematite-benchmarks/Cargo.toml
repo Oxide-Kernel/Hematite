@@ -58,7 +58,7 @@ defmt-rtt = "0.4"
 # timer skew). Every printed number still carries the QEMU-EMULATION label;
 # this feature changes ONLY the output transport and guardrail bypass, never
 # the benchmark methodology (spec.rs / timing.rs / report.rs are untouched).
-qemu = []
+qemu = ["hematite-s3/qemu"]
 # Model validation: compiles the runnable zoo .tflite models via `#[model]`
 # and runs each inference on the device (or QEMU) against the executed-TFLite
 # golden, printing PASS/FAIL + FNV-1a per model. Pure validation — does not

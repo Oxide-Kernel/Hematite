@@ -70,6 +70,65 @@ pub fn fully_connected(
     let multipliers = params.output_multiplier_per_channel;
     let shifts = params.output_shift_per_channel;
 
+    // ── TIE728 SIMD dispatch (device-only; compiled out entirely on host) ──
+    // Same eligibility contract as conv1x1's dispatch, for input_dim/output_dim
+    // in place of Cin/Cout (an FC layer is a 1x1 conv with H=W=1).
+    //
+    // ALSO gated off under the `qemu` feature: this reuses conv1x1's entry
+    // point (`dl_tie728_s8_conv2d_11cn`), whose `EE.VSMULAS.S8.QACC.LD.INCP`
+    // MAC instruction QEMU's TIE728 emulation does not correctly execute
+    // (confirmed by direct bisection — see
+    // local-notes/notepads/hematite-nn/problems.md). QEMU builds fall through to
+    // the scalar path; real hardware still gets SIMD.
+    #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+    {
+        let mult_uniform = !multipliers.is_empty()
+            && multipliers.iter().all(|&m| m == multipliers[0])
+            && multipliers[0] == 1 << 30;
+        let shift_uniform = !shifts.is_empty() && shifts.iter().all(|&s| s == shifts[0]);
+        let full_range = params.quantized_activation_min == i8::MIN as i32
+            && params.quantized_activation_max == i8::MAX as i32;
+        let relu_range = params.quantized_activation_min == 0
+            && params.quantized_activation_max == i8::MAX as i32;
+
+        if params.input_offset == 0
+            && params.output_offset == 0
+            && (full_range || relu_range)
+            && mult_uniform
+            && shift_uniform
+            && input_dim % 16 == 0
+            && input_dim >= 16
+            && output_dim % 16 == 0
+        {
+            let in_ptr = input.as_ptr();
+            let w_ptr = weights.as_ptr();
+            let b_ptr = bias.as_ptr();
+            let out_ptr = output.as_mut_ptr();
+            let aligned = (in_ptr as usize) % 16 == 0
+                && (w_ptr as usize) % 16 == 0
+                && (b_ptr as usize) % 16 == 0
+                && (out_ptr as usize) % 16 == 0;
+
+            if aligned {
+                let use_relu = relu_range && !full_range;
+                unsafe {
+                    gemm_simd::dispatch_fc(
+                        out_ptr,
+                        in_ptr,
+                        w_ptr,
+                        b_ptr,
+                        shifts[0],
+                        (output_dim / 16) as i32,
+                        (input_dim / 16) as i32 - 1,
+                        use_relu,
+                    );
+                }
+                let _ = scratch;
+                return Ok(());
+            }
+        }
+    }
+
     // ── Accumulation loop ───────────────────────────────────────────────
     // TFLM loop order: batch(=0) → oc → accum_depth
     for oc in 0..output_dim {
@@ -197,5 +256,49 @@ mod gemm_simd {
             args   = in(reg) args,
             clobber_abi("C"),
         );
+    }
+
+    /// Build a [`Tie728GemmArgs`] and dispatch — called from the public
+    /// scalar `fully_connected` eligibility check in the parent module.
+    ///
+    /// `gemm_simd` is private, so the eligibility-gated caller in
+    /// `fully_connected` cannot reach the entry points directly; this
+    /// wrapper takes plain scalar arguments and builds the struct
+    /// internally.
+    ///
+    /// # Safety
+    ///
+    /// Same safety contract as `fc_simd_aligned` / `fc_simd_relu`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn dispatch_fc(
+        output: *mut i8,
+        input: *const i8,
+        filter: *const i8,
+        bias: *const i32,
+        mac_shift: i32,
+        output_channel_div_8: i32,
+        c_div_x_1: i32,
+        use_relu: bool,
+    ) {
+        let args = Tie728GemmArgs {
+            _pad0: [0u8; 48],
+            filter,
+            _pad1: [0u8; 12],
+            mac_shift,
+            bias,
+            _pad2: [0u8; 4],
+            activation_alpha: 0,
+            activation_alpha_ptr: core::ptr::null(),
+            activation_shift: if use_relu { 0 } else { -1 },
+            _pad3: [0u8; 8],
+            output_channel_div_8,
+            c_div_x_1,
+            filter_channel_factor: core::ptr::null(),
+        };
+        if use_relu {
+            fc_simd_relu(output, input, &args);
+        } else {
+            fc_simd_aligned(output, input, &args);
+        }
     }
 }

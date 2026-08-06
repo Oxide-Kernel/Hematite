@@ -99,6 +99,74 @@ pub fn conv2d_3x3(
     let pad_h = ((out_h - 1) * params.stride_height + dilated_filter_h - input_h) / 2;
     let pad_w = ((out_w - 1) * params.stride_width + dilated_filter_w - input_w) / 2;
 
+    // ── TIE728 SIMD dispatch (device-only; compiled out entirely on host) ──
+    // Same eligibility contract as conv1x1's dispatch, plus VALID padding
+    // only (the hardware 3x3 kernel has no bounds-checking) and a check
+    // that the filter really is 3x3 (this scalar kernel is reused for
+    // arbitrary filter sizes; the vendored asm hardcodes a 9-MAC unroll).
+    //
+    // ALSO gated off under the `qemu` feature: this entry point shares the
+    // same `EE.VSMULAS.S8.QACC.LD.INCP`-based MAC macro as conv1x1, which
+    // QEMU's TIE728 emulation does not correctly execute (confirmed by
+    // direct bisection — see local-notes/notepads/hematite-nn/problems.md). QEMU
+    // builds fall through to the scalar path; real hardware still gets SIMD.
+    #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+    {
+        let mult = params.output_multiplier_per_channel;
+        let shift = params.output_shift_per_channel;
+        let mult_uniform = !mult.is_empty() && mult.iter().all(|&m| m == mult[0]) && mult[0] == 1 << 30;
+        let shift_uniform = !shift.is_empty() && shift.iter().all(|&s| s == shift[0]);
+        let full_range = params.quantized_activation_min == i8::MIN as i32
+            && params.quantized_activation_max == i8::MAX as i32;
+        let relu_range = params.quantized_activation_min == 0
+            && params.quantized_activation_max == i8::MAX as i32;
+
+        if params.input_offset == 0
+            && params.output_offset == 0
+            && (full_range || relu_range)
+            && mult_uniform
+            && shift_uniform
+            && input_c % 16 == 0
+            && input_c >= 16
+            && out_channels % 16 == 0
+            && pad_h == 0
+            && pad_w == 0
+            && filter_h == 3
+            && filter_w == 3
+        {
+            let in_ptr = input.as_ptr();
+            let w_ptr = weights.as_ptr();
+            let b_ptr = bias.as_ptr();
+            let out_ptr = output.as_mut_ptr();
+            let aligned = (in_ptr as usize) % 16 == 0
+                && (w_ptr as usize) % 16 == 0
+                && (b_ptr as usize) % 16 == 0
+                && (out_ptr as usize) % 16 == 0;
+
+            if aligned {
+                let use_relu = relu_range && !full_range;
+                let dilation_x_offset = params.dilation_width_factor * params.stride_width;
+                let dilation_y_offset = params.dilation_height_factor * params.stride_height;
+                unsafe {
+                    conv3x3_simd::dispatch_3x3(
+                        out_ptr,
+                        in_ptr,
+                        w_ptr,
+                        b_ptr,
+                        shift[0],
+                        out_channels / 16,
+                        input_c / 16 - 1,
+                        dilation_x_offset,
+                        dilation_y_offset,
+                        use_relu,
+                    );
+                }
+                let _ = scratch;
+                return Ok(());
+            }
+        }
+    }
+
     // ── Per-channel multiplier/shift slices ─────────────────────────────
     let multipliers = params.output_multiplier_per_channel;
     let shifts = params.output_shift_per_channel;
@@ -284,5 +352,56 @@ mod conv3x3_simd {
             args   = in(reg) args,
             clobber_abi("C"),
         );
+    }
+
+    /// Build a [`Tie728Conv33Args`] and dispatch — called from the public
+    /// scalar `conv2d_3x3` eligibility check in the parent module.
+    ///
+    /// `conv3x3_simd` and `Tie728Conv33Args` are private to this module, so
+    /// the eligibility-gated caller in `conv2d_3x3` cannot reach the entry
+    /// points directly; this wrapper takes plain scalar arguments and
+    /// builds the struct internally.
+    ///
+    /// # Safety
+    ///
+    /// Same safety contract as `conv2d_3x3_simd_aligned` / `_relu`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn dispatch_3x3(
+        output: *mut i8,
+        input: *const i8,
+        filter: *const i8,
+        bias: *const i32,
+        mac_shift: i32,
+        output_channel_div_8: i32,
+        c_div_x_1: i32,
+        dilation_x_offset: i32,
+        dilation_y_offset: i32,
+        use_relu: bool,
+    ) {
+        let args = Tie728Conv33Args {
+            _pad0: [0u8; 48],
+            filter,
+            _pad1: [0u8; 12],
+            mac_shift,
+            bias,
+            _pad2: [0u8; 4],
+            activation_alpha: 0,
+            activation_alpha_ptr: core::ptr::null(),
+            activation_shift: if use_relu { 0 } else { -1 },
+            _pad3: [0u8; 8],
+            output_channel_div_8,
+            c_div_x_1,
+            filter_channel_factor: core::ptr::null(),
+            dilation_x_offset,
+            dilation_y_offset,
+            _pad4: [0u8; 20],
+            c_remainder: 0,
+            n_remainder: 0,
+        };
+        if use_relu {
+            conv2d_3x3_simd_relu(output, input, &args);
+        } else {
+            conv2d_3x3_simd_aligned(output, input, &args);
+        }
     }
 }

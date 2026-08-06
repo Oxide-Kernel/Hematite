@@ -194,6 +194,10 @@ pub fn hard_swish(
 ///
 /// * Leg (a): SIMD output must match a per-tensor TFLM golden (Phase 5 fixture).
 /// * Leg (c): SIMD vs scalar ref cross-check tolerance ≤1 LSB.
+//
+// relu_simd has a known off-by-16 trip-count bug (last 16 elements left
+// unprocessed for any input size) — tracked in
+// local-notes/notepads/hematite-nn/problems.md. Do not dispatch until fixed.
 #[cfg(target_arch = "xtensa")]
 mod activation_simd {
     /// Include the vendored TIE728 shared macros and relu entry points.
