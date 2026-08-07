@@ -479,23 +479,24 @@ unsafe fn cast_i8(s: &mut [u8]) -> &mut [i8] {
 ///
 /// Offsets are aligned so input/weights/output sit on 16-byte boundaries (the
 /// SIMD path requires 16-byte alignment for `EE.VLD.128` / `EE.VST.128`) and
-/// the bias on a 4-byte boundary.  The layout is `[input][pad][weights][pad]
-/// [bias][pad][output]`.  Returns [`KernelError::ScratchTooSmall`] when the
-/// arena cannot hold the working set.
+/// the bias on a 16-byte boundary too (the TIE728 SIMD kernels gate on a
+/// 16-aligned bias pointer — `conv1x1.rs`/`conv3x3.rs` check `b_ptr % 16 == 0`).
+/// The layout is `[input][pad][weights][pad][bias][pad][output]`.  Returns
+/// [`KernelError::ScratchTooSmall`] when the arena cannot hold the working
+/// set.
 ///
 /// This function is **host-compiled and tested** so the device firmware can
 /// rely on it without a device build (issues.md: every device-only code path
 /// needs a host-side proof).
 pub fn carve_into<'a>(arena: &'a mut [u8], lay: &SpecLayout) -> Result<SpecBufs<'a>, KernelError> {
     let align16 = |o: usize| o.div_ceil(16) * 16;
-    let align4 = |o: usize| o.div_ceil(4) * 4;
 
     // Byte ranges (bias is stored as `lay.bias_len` i32 values).
     let in_start = 0usize;
     let in_end = in_start + lay.input_len;
     let w_start = align16(in_end);
     let w_end = w_start + lay.weights_len;
-    let b_start = align4(w_end);
+    let b_start = align16(w_end);
     let b_end = b_start + lay.bias_len * 4;
     let o_start = align16(b_end);
     let o_end = o_start + lay.output_len;
@@ -842,10 +843,10 @@ mod tests {
                 "{}: carved buffers rejected by s3 kernel",
                 spec.name
             );
-            // Alignment: input/weights/output 16-byte, bias 4-byte.
+            // Alignment: input/weights/output/bias 16-byte.
             assert_eq!(bufs.input.as_ptr() as usize % 16, 0);
             assert_eq!(bufs.weights.as_ptr() as usize % 16, 0);
-            assert_eq!(bufs.bias.as_ptr() as usize % 4, 0);
+            assert_eq!(bufs.bias.as_ptr() as usize % 16, 0);
             assert_eq!(bufs.output.as_ptr() as usize % 16, 0);
         }
     }

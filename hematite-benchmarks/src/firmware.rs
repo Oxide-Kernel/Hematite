@@ -42,21 +42,27 @@ use esp_hal::Config;
 // invisible but the crate still provides the defmt logger symbols.
 use defmt_rtt as _;
 
-/// QEMU smoke-run UART output (feature = "qemu").
+/// UART0 report output via direct register access.
 ///
-/// defmt-rtt emits nothing under QEMU (no RTT sink), so under the `qemu`
-/// feature the report is written to UART0 via direct register access.  ESP32-S3
-/// UART0 (verified against IDF v5.5 `esp32s3/register/soc/uart_reg.h` and the
-/// QEMU `esp32s3_reg.h` — same map the C baseline's uart.c uses):
+/// defmt-rtt emits nothing under QEMU (no RTT sink), and on real hardware the
+/// RTT stream is only readable through a JTAG probe — which the bring-up
+/// board does not expose (USB-UART only).  The report is therefore mirrored to
+/// UART0 on **every** xtensa build so it can be captured on a plain USB-UART:
+///
+/// * under `qemu` it is the only transport (no RTT sink);
+/// * on hardware it runs alongside defmt/RTT (for probe users).
+///
+/// ESP32-S3 UART0 (verified against IDF v5.5 `esp32s3/register/soc/uart_reg.h`
+/// and the QEMU `esp32s3_reg.h` — same map the C baseline's uart.c uses):
 ///
 /// * base `0x60000000`
 /// * `UART_STATUS` at offset `0x1C`, `TXFIFO_CNT` at bits `[25:16]`
 /// * `TX_FIFO` at offset `0x00` (byte writes)
 ///
 /// Only TXFIFO_CNT is polled (< 128 = room) before each write — no baud
-/// divisor math is needed for correct visible text under QEMU.
-#[cfg(feature = "qemu")]
-pub(crate) mod qemu_uart {
+/// divisor math is needed.  The baud the bootloader left configured on UART0
+/// (115200) is reused; the boot banner above confirms it is visible there.
+pub(crate) mod uart0 {
     const UART0_BASE: usize = 0x6000_0000;
     const UART_STATUS: usize = 0x1C;
     const TX_FIFO: usize = 0x00;
@@ -93,14 +99,13 @@ pub(crate) mod qemu_uart {
     }
 }
 
-/// Log one report line: defmt/RTT on hardware, UART0 under the `qemu` feature.
+/// Log one report line: UART0 on every xtensa build (readable on a plain
+/// USB-UART), plus defmt/RTT on real hardware.  Under the `qemu` feature
+/// defmt-rtt has no sink, so UART0 is the only transport there.
 macro_rules! firmware_log {
     ($($arg:tt)*) => {{
-        #[cfg(feature = "qemu")]
-        {
-            use core::fmt::Write;
-            let _ = writeln!(crate::firmware::qemu_uart::Uart0, $($arg)*);
-        }
+        use core::fmt::Write;
+        let _ = writeln!(crate::firmware::uart0::Uart0, $($arg)*);
         #[cfg(not(feature = "qemu"))]
         {
             defmt::info!($($arg)*);
@@ -258,7 +263,14 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 }
 
 /// SRAM bench arena (rows whose working set fits internal SRAM).
-static mut SRAM_ARENA: [u8; 256 * 1024] = [0u8; 256 * 1024];
+///
+/// 16-byte aligned so the TIE728 SIMD path's `input` pointer (the arena base,
+/// carve offset 0) satisfies the kernels' alignment gate — `[u8; N]` alone
+/// has alignment 1, which silently drops the bench rows to the scalar path.
+#[repr(align(16))]
+struct AlignedArena([u8; 256 * 1024]);
+
+static mut SRAM_ARENA: AlignedArena = AlignedArena([0u8; 256 * 1024]);
 
 /// PSRAM bench arena (large MobileNetV2-style rows) — runtime-mapped.
 ///
@@ -328,18 +340,31 @@ fn disable_watchdog() {
 
 /// Measure CCOUNT over an independent wall window and assert 240 MHz.
 ///
+/// BRING-UP (hardware, 2026-08-06): the original fixed 1000-iteration loop
+/// produced only a ~75 µs wall window.  With the systimer's 1 µs resolution
+/// that alone is ~1.3% quantization error, and the `read_wall_ns_impl` call
+/// overhead (~300 cycles) is another ~1.7% on an 18 kcycle window — together
+/// ~2% high, past the 1000 ppm tolerance.  The window is therefore measured
+/// by polling the independent wall clock until it has advanced [`TARGET`]:
+/// a 20 ms window reduces 1 µs quantization to 50 ppm and makes the fixed
+/// read overhead (< 400 cycles on 4.8 Mcycles) negligible.
+///
 /// Under the `qemu` feature this guardrail is bypassed: `-icount` skews the
 /// CCOUNT-vs-wall ratio so the assert would always fail.  The busy-loop wall
 /// measurement is meaningless there anyway; the QEMU numbers are explicitly
 /// labeled emulation, not hardware.
 #[cfg(not(feature = "qemu"))]
 fn calibrate_and_assert() {
+    /// Calibration wall window in ns (20 ms → ~4.8 Mcycles at 240 MHz).
+    const TARGET_WALL_NS: u64 = 20_000_000;
+
     let c0 = read_ccount();
     let w0 = read_wall_ns_impl();
-    // BRING-UP: a real esp-hal sleep / timer yield is preferred; this busy
-    // loop must survive the optimizer (sink is consumed below).
+    // Busy-wait on the independent wall clock (an opaque esp-hal call, so the
+    // loop cannot be optimized away).  CCOUNT keeps ticking during the wait;
+    // the wall clock is the reference.
     let mut sink: u64 = 0;
-    for _ in 0..1000 {
+    while read_wall_ns_impl().saturating_sub(w0) < TARGET_WALL_NS {
         sink = sink.wrapping_add(1);
     }
     core::hint::black_box(sink);
@@ -368,7 +393,7 @@ fn bench_kernel(spec: &KernelSpec, clock: &mut RealClock, canary: &mut StackCana
     // duration of this benchmark; the arena is re-carved per spec.
     let arena = unsafe {
         match spec.tier {
-            MemoryTier::Sram => &mut SRAM_ARENA[..],
+            MemoryTier::Sram => &mut SRAM_ARENA.0[..],
             MemoryTier::Psram => &mut **core::ptr::addr_of_mut!(PSRAM_ARENA),
         }
     };
@@ -389,6 +414,9 @@ fn bench_kernel(spec: &KernelSpec, clock: &mut RealClock, canary: &mut StackCana
         },
         &cfg,
     );
+    // FNV-1a over the ref output of the final (timed) run — deterministic
+    // proof of what the kernel computed; matched against the C-SIMD scalar.
+    let ref_fnv = fnv1a(bufs.output);
 
     // The s3 kernel (SIMD on device, scalar fallback where no SIMD path).
     fill_pattern(&mut bufs);
@@ -399,6 +427,9 @@ fn bench_kernel(spec: &KernelSpec, clock: &mut RealClock, canary: &mut StackCana
         },
         &cfg,
     );
+    // FNV-1a over the s3 output of the final (timed) run — matched against
+    // the C-SIMD harness calling the identical TIE728 entry point.
+    let s3_fnv = fnv1a(bufs.output);
 
     let s3_sum = match summarize(&s3_log) {
         Some(s) => s,
@@ -423,20 +454,36 @@ fn bench_kernel(spec: &KernelSpec, clock: &mut RealClock, canary: &mut StackCana
     );
     row.speedups[0].speedup = Some(col1);
 
-    emit_row(&row);
+    emit_row(&row, ref_fnv, s3_fnv);
 
     if let Err(e) = canary.verify() {
         panic!("bench '{}': {}", spec.name, e.describe());
     }
 }
 
+/// FNV-1a 32-bit checksum over raw output bytes (seed 2166136261, prime
+/// 16777619) — mirrors the C baseline's `out_checksum` so the Rust s3 kernel
+/// output can be matched bit-exactly against the C-SIMD harness.
+fn fnv1a(data: &[i8]) -> u32 {
+    let mut h: u32 = 2_166_136_261;
+    for &b in data {
+        h ^= b as u32;
+        h = h.wrapping_mul(16_777_619);
+    }
+    h
+}
+
 /// Emit a report row (defmt/RTT on hardware, UART0 under `qemu`).
 ///
 /// Columns 2 and 3 stay `None` (rendered as `None`) until the competitor
 /// cycle counts are sourced — the MUST-NOT-invent-numbers rule.
-fn emit_row(row: &ReportRow) {
+///
+/// `ref_fnv` / `s3_fnv` are FNV-1a checksums over the final output of the
+/// scalar-ref and s3 (SIMD where eligible) runs respectively; the s3 one is
+/// matched against the C-SIMD harness output checksum.
+fn emit_row(row: &ReportRow, ref_fnv: u32, s3_fnv: u32) {
     firmware_log!(
-        "| {} | {} | {}/{} | {}/{} | {}/{} | col1={} | col2={} | col3={} |",
+        "| {} | {} | {}/{} | {}/{} | {}/{} | col1={} | col2={} | col3={} | out_fnv(ref/s3)=0x{:08x}/0x{:08x} |",
         row.label,
         row.tier,
         row.min_cycles,
@@ -448,6 +495,8 @@ fn emit_row(row: &ReportRow) {
         OptDisp(row.speedups[0].speedup),
         OptDisp(row.speedups[1].speedup),
         OptDisp(row.speedups[2].speedup),
+        ref_fnv,
+        s3_fnv,
     );
 }
 
