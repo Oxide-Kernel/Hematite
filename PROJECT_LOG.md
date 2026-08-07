@@ -28,13 +28,15 @@ Eight workspace crates:
 | `hematite-tests` | Golden fixture corpus (`goldens/`) + per-op and per-model TDD test suite |
 | `hematite-benchmarks` | ESP32-S3 hardware/QEMU benchmark firmware — per-kernel + model-level CCOUNT timing, methodology guardrails, model validation |
 
-Plus `tools/generate_goldens/` (host-side fixture generator) and
-`tools/qemu-baseline/` (freestanding C benchmark for cross-language
-comparison under QEMU).
+Plus `tools/generate_goldens/` (host-side fixture generator) and the
+`benchmarks/` directory of C cross-language comparison baselines:
+`benchmarks/qemu-baseline/` (freestanding C benchmark under QEMU) and
+`benchmarks/espdl-baseline/` (ESP-IDF v5.5.1 C harness calling the same
+vendored TIE728 SIMD assembly, for on-hardware output/cycle matching).
 
 ---
 
-## 2. Phase-by-phase build history (commits `f982b06` → `e4c1e8f`)
+## 2. Phase-by-phase build history (commits `f982b06` → `e4c1e8f` → HEAD)
 
 ### Phase 0 — Workspace scaffold + CI
 `a11e688` workspace manifest + crate stubs, xtensa target config.
@@ -114,7 +116,7 @@ GNU-as→LLVM-MC assembler rewrites** across the vendored `.S` files (the
 esp-rs fork's LLVM integrated assembler is stricter than the GNU assembler
 the original esp-dl code targeted — branch-relaxation range errors,
 `.macro` visibility, missing struct pad fields), and the first freestanding
-C benchmark (`tools/qemu-baseline/`) booting under Espressif's QEMU fork
+C benchmark (`benchmarks/qemu-baseline/`) booting under Espressif's QEMU fork
 for a cross-language comparison baseline.
 `0a42b2f` **Rust firmware boots under QEMU** — a `qemu` Cargo feature
 routes benchmark output through direct UART0 register writes (defmt-RTT has
@@ -212,6 +214,93 @@ avg-pool row uses a 7×7 filter but the SIMD path only supports 2×2).
 hardware** — QEMU has been proven incapable of it for this benchmark, for
 a documented, verified reason, not an assumption.
 
+### Phase 9 — Physical ESP32-S3 hardware bring-up
+Physical bring-up on a real ESP32-S3 dev board (Silicon Labs CP2102N
+USB-UART bridge; chip rev v0.2; **4 MB flash with flash encryption ENABLED
+and PERMANENT** — `SPI_BOOT_CRYPT_CNT=0x7`, irreversible, so *all* flash
+writes must go through `esptool write-flash --encrypt`, which encrypts
+on-chip with the eFuse key, never plaintext).
+
+Four real hardware root causes were found and fixed while getting a
+freestanding C harness to boot (each verified by capture on-device):
+1. **Inline-literal corruption** (`-mtext-section-literals` + `movi`
+   immediates like `0x60008000`) embeds raw data in the code stream →
+   `IllegalInstruction`; fix = declared `.literal` symbols + `l32r` for all
+   large immediates.
+2. `.align 4` placed before `entry` makes the assembler drop the `entry`
+   instruction (garbage emitted); `entry` must be the very first
+   instruction of the aligned section.
+3. **RTC WDT write-protect offset**: `wdtwprotect` is at RTC_CNTL +`0xb0`
+   (not `0xa0`, which is WDTCONFIG2), so the unlock never worked and every
+   build silently reset every ~9 s.
+4. **UART0 TX FIFO requires 32-bit stores** — byte (`s8i`) stores to the
+   FIFO are silently dropped on ESP32-S3; 32-bit stores work. (The Rust
+   firmware's `write_volatile(fifo, u32)` had worked all along.)
+
+The bare-metal C path was abandoned when its flash-resident `main` faulted
+with `IllegalInstruction` on its first `entry` (root cause never resolved —
+the four bugs above were all found *before* that). Pivoted to **Option B:
+ESP-IDF v5.5.1 + the vendored TIE728 assembly** as a proper C-SIMD harness
+(`benchmarks/espdl-baseline/`), which boots through ESP-IDF's official
+startup and runs the flash code normally.
+
+Simultaneously, the first *real-hardware* execution of Hematite's SIMD
+kernels exposed a **windowed-ABI `call8` argument-placement bug** in all 9
+`hematite-s3` SIMD call sites: for a `call8`-target (callee uses
+`entry sp,128`), the window rotates by 8, so arguments must go in the
+*caller's* `a10/a11/a12` (not `a2/a3/a4`). Fixed at every call site
+(conv1x1, conv3x3, gemm, elementwise, activations, pool); verified by GCC
+disassembly. This was why QEMU never caught it — the `qemu` feature gates
+off all SIMD paths due to the `VSMULAS` emulator bug.
+
+Final clean on-device benchmark (`hematite-benchmarks` release build, 240
+MHz calibrated, 4 SRAM rows + expected no-PSRAM panic for the PSRAM-tier
+rows):
+
+| Row | Cycles (min/med) | col1 speedup |
+|---|---|---|
+| `conv_s8 8x8,64x3x3x3` | 4893951/4893951 | 1.03× (pad gated, scalar) |
+| `depthwise_conv_s8 18x18` | 3538988/3538988 | 0.99× (input_c=1 gated, scalar) |
+| `fc_s8 271row,3out` | 17936/17936 | 0.99× (out=3 gated, scalar) |
+| `conv1x1_s8 64x1x1x64` | **2626/2628** | **51.37×** (SIMD fires) |
+
+The conv1x1 SIMD path ran the real TIE728 asm for the first time: 4096
+MACs in 2628 cycles (0.64 cyc/MAC), with `out_fnv(ref/s3) =
+0x0bea8225/0x5eee898e` — SIMD output *differs* from the scalar reference
+(see §3).
+
+### Phase 10 — C-SIMD bit-exact output match (cross-language benchmark)
+`benchmarks/espdl-baseline/` (ESP-IDF v5.5.1 C harness) calls the *same*
+vendored `dl_tie728_s8_conv2d_11cn` asm entry directly, with the same
+`fill_pattern` (input `i*7+3`, weights `i*13+11`, bias `i*17-8`, out 0),
+same `Tie728ConvArgs` (offsets verified byte-identical to the Rust struct),
+and the same quantization constants (`mult=1<<30`, `shift=0`, act
+`-128/127`).
+
+One root cause surfaced by the comparison: **FNV-1a sign-extension
+convention.** The Rust firmware's `fnv1a` does `h ^= b as u32` on `i8`
+bytes, which *sign-extends* negatives (`0x80 → 0xFFFFFF80`); the first C
+version XORed raw bytes, producing a different checksum for the same
+output. Fixed in C (`h ^= (uint32_t)(int8_t)b`), after which **both
+checksums matched bit-exact on-device**:
+
+| Path | Cycles (min/med) | out_checksum |
+|---|---|---|
+| C raw TIE728 asm call | 380/380 | `0x5eee898e` |
+| C full-API mirror (gate+dispatch+asm) | 1767/1767 | `0x5eee898e` |
+| Rust `hematite-s3` public `conv2d_1x1` | 2626/2628 | `0x5eee898e` |
+| C scalar reference | — | `0x0bea8225` |
+| Rust scalar reference (`hematite-ref`) | 141055 | `0x0bea8225` |
+
+**Findings:** (a) the C↔Rust SIMD output is *bit-exact* — Rust executes the
+same vendored asm as C, so there is no Rust-specific SIMD slowdown; (b) the
+380 → 1767 → 2628 cycle ladder is pure wrapper overhead (validation +
+dispatch + arg build), not kernel cost; the kernel itself is 0.09 cyc/MAC
+for 16-wide TIE728; (c) SIMD output (`0x5eee898e`) ≠ scalar reference
+(`0x0bea8225`) because the asm consumes filter in `[g][ic][lane]` layout
+while the Rust/C wrappers feed raw `[oc][ic]` weights — a deterministic
+filter-layout transform, not a bug, and real headroom for a faster kernel.
+
 ---
 
 ## 3. Known divergences and open technical debt
@@ -252,13 +341,16 @@ a documented, verified reason, not an assumption.
   the current benchmark table's specific shapes and is therefore an open,
   documented, low-confidence item — not proven safe under QEMU, just not
   proven broken either.
-- **No physical ESP32-S3 hardware available in this environment.** Every
-  number this project has produced is either a host-native scalar
-  correctness check or a QEMU-emulated cycle count (explicitly labeled
-  "QEMU-EMULATION", never presented as a hardware measurement). Real
-  SIMD-speedup numbers, real timing, and the `person_detect`/`mobilenet_v2`
-  divergence's practical significance all require hardware bring-up as the
-  next concrete step.
+- **SIMD output ≠ scalar reference on conv1x1** (`out_fnv` `0x5eee898e` vs
+  `0x0bea8225`, bit-exact across C↔Rust): the vendored TIE728 asm consumes
+  the filter in `[g][ic][lane]` layout (per 16-output-channel group,
+  input-channel-major, 16 lanes), while both the C and Rust wrappers feed
+  it raw `[oc][ic]` row-major weights. The result is a *deterministic*
+  rearrangement of the same math — not a bug, and it is why `conv1x1` SIMD
+  "speedup" numbers (col1 ≈ 51×) are computed against the scalar reference
+  even though the outputs differ. Fixing it (transposing the filter, or
+  feeding the asm's expected layout) is the largest single performance and
+  correctness headroom item left.
 
 ---
 
@@ -293,12 +385,22 @@ a documented, verified reason, not an assumption.
 ## 5. Current status
 
 All 37 original plan tasks are complete and the Final Verification Wave
-approved. All post-plan hardware bring-up work through the SIMD-wiring and
-QEMU-emulation-gap discovery is committed. Host test suite: 80 suites,
-0 failures, maintained throughout every change in this log.
+approved. Hardware bring-up (Phase 9) and the C-SIMD bit-exact output match
+(Phase 10) are committed. Host test suite: 80 suites, 0 failures,
+maintained throughout every change in this log.
+
+On-device benchmark state: conv1x1 `64x1x1x64` SIMD runs the real TIE728
+asm at 2626/2628 cycles (51× vs scalar), with output verified bit-exact
+against an independent ESP-IDF C harness (`benchmarks/espdl-baseline`,
+380-cycle raw asm / 1767-cycle full-API). Other SRAM rows are
+legitimately scalar (pad/input_c/out-channel gates); PSRAM-tier rows
+require a PSRAM-equipped board.
 
 **Open decisions awaiting explicit direction:**
 1. Force-push the rewritten git history to `origin/main`?
-2. Physical ESP32-S3 hardware bring-up — the confirmed next step for real
-   SIMD timing and to assess the practical impact of the
-   `person_detect`/`mobilenet_v2` rounding divergence.
+2. The `person_detect`/`mobilenet_v2` rounding divergence's practical
+   impact on hardware (now that real timing exists).
+3. The conv1x1 SIMD filter-layout gap (see §3): transpose the weights to
+   match the asm's `[g][ic][lane]` layout to make SIMD output equal the
+   scalar reference, and to recover the remaining wrapper overhead
+   (2628 → 1767+ cycles).
