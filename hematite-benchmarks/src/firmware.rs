@@ -431,6 +431,27 @@ fn bench_kernel(spec: &KernelSpec, clock: &mut RealClock, canary: &mut StackCana
     // the C-SIMD harness calling the identical TIE728 entry point.
     let s3_fnv = fnv1a(bufs.output);
 
+    // Prepared path: the SIMD gate runs ONCE here (outside the timed window);
+    // the timed closure only re-checks pointer alignment + dispatches. This
+    // isolates wrapper overhead the public-API path pays on every call.
+    let prepared = match crate::spec::prepare_kernel(spec) {
+        Ok(p) => p,
+        Err(_) => panic!("prepared '{}': prepare_kernel failed", spec.name),
+    };
+    fill_pattern(&mut bufs);
+    let prepared_log = run_repeated(
+        clock,
+        &mut || {
+            let _ = prepared.run(spec, &mut bufs, &mut scratch);
+        },
+        &cfg,
+    );
+    let prepared_fnv = fnv1a(bufs.output);
+
+    let prepared_sum = match summarize(&prepared_log) {
+        Some(s) => s,
+        None => return, // unreachable: run_repeated floors at 10
+    };
     let s3_sum = match summarize(&s3_log) {
         Some(s) => s,
         None => return, // unreachable: run_repeated floors at 10
@@ -455,6 +476,15 @@ fn bench_kernel(spec: &KernelSpec, clock: &mut RealClock, canary: &mut StackCana
     row.speedups[0].speedup = Some(col1);
 
     emit_row(&row, ref_fnv, s3_fnv);
+    firmware_log!(
+        "  prepared: {}/{} cycles | ms_240 {}/{} | out_fnv=0x{:08x} (matches s3 0x{:08x})",
+        prepared_sum.min_cycles,
+        prepared_sum.median_cycles,
+        crate::timing::cycles_to_us(prepared_sum.min_cycles, CPU_HZ_240MHZ),
+        crate::timing::cycles_to_us(prepared_sum.median_cycles, CPU_HZ_240MHZ),
+        prepared_fnv,
+        s3_fnv,
+    );
 
     if let Err(e) = canary.verify() {
         panic!("bench '{}': {}", spec.name, e.describe());

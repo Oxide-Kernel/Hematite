@@ -816,8 +816,7 @@ pub fn run_kernel(spec: &KernelSpec, bufs: &mut SpecBufs<'_>, scratch: &mut [u8]
         OpKind::Conv2d1x1 => {
             let p = params_conv(spec);
             hematite_s3::conv1x1::conv2d_1x1(bufs.input, bufs.weights, bufs.bias, p, bufs.output, scratch)
-        }
-        OpKind::Conv2d3x3 => {
+        }        OpKind::Conv2d3x3 => {
             let p = params_conv(spec);
             hematite_s3::conv3x3::conv2d_3x3(bufs.input, bufs.weights, bufs.bias, p, bufs.output, scratch)
         }
@@ -857,6 +856,219 @@ pub fn run_kernel(spec: &KernelSpec, bufs: &mut SpecBufs<'_>, scratch: &mut [u8]
             let p = params_elementwise(spec);
             hematite_s3::elementwise::sub(bufs.input, bufs.weights, p, bufs.output, scratch)
         }
+    }
+}
+
+/// A prepared kernel handle: the SIMD eligibility gate is run ONCE at
+/// construction (`prepare_kernel`), then `run` only re-checks pointer
+/// alignment and dispatches to the TIE728 entry — closing the wrapper
+/// overhead the firmware measures on the legacy public-API path.
+///
+/// Host-compilable: on host every handle is non-SIMD and `run` falls through
+/// to the scalar kernel, so the prepared path is bit-exact vs the scalar ref
+/// in host tests. On device (`xtensa`, non-qemu) the SIMD gate fires for the
+/// `SIMD_*` bench rows.
+#[allow(clippy::large_enum_variant)]
+pub enum PreparedKernel {
+    Conv1x1(hematite_s3::conv1x1::PreparedConv1x1),
+    Conv3x3(hematite_s3::conv3x3::PreparedConv3x3),
+    Fc(hematite_s3::gemm::PreparedFc),
+    MaxPool(hematite_s3::pool::PreparedMaxPool),
+    AvgPool(hematite_s3::pool::PreparedAvgPool),
+    Relu(hematite_s3::activations::PreparedRelu),
+    Add(hematite_s3::elementwise::PreparedAdd),
+    Mul(hematite_s3::elementwise::PreparedMul),
+    Sub(hematite_s3::elementwise::PreparedSub),
+    /// Ops with no SIMD path (depthwise, softmax): just run the public API.
+    Scalar,
+}
+
+impl PreparedKernel {
+    /// Run the prepared kernel. `spec` is only consulted for the `Scalar`
+    /// fallback (depthwise/softmax); the handle variants dispatch directly.
+    pub fn run(
+        &self,
+        spec: &KernelSpec,
+        bufs: &mut SpecBufs<'_>,
+        scratch: &mut [u8],
+    ) -> Result<(), KernelError> {
+        match self {
+            PreparedKernel::Conv1x1(h) => {
+                h.run(bufs.input, bufs.weights, bufs.bias, bufs.output, scratch)
+            }
+            PreparedKernel::Conv3x3(h) => {
+                h.run(bufs.input, bufs.weights, bufs.bias, bufs.output, scratch)
+            }
+            PreparedKernel::Fc(h) => {
+                h.run(bufs.input, bufs.weights, bufs.bias, bufs.output, scratch)
+            }
+            PreparedKernel::MaxPool(h) => h.run(bufs.input, bufs.output, scratch),
+            PreparedKernel::AvgPool(h) => h.run(bufs.input, bufs.output, scratch),
+            PreparedKernel::Relu(h) => h.run(bufs.input, bufs.output, scratch),
+            PreparedKernel::Add(h) => {
+                h.run(bufs.input, bufs.weights, bufs.output, scratch)
+            }
+            PreparedKernel::Mul(h) => {
+                h.run(bufs.input, bufs.weights, bufs.output, scratch)
+            }
+            PreparedKernel::Sub(h) => {
+                h.run(bufs.input, bufs.weights, bufs.output, scratch)
+            }
+            PreparedKernel::Scalar => run_kernel_scalar(spec, bufs, scratch),
+        }
+    }
+}
+
+/// Host/device-compilable scalar dispatch for the `PreparedKernel::Scalar`
+/// fallback (depthwise, softmax — ops with no SIMD path). Mirrors
+/// `run_kernel` but never touches the (xtensa-gated) `run_kernel`/`params_*`.
+fn run_kernel_scalar(
+    spec: &KernelSpec,
+    bufs: &mut SpecBufs<'_>,
+    scratch: &mut [u8],
+) -> Result<(), KernelError> {
+    match spec.op {
+        OpKind::Conv2d1x1 => {
+            let p = match spec.params {
+                KernelParams::Conv(p) => p,
+                _ => return Err(KernelError::Unsupported),
+            };
+            hematite_s3::conv1x1::conv2d_1x1(bufs.input, bufs.weights, bufs.bias, p, bufs.output, scratch)
+        }
+        OpKind::Conv2d3x3 => {
+            let p = match spec.params {
+                KernelParams::Conv(p) => p,
+                _ => return Err(KernelError::Unsupported),
+            };
+            hematite_s3::conv3x3::conv2d_3x3(bufs.input, bufs.weights, bufs.bias, p, bufs.output, scratch)
+        }
+        OpKind::DepthwiseConv2d => {
+            let p = match spec.params {
+                KernelParams::Depthwise(p) => p,
+                _ => return Err(KernelError::Unsupported),
+            };
+            hematite_s3::depthwise::depthwise_conv2d(bufs.input, bufs.weights, bufs.bias, p, bufs.output, scratch)
+        }
+        OpKind::FullyConnected => {
+            let p = match spec.params {
+                KernelParams::Fc(p) => p,
+                _ => return Err(KernelError::Unsupported),
+            };
+            hematite_s3::gemm::fully_connected(bufs.input, bufs.weights, bufs.bias, p, bufs.output, scratch)
+        }
+        OpKind::Softmax => {
+            let p = match spec.params {
+                KernelParams::Softmax(p) => p,
+                _ => return Err(KernelError::Unsupported),
+            };
+            hematite_s3::softmax::softmax(bufs.input, p, bufs.output, scratch)
+        }
+        OpKind::AvgPool => {
+            let p = match spec.params {
+                KernelParams::Pool(p) => p,
+                _ => return Err(KernelError::Unsupported),
+            };
+            hematite_s3::pool::average_pool_2d(bufs.input, p, bufs.output, scratch)
+        }
+        OpKind::MaxPool => {
+            let p = match spec.params {
+                KernelParams::Pool(p) => p,
+                _ => return Err(KernelError::Unsupported),
+            };
+            hematite_s3::pool::max_pool_2d(bufs.input, p, bufs.output, scratch)
+        }
+        OpKind::Relu => {
+            let p = match spec.params {
+                KernelParams::Activation(p) => p,
+                _ => return Err(KernelError::Unsupported),
+            };
+            hematite_s3::activations::relu(bufs.input, p, bufs.output, scratch)
+        }
+        OpKind::Add => {
+            let p = match spec.params {
+                KernelParams::Elementwise(p) => p,
+                _ => return Err(KernelError::Unsupported),
+            };
+            hematite_s3::elementwise::add(bufs.input, bufs.weights, p, bufs.output, scratch)
+        }
+        OpKind::Mul => {
+            let p = match spec.params {
+                KernelParams::Elementwise(p) => p,
+                _ => return Err(KernelError::Unsupported),
+            };
+            hematite_s3::elementwise::mul(bufs.input, bufs.weights, p, bufs.output, scratch)
+        }
+        OpKind::Sub => {
+            let p = match spec.params {
+                KernelParams::Elementwise(p) => p,
+                _ => return Err(KernelError::Unsupported),
+            };
+            hematite_s3::elementwise::sub(bufs.input, bufs.weights, p, bufs.output, scratch)
+        }
+    }
+}
+
+/// Build a [`PreparedKernel`] from a spec — runs the SIMD gate once.
+///
+/// Uses the `&'static` params stored in `spec.params` directly (host- and
+/// device-compilable, unlike the xtensa-gated `params_*` accessors).
+pub fn prepare_kernel(spec: &KernelSpec) -> Result<PreparedKernel, KernelError> {
+    match spec.op {
+        OpKind::Conv2d1x1 => match spec.params {
+            KernelParams::Conv(p) => Ok(PreparedKernel::Conv1x1(
+                hematite_s3::conv1x1::PreparedConv1x1::new(p)?,
+            )),
+            _ => Err(KernelError::Unsupported),
+        },
+        OpKind::Conv2d3x3 => match spec.params {
+            KernelParams::Conv(p) => Ok(PreparedKernel::Conv3x3(
+                hematite_s3::conv3x3::PreparedConv3x3::new(p)?,
+            )),
+            _ => Err(KernelError::Unsupported),
+        },
+        OpKind::FullyConnected => match spec.params {
+            KernelParams::Fc(p) => Ok(PreparedKernel::Fc(
+                hematite_s3::gemm::PreparedFc::new(p)?,
+            )),
+            _ => Err(KernelError::Unsupported),
+        },
+        OpKind::MaxPool => match spec.params {
+            KernelParams::Pool(p) => Ok(PreparedKernel::MaxPool(
+                hematite_s3::pool::PreparedMaxPool::new(p)?,
+            )),
+            _ => Err(KernelError::Unsupported),
+        },
+        OpKind::AvgPool => match spec.params {
+            KernelParams::Pool(p) => Ok(PreparedKernel::AvgPool(
+                hematite_s3::pool::PreparedAvgPool::new(p)?,
+            )),
+            _ => Err(KernelError::Unsupported),
+        },
+        OpKind::Relu => match spec.params {
+            KernelParams::Activation(p) => Ok(PreparedKernel::Relu(
+                hematite_s3::activations::PreparedRelu::new(p)?,
+            )),
+            _ => Err(KernelError::Unsupported),
+        },
+        OpKind::Add => match spec.params {
+            KernelParams::Elementwise(p) => Ok(PreparedKernel::Add(
+                hematite_s3::elementwise::PreparedAdd::new(p)?,
+            )),
+            _ => Err(KernelError::Unsupported),
+        },
+        OpKind::Mul => match spec.params {
+            KernelParams::Elementwise(p) => Ok(PreparedKernel::Mul(
+                hematite_s3::elementwise::PreparedMul::new(p)?,
+            )),
+            _ => Err(KernelError::Unsupported),
+        },
+        OpKind::Sub => match spec.params {
+            KernelParams::Elementwise(p) => Ok(PreparedKernel::Sub(
+                hematite_s3::elementwise::PreparedSub::new(p)?,
+            )),
+            _ => Err(KernelError::Unsupported),
+        },
+        OpKind::DepthwiseConv2d | OpKind::Softmax => Ok(PreparedKernel::Scalar),
     }
 }
 
@@ -1174,6 +1386,42 @@ mod tests {
                 assert_eq!(
                     s3_out, ref_out,
                     "{}: s3 scalar output must be bit-identical to hematite-ref",
+                    spec.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_spec_prepared_matches_ref_bit_exact() {
+        let specs = kernel_specs();
+        for spec in specs {
+            let lay = layout(spec);
+            let mut input = vec![0i8; lay.input_len];
+            let mut weights = vec![0i8; lay.weights_len];
+            let mut bias = vec![0i32; lay.bias_len];
+            let mut output = vec![0i8; lay.output_len];
+            let mut scratch = vec![0u8; 0];
+            {
+                let mut bufs = SpecBufs {
+                    input: &mut input,
+                    weights: &mut weights,
+                    bias: &mut bias,
+                    output: &mut output,
+                };
+                let prepared = prepare_kernel(spec)
+                    .unwrap_or_else(|e| panic!("{}: prepare_kernel failed: {e:?}", spec.name));
+                fill_pattern(&mut bufs);
+                prepared
+                    .run(spec, &mut bufs, &mut scratch)
+                    .unwrap_or_else(|e| panic!("{}: prepared kernel rejected: {e:?}", spec.name));
+                let prepared_out = bufs.output.to_vec();
+                fill_pattern(&mut bufs);
+                let ref_out = run_ref(spec, &mut bufs, &mut scratch)
+                    .unwrap_or_else(|e| panic!("{}: ref kernel rejected: {e}", spec.name));
+                assert_eq!(
+                    prepared_out, ref_out,
+                    "{}: prepared output must be bit-identical to hematite-ref",
                     spec.name
                 );
             }
