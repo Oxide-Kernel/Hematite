@@ -320,9 +320,9 @@ mod conv3x3_simd {
         args: &Tie728Conv33Args,
     ) {
         core::arch::asm!(
-            "mov a2, {output}",
-            "mov a3, {input}",
-            "mov a4, {args}",
+            "mov a10, {output}",
+            "mov a11, {input}",
+            "mov a12, {args}",
             "call8 dl_tie728_s8_conv2d_33cn",
             output = in(reg) output,
             input  = in(reg) input,
@@ -343,9 +343,9 @@ mod conv3x3_simd {
         args: &Tie728Conv33Args,
     ) {
         core::arch::asm!(
-            "mov a2, {output}",
-            "mov a3, {input}",
-            "mov a4, {args}",
+            "mov a10, {output}",
+            "mov a11, {input}",
+            "mov a12, {args}",
             "call8 dl_tie728_s8_conv2d_33cn_relu",
             output = in(reg) output,
             input  = in(reg) input,

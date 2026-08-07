@@ -278,9 +278,9 @@ mod activation_simd {
             ..Default::default()
         };
         core::arch::asm!(
-            "mov a2, {output}",
-            "mov a3, {input}",
-            "mov a4, {args}",
+            "mov a10, {output}",
+            "mov a11, {input}",
+            "mov a12, {args}",
             "call8 dl_tie728_s8_relu_11c",
             output = in(reg) output,
             input = in(reg) input,

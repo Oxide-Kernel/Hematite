@@ -384,10 +384,15 @@ mod conv1x1_simd {
         // appropriate entry point.
 
         core::arch::asm!(
-            // Load arguments into the ABI registers
-            "mov a2, {output}",
-            "mov a3, {input}",
-            "mov a4, {args}",
+            // Load arguments into the ABI registers.
+            //
+            // `dl_tie728_s8_conv2d_11cn` uses `entry sp, 128`, so it is called
+            // with the windowed `call8` convention: the callee's a2/a3/a4 are
+            // the caller's a10/a11/a12 (the window rotates by 8). Placing the
+            // args in a2/a3/a4 would deliver garbage pointers to the callee.
+            "mov a10, {output}",
+            "mov a11, {input}",
+            "mov a12, {args}",
 
             // Branch to dl_tie728_s8_conv2d_11cn (aligned, no fused activation)
             "call8 dl_tie728_s8_conv2d_11cn",
@@ -414,9 +419,9 @@ mod conv1x1_simd {
         args: &Tie728ConvArgs,
     ) {
         core::arch::asm!(
-            "mov a2, {output}",
-            "mov a3, {input}",
-            "mov a4, {args}",
+            "mov a10, {output}",
+            "mov a11, {input}",
+            "mov a12, {args}",
             "call8 dl_tie728_s8_conv2d_11cn_relu",
             output = in(reg) output,
             input  = in(reg) input,

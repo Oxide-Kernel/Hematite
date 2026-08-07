@@ -465,10 +465,10 @@ mod elementwise_simd {
             ..Default::default()
         };
         core::arch::asm!(
-            "mov a2, {output}",
-            "mov a3, {input1}",
-            "mov a4, {input2}",
-            "mov a5, {args}",
+            "mov a10, {output}",
+            "mov a11, {input1}",
+            "mov a12, {input2}",
+            "mov a13, {args}",
             "call8 dl_tie728_s8_add_w1_16_w2_16",
             output = in(reg) output,
             input1 = in(reg) input1,
@@ -510,10 +510,10 @@ mod elementwise_simd {
             ..Default::default()
         };
         core::arch::asm!(
-            "mov a2, {output}",
-            "mov a3, {input1}",
-            "mov a4, {input2}",
-            "mov a5, {args}",
+            "mov a10, {output}",
+            "mov a11, {input1}",
+            "mov a12, {input2}",
+            "mov a13, {args}",
             "call8 dl_tie728_s8_mul_w1_16_w2_16",
             output = in(reg) output,
             input1 = in(reg) input1,
@@ -551,10 +551,10 @@ mod elementwise_simd {
             ..Default::default()
         };
         core::arch::asm!(
-            "mov a2, {output}",
-            "mov a3, {input1}",
-            "mov a4, {input2}",
-            "mov a5, {args}",
+            "mov a10, {output}",
+            "mov a11, {input1}",
+            "mov a12, {input2}",
+            "mov a13, {args}",
             "call8 dl_tie728_s8_sub_w1_16_w2_16",
             output = in(reg) output,
             input1 = in(reg) input1,
