@@ -31,10 +31,130 @@ use hematite_core::op_params::Conv2DParams;
 use hematite_core::KernelError;
 use hematite_int8::{multiply_by_quantized_multiplier, saturating_cast};
 
+/// Shared TIE728 SIMD eligibility gate for the 3×3 conv — host-compilable.
+///
+/// Returns
+/// `Some((mac_shift, ocd8, c_div_x_1, dilation_x_offset, dilation_y_offset, use_relu))`
+/// when the params qualify for `dl_tie728_s8_conv2d_33cn`, `None` otherwise.
+/// Single source of truth for both the legacy `conv2d_3x3` dispatch and the
+/// [`PreparedConv3x3`] handle.
+#[inline]
+pub(crate) fn simd_eligible_conv3x3(
+    params: &Conv2DParams<'_>,
+    input_c: i32,
+    out_channels: i32,
+    filter_h: i32,
+    filter_w: i32,
+    pad_h: i32,
+    pad_w: i32,
+) -> Option<(i32, i32, i32, i32, i32, bool)> {
+    let mult = params.output_multiplier_per_channel;
+    let shift = params.output_shift_per_channel;
+    let mult_uniform = !mult.is_empty() && mult.iter().all(|&m| m == mult[0]) && mult[0] == 1 << 30;
+    let shift_uniform = !shift.is_empty() && shift.iter().all(|&s| s == shift[0]);
+    let full_range = params.quantized_activation_min == i8::MIN as i32
+        && params.quantized_activation_max == i8::MAX as i32;
+    let relu_range = params.quantized_activation_min == 0
+        && params.quantized_activation_max == i8::MAX as i32;
+
+    if params.input_offset == 0
+        && params.output_offset == 0
+        && (full_range || relu_range)
+        && mult_uniform
+        && shift_uniform
+        && input_c % 16 == 0
+        && input_c >= 16
+        && out_channels % 16 == 0
+        && pad_h == 0
+        && pad_w == 0
+        && filter_h == 3
+        && filter_w == 3
+    {
+        let use_relu = relu_range && !full_range;
+        let dilation_x_offset = params.dilation_width_factor * params.stride_width;
+        let dilation_y_offset = params.dilation_height_factor * params.stride_height;
+        Some((shift[0], out_channels / 16, input_c / 16 - 1, dilation_x_offset, dilation_y_offset, use_relu))
+    } else {
+        None
+    }
+}
+
+/// Prepared 3×3 conv handle — runs the SIMD gate ONCE at construction, then
+/// `run` only re-checks pointer alignment and dispatches. Closes the
+/// wrapper-overhead gap vs C raw-asm (2824 cyc vs Rust s3 4849 cyc).
+pub struct PreparedConv3x3 {
+    simd: Option<(i32, i32, i32, i32, i32, bool)>,
+    params: &'static Conv2DParams<'static>,
+}
+
+impl PreparedConv3x3 {
+    pub fn new(params: &'static Conv2DParams<'static>) -> Result<Self, KernelError> {
+        let input_c = params.input_shape[3];
+        let out_channels = params.output_shape[3];
+        let filter_h = params.filter_shape[1];
+        let filter_w = params.filter_shape[2];
+        let pad_h = conv_pad_h(params);
+        let pad_w = conv_pad_w(params);
+        let simd = simd_eligible_conv3x3(params, input_c, out_channels, filter_h, filter_w, pad_h, pad_w)
+            .filter(|_| cfg!(all(target_arch = "xtensa", not(feature = "qemu"))));
+        Ok(Self { simd, params })
+    }
+
+    #[inline]
+    pub fn is_simd(&self) -> bool {
+        self.simd.is_some()
+    }
+
+    pub fn run(
+        &self,
+        input: &[i8],
+        weights: &[i8],
+        bias: &[i32],
+        output: &mut [i8],
+        scratch: &mut [u8],
+    ) -> Result<(), KernelError> {
+        #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+        if let Some((mac_shift, ocd8, cdiv, dil_x, dil_y, use_relu)) = self.simd {
+            let in_ptr = input.as_ptr();
+            let w_ptr = weights.as_ptr();
+            let b_ptr = bias.as_ptr();
+            let out_ptr = output.as_mut_ptr();
+            let aligned = (in_ptr as usize) % 16 == 0
+                && (w_ptr as usize) % 16 == 0
+                && (b_ptr as usize) % 16 == 0
+                && (out_ptr as usize) % 16 == 0;
+            if aligned {
+                unsafe {
+                    conv3x3_simd::dispatch_3x3(
+                        out_ptr, in_ptr, w_ptr, b_ptr, mac_shift, ocd8, cdiv, dil_x, dil_y, use_relu,
+                    );
+                }
+                let _ = scratch;
+                return Ok(());
+            }
+        }
+        conv2d_3x3(input, weights, bias, self.params, output, scratch)
+    }
+}
+
 /// Compute the product of a `[i32; 4]` shape array.
 #[inline(always)]
 fn shape_product(shape: &[i32; 4]) -> usize {
     shape[0] as usize * shape[1] as usize * shape[2] as usize * shape[3] as usize
+}
+
+/// Derived vertical pad (same formula as hematite-ref conv.rs).
+#[inline]
+pub(crate) fn conv_pad_h(params: &Conv2DParams<'_>) -> i32 {
+    let dilated_h = (params.filter_shape[1] - 1) * params.dilation_height_factor + 1;
+    ((params.output_shape[1] - 1) * params.stride_height + dilated_h - params.input_shape[1]) / 2
+}
+
+/// Derived horizontal pad (same formula as hematite-ref conv.rs).
+#[inline]
+pub(crate) fn conv_pad_w(params: &Conv2DParams<'_>) -> i32 {
+    let dilated_w = (params.filter_shape[2] - 1) * params.dilation_width_factor + 1;
+    ((params.output_shape[2] - 1) * params.stride_width + dilated_w - params.input_shape[2]) / 2
 }
 
 /// Conv2D general kernel — scalar path (host-compilable, bit-exact vs per-channel golden).
@@ -112,27 +232,8 @@ pub fn conv2d_3x3(
     // builds fall through to the scalar path; real hardware still gets SIMD.
     #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
     {
-        let mult = params.output_multiplier_per_channel;
-        let shift = params.output_shift_per_channel;
-        let mult_uniform = !mult.is_empty() && mult.iter().all(|&m| m == mult[0]) && mult[0] == 1 << 30;
-        let shift_uniform = !shift.is_empty() && shift.iter().all(|&s| s == shift[0]);
-        let full_range = params.quantized_activation_min == i8::MIN as i32
-            && params.quantized_activation_max == i8::MAX as i32;
-        let relu_range = params.quantized_activation_min == 0
-            && params.quantized_activation_max == i8::MAX as i32;
-
-        if params.input_offset == 0
-            && params.output_offset == 0
-            && (full_range || relu_range)
-            && mult_uniform
-            && shift_uniform
-            && input_c % 16 == 0
-            && input_c >= 16
-            && out_channels % 16 == 0
-            && pad_h == 0
-            && pad_w == 0
-            && filter_h == 3
-            && filter_w == 3
+        if let Some((mac_shift, ocd8, cdiv, dil_x, dil_y, use_relu)) =
+            simd_eligible_conv3x3(params, input_c, out_channels, filter_h, filter_w, pad_h, pad_w)
         {
             let in_ptr = input.as_ptr();
             let w_ptr = weights.as_ptr();
@@ -144,20 +245,17 @@ pub fn conv2d_3x3(
                 && (out_ptr as usize) % 16 == 0;
 
             if aligned {
-                let use_relu = relu_range && !full_range;
-                let dilation_x_offset = params.dilation_width_factor * params.stride_width;
-                let dilation_y_offset = params.dilation_height_factor * params.stride_height;
                 unsafe {
                     conv3x3_simd::dispatch_3x3(
                         out_ptr,
                         in_ptr,
                         w_ptr,
                         b_ptr,
-                        shift[0],
-                        out_channels / 16,
-                        input_c / 16 - 1,
-                        dilation_x_offset,
-                        dilation_y_offset,
+                        mac_shift,
+                        ocd8,
+                        cdiv,
+                        dil_x,
+                        dil_y,
                         use_relu,
                     );
                 }
@@ -378,30 +476,28 @@ mod conv3x3_simd {
         dilation_y_offset: i32,
         use_relu: bool,
     ) {
-        let args = Tie728Conv33Args {
-            _pad0: [0u8; 48],
-            filter,
-            _pad1: [0u8; 12],
-            mac_shift,
-            bias,
-            _pad2: [0u8; 4],
-            activation_alpha: 0,
-            activation_alpha_ptr: core::ptr::null(),
-            activation_shift: if use_relu { 0 } else { -1 },
-            _pad3: [0u8; 8],
-            output_channel_div_8,
-            c_div_x_1,
-            filter_channel_factor: core::ptr::null(),
-            dilation_x_offset,
-            dilation_y_offset,
-            _pad4: [0u8; 20],
-            c_remainder: 0,
-            n_remainder: 0,
-        };
+        // MaybeUninit args build — write ONLY the asm-read fields
+        // (+48/+64/+68/+76/+80/+84/+96/+100/+104/+108/+112), no memset/dead
+        // pad stores. The unaligned-path fields +136/+140 stay uninit (never
+        // read on the aligned path).
+        let mut args = core::mem::MaybeUninit::<Tie728Conv33Args>::uninit();
+        let p = args.as_mut_ptr();
+        p.cast::<u8>().add(48).cast::<*const i8>().write(filter);
+        p.cast::<u8>().add(64).cast::<i32>().write(mac_shift);
+        p.cast::<u8>().add(68).cast::<*const i32>().write(bias);
+        p.cast::<u8>().add(76).cast::<i32>().write(0);
+        p.cast::<u8>().add(80).cast::<*const u8>().write(core::ptr::null());
+        p.cast::<u8>().add(84).cast::<i32>().write(if use_relu { 0 } else { -1 });
+        p.cast::<u8>().add(96).cast::<i32>().write(output_channel_div_8);
+        p.cast::<u8>().add(100).cast::<i32>().write(c_div_x_1);
+        p.cast::<u8>().add(104).cast::<*const i16>().write(core::ptr::null());
+        p.cast::<u8>().add(108).cast::<i32>().write(dilation_x_offset);
+        p.cast::<u8>().add(112).cast::<i32>().write(dilation_y_offset);
+        let args = args.assume_init_ref();
         if use_relu {
-            conv2d_3x3_simd_relu(output, input, &args);
+            conv2d_3x3_simd_relu(output, input, args);
         } else {
-            conv2d_3x3_simd_aligned(output, input, &args);
+            conv2d_3x3_simd_aligned(output, input, args);
         }
     }
 }

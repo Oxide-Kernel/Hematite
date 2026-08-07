@@ -27,6 +27,67 @@ use hematite_core::op_params::ActivationParams;
 use hematite_core::KernelError;
 use hematite_int8::{multiply_by_quantized_multiplier, saturating_cast};
 
+/// Shared TIE728 SIMD eligibility gate for ReLU — host-compilable.
+///
+/// `n` is the element count (not in the params), so the gate is split: the
+/// params-derived conditions are fixed at construction, and `n % 16 == 0`
+/// (plus pointer alignment) is re-checked per call. Returns `true` when the
+/// params qualify for `dl_tie728_s8_relu_11c`.
+#[inline]
+pub(crate) fn relu_simd_eligible_params(params: &ActivationParams<'_>) -> bool {
+    params.input_offset == 0
+        && params.output_offset == 0
+        && params.output_multiplier == 1 << 30
+        && params.output_shift == 1
+}
+
+/// Prepared ReLU handle — evaluates the params-derived half of the SIMD gate
+/// ONCE at construction; `run` re-checks `n % 16 == 0` and pointer alignment
+/// per call, then dispatches. Closes the wrapper gap vs C raw-asm (175 cyc vs
+/// Rust s3 425 cyc).
+pub struct PreparedRelu {
+    params_ok: bool,
+    params: &'static ActivationParams<'static>,
+}
+
+impl PreparedRelu {
+    pub fn new(params: &'static ActivationParams<'static>) -> Result<Self, KernelError> {
+        let params_ok = relu_simd_eligible_params(params)
+            && cfg!(all(target_arch = "xtensa", not(feature = "qemu")));
+        Ok(Self { params_ok, params })
+    }
+
+    #[inline]
+    pub fn is_simd(&self) -> bool {
+        self.params_ok
+    }
+
+    pub fn run(
+        &self,
+        input: &[i8],
+        output: &mut [i8],
+        scratch: &mut [u8],
+    ) -> Result<(), KernelError> {
+        let n = input.len();
+        if output.len() != n {
+            return Err(KernelError::ShapeMismatch);
+        }
+        #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+        if self.params_ok && n % 16 == 0 && n >= 16 {
+            let in_ptr = input.as_ptr();
+            let out_ptr = output.as_mut_ptr();
+            if (in_ptr as usize) % 16 == 0 && (out_ptr as usize) % 16 == 0 {
+                unsafe {
+                    relu_simd(out_ptr, in_ptr, n as u32, 0, 0);
+                }
+                let _ = scratch;
+                return Ok(());
+            }
+        }
+        relu(input, self.params, output, scratch)
+    }
+}
+
 /// ReLU: `output = max(0, input)` in quantized space.
 ///
 /// # Algorithm
@@ -315,13 +376,16 @@ mod activation_simd {
         // (it always has a final unconditional 16-element block), so the loop
         // counts must reserve that trailing block.
         let c = num_elements as i32;
-        let args = Tie728ReluArgs {
-            activation_alpha,
-            activation_shift,
-            c_rs1_1: (c - 16) / 32,
-            c_rs2_1: ((c - 16) % 32) / 16,
-            ..Default::default()
-        };
+        // Write only the 4 asm-read fields (offsets +76/+84/+88/+92); the
+        // 76-byte _pad0 is never read by the asm, so leave it uninitialized
+        // (no memset / no dead pad stores).
+        let mut args = core::mem::MaybeUninit::<Tie728ReluArgs>::uninit();
+        let p = args.as_mut_ptr();
+        p.cast::<u8>().add(76).cast::<i32>().write(activation_alpha);
+        p.cast::<u8>().add(84).cast::<i32>().write(activation_shift);
+        p.cast::<u8>().add(88).cast::<i32>().write((c - 16) / 32);
+        p.cast::<u8>().add(92).cast::<i32>().write(((c - 16) % 32) / 16);
+        let args = unsafe { args.assume_init_ref() };
         let target = dl_tie728_s8_relu_11c as unsafe extern "C" fn() as usize;
         core::arch::asm!(
             "mov a10, {output}",
@@ -330,7 +394,7 @@ mod activation_simd {
             "callx8 {target}",
             output = in(reg) output,
             input = in(reg) input,
-            args = in(reg) &args,
+            args = in(reg) args,
             target = in(reg) target,
             clobber_abi("C"),
         );

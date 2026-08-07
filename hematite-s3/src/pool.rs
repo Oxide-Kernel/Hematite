@@ -584,13 +584,18 @@ mod pool_simd {
         input_x_offset: i32,
         c_div_x_1: i32,
     ) {
-        let args = Tie728MaxPoolArgs {
-            input_channel,
-            input_y_offset,
-            input_x_offset,
-            c_div_x_1,
-            ..Default::default()
-        };
+        // Write only the asm-read fields (+4/+16/+20/+48/+52/+60/+104);
+        // _pad bytes are never read by the asm, so leave uninitialized.
+        let mut args = core::mem::MaybeUninit::<Tie728MaxPoolArgs>::uninit();
+        let p = args.as_mut_ptr();
+        p.cast::<u8>().add(4).cast::<i32>().write(input_channel);
+        p.cast::<u8>().add(16).cast::<i32>().write(input_y_offset);
+        p.cast::<u8>().add(20).cast::<i32>().write(input_x_offset);
+        p.cast::<u8>().add(48).cast::<i32>().write(2); // filter_height
+        p.cast::<u8>().add(52).cast::<i32>().write(2); // filter_width
+        p.cast::<u8>().add(60).cast::<i32>().write(0); // c_remainder
+        p.cast::<u8>().add(104).cast::<i32>().write(c_div_x_1);
+        let args = unsafe { args.assume_init_ref() };
         let target = dl_tie728_s8_max_pool2d_22c1 as unsafe extern "C" fn() as usize;
         core::arch::asm!(
             "mov a10, {output}",
@@ -599,7 +604,7 @@ mod pool_simd {
             "callx8 {target}",
             output = in(reg) output,
             input = in(reg) input,
-            args = in(reg) &args,
+            args = in(reg) args,
             target = in(reg) target,
             clobber_abi("C"),
         );
@@ -637,15 +642,21 @@ mod pool_simd {
     ) {
         let mut area_inv = [0i8; 16];
         area_inv.copy_from_slice(avg_pool_area_inv);
-        let args = Tie728AvgPoolArgs {
-            input_channel,
-            input_y_offset,
-            input_x_offset,
-            shift,
-            avg_pool_area_inv: area_inv,
-            c_div_x_1,
-            ..Default::default()
-        };
+        // Write only the asm-read fields (+4/+16/+20/+56/+64/+104).
+        let mut args = core::mem::MaybeUninit::<Tie728AvgPoolArgs>::uninit();
+        let p = args.as_mut_ptr();
+        p.cast::<u8>().add(4).cast::<i32>().write(input_channel);
+        p.cast::<u8>().add(16).cast::<i32>().write(input_y_offset);
+        p.cast::<u8>().add(20).cast::<i32>().write(input_x_offset);
+        p.cast::<u8>().add(48).cast::<i32>().write(2); // filter_height
+        p.cast::<u8>().add(52).cast::<i32>().write(2); // filter_width
+        p.cast::<u8>().add(56).cast::<i32>().write(shift);
+        p.cast::<u8>().add(64).cast::<i8>().copy_from_nonoverlapping(
+            area_inv.as_ptr(),
+            16,
+        );
+        p.cast::<u8>().add(104).cast::<i32>().write(c_div_x_1);
+        let args = unsafe { args.assume_init_ref() };
         let target = dl_tie728_s8_avg_pool2d_22c1 as unsafe extern "C" fn() as usize;
         core::arch::asm!(
             "mov a10, {output}",
@@ -654,7 +665,7 @@ mod pool_simd {
             "callx8 {target}",
             output = in(reg) output,
             input = in(reg) input,
-            args = in(reg) &args,
+            args = in(reg) args,
             target = in(reg) target,
             clobber_abi("C"),
         );
@@ -665,3 +676,150 @@ mod pool_simd {
 pub use pool_simd::avg_pool_2d_simd;
 #[cfg(target_arch = "xtensa")]
 pub use pool_simd::max_pool_2d_simd;
+
+// ── Prepared-pool fast path ──────────────────────────────────────────────
+
+/// Shared SIMD-eligibility gate for 2×2/stride-2 pooling (both avg and max).
+///
+/// Host-compilable: returns `Some(cfg)` when the TIE728 `*_22c1` entry points
+/// can run, so a handle can be built once and reused across calls without
+/// re-running the gate. `cfg` is `(input_channel, input_y_offset, input_x_offset,
+/// c_div_x_1)`.
+pub(crate) fn simd_eligible_pool(
+    params: &PoolParams,
+) -> Option<(i32, i32, i32, i32)> {
+    let input_h = params.input_shape[1];
+    let input_w = params.input_shape[2];
+    let channels = params.input_shape[3];
+    let filter_h = params.filter_height;
+    let filter_w = params.filter_width;
+    let out_h = params.output_shape[1];
+    let out_w = params.output_shape[2];
+
+    let pad_h = ((out_h - 1) * params.stride_height + filter_h - input_h) / 2;
+    let pad_w = ((out_w - 1) * params.stride_width + filter_w - input_w) / 2;
+
+    if filter_h == 2
+        && filter_w == 2
+        && params.stride_height == 2
+        && params.stride_width == 2
+        && pad_h == 0
+        && pad_w == 0
+        && channels % 16 == 0
+        && params.quantized_activation_min == i8::MIN as i32
+        && params.quantized_activation_max == i8::MAX as i32
+    {
+        let total_out = out_h * out_w * channels;
+        Some((
+            channels,
+            input_w * channels,
+            channels,
+            total_out / 16 - 1,
+        ))
+    } else {
+        None
+    }
+}
+
+/// Prepared 2×2 max pool — runs the SIMD gate once at construction.
+pub struct PreparedMaxPool {
+    simd: Option<(i32, i32, i32, i32)>,
+    params: &'static PoolParams,
+}
+
+impl PreparedMaxPool {
+    /// Run the SIMD gate once; subsequent `run` calls skip it.
+    pub fn new(params: &'static PoolParams) -> Result<Self, KernelError> {
+        let simd = simd_eligible_pool(params).filter(|_| cfg!(all(target_arch = "xtensa")));
+        Ok(Self { simd, params })
+    }
+
+    /// Whether the TIE728 SIMD path is active for these params.
+    pub fn is_simd(&self) -> bool {
+        self.simd.is_some()
+    }
+
+    /// Run max pool on `input` → `output`.
+    pub fn run(
+        &self,
+        input: &[i8],
+        output: &mut [i8],
+        scratch: &mut [u8],
+    ) -> Result<(), KernelError> {
+        #[cfg(target_arch = "xtensa")]
+        {
+            if let Some((input_channel, input_y_offset, input_x_offset, c_div_x_1)) = self.simd {
+                let in_ptr = input.as_ptr();
+                let out_ptr = output.as_mut_ptr();
+                if (in_ptr as usize) % 16 == 0 && (out_ptr as usize) % 16 == 0 {
+                    unsafe {
+                        max_pool_2d_simd(
+                            out_ptr,
+                            in_ptr,
+                            input_channel,
+                            input_y_offset,
+                            input_x_offset,
+                            c_div_x_1,
+                        );
+                    }
+                    let _ = scratch;
+                    return Ok(());
+                }
+            }
+        }
+        max_pool_2d(input, self.params, output, scratch)
+    }
+}
+
+/// Prepared 2×2 average pool — runs the SIMD gate once at construction.
+pub struct PreparedAvgPool {
+    simd: Option<(i32, i32, i32, i32)>,
+    params: &'static PoolParams,
+}
+
+impl PreparedAvgPool {
+    /// Run the SIMD gate once; subsequent `run` calls skip it.
+    pub fn new(params: &'static PoolParams) -> Result<Self, KernelError> {
+        let simd = simd_eligible_pool(params).filter(|_| cfg!(all(target_arch = "xtensa")));
+        Ok(Self { simd, params })
+    }
+
+    /// Whether the TIE728 SIMD path is active for these params.
+    pub fn is_simd(&self) -> bool {
+        self.simd.is_some()
+    }
+
+    /// Run average pool on `input` → `output`.
+    pub fn run(
+        &self,
+        input: &[i8],
+        output: &mut [i8],
+        scratch: &mut [u8],
+    ) -> Result<(), KernelError> {
+        #[cfg(target_arch = "xtensa")]
+        {
+            if let Some((input_channel, input_y_offset, input_x_offset, c_div_x_1)) = self.simd {
+                let in_ptr = input.as_ptr();
+                let out_ptr = output.as_mut_ptr();
+                if (in_ptr as usize) % 16 == 0 && (out_ptr as usize) % 16 == 0 {
+                    let area_inv = [64i8; 16];
+                    unsafe {
+                        avg_pool_2d_simd(
+                            out_ptr,
+                            in_ptr,
+                            input_channel,
+                            input_y_offset,
+                            input_x_offset,
+                            8,
+                            &area_inv,
+                            c_div_x_1,
+                        );
+                    }
+                    let _ = scratch;
+                    return Ok(());
+                }
+            }
+        }
+        average_pool_2d(input, self.params, output, scratch)
+    }
+}

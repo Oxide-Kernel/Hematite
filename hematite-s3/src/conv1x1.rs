@@ -65,6 +65,111 @@ fn shape_product(shape: &[i32; 4]) -> usize {
     shape[0] as usize * shape[1] as usize * shape[2] as usize * shape[3] as usize
 }
 
+/// Shared TIE728 SIMD eligibility gate for the 1×1 conv — host-compilable.
+///
+/// Returns `Some((mac_shift, output_channel_div_8, c_div_x_1, use_relu))` when
+/// the params qualify for the vendored `dl_tie728_s8_conv2d_11cn` entry point,
+/// `None` otherwise. This is the single source of truth reused by both the
+/// legacy `conv2d_1x1` dispatch and the [`PreparedConv1x1`] handle.
+#[inline]
+pub(crate) fn simd_eligible_conv1x1(
+    params: &Conv2DParams<'_>,
+    input_c: i32,
+    out_channels: i32,
+) -> Option<(i32, i32, i32, bool)> {
+    let mult = params.output_multiplier_per_channel;
+    let shift = params.output_shift_per_channel;
+    let mult_uniform = !mult.is_empty() && mult.iter().all(|&m| m == mult[0]) && mult[0] == 1 << 30;
+    let shift_uniform = !shift.is_empty() && shift.iter().all(|&s| s == shift[0]);
+    let full_range = params.quantized_activation_min == i8::MIN as i32
+        && params.quantized_activation_max == i8::MAX as i32;
+    let relu_range = params.quantized_activation_min == 0
+        && params.quantized_activation_max == i8::MAX as i32;
+
+    if params.input_offset == 0
+        && params.output_offset == 0
+        && (full_range || relu_range)
+        && mult_uniform
+        && shift_uniform
+        && input_c % 16 == 0
+        && input_c >= 16
+        && out_channels % 16 == 0
+    {
+        let use_relu = relu_range && !full_range;
+        Some((shift[0], out_channels / 16, input_c / 16 - 1, use_relu))
+    } else {
+        None
+    }
+}
+
+/// Prepared 1×1 conv handle — runs the SIMD eligibility gate ONCE at
+/// construction, then `run` only re-checks pointer alignment and dispatches.
+///
+/// This closes the wrapper-overhead gap vs C (raw-asm 472 cyc vs Rust public
+/// API 2628 cyc): the per-call path is reduced to 4 alignment ANDs + a
+/// MaybeUninit args build + the call8, instead of re-validating shapes and
+/// re-scanning the per-channel multiplier/shift arrays every call.
+///
+/// When the gate fails (or on host where the SIMD backend is compiled out),
+/// `run` falls through to the scalar kernel — output is bit-exact either way.
+pub struct PreparedConv1x1 {
+    /// Cached `(mac_shift, output_channel_div_8, c_div_x_1, use_relu)` from the
+    /// gate, `None` when not SIMD-eligible on this target.
+    simd: Option<(i32, i32, i32, bool)>,
+    params: &'static Conv2DParams<'static>,
+}
+
+impl PreparedConv1x1 {
+    /// Evaluate the SIMD gate for the given layer params.
+    ///
+    /// `input_c` / `out_channels` are taken from the params by the caller; this
+    /// keeps the constructor free of shape-product slicing so it stays cheap
+    /// (used once per layer at model build time).
+    pub fn new(params: &'static Conv2DParams<'static>) -> Result<Self, KernelError> {
+        let input_c = params.input_shape[3];
+        let out_channels = params.output_shape[3];
+        let simd = simd_eligible_conv1x1(params, input_c, out_channels)
+            .filter(|_| cfg!(all(target_arch = "xtensa", not(feature = "qemu"))));
+        Ok(Self { simd, params })
+    }
+
+    /// Whether this layer is SIMD-eligible on the current target.
+    #[inline]
+    pub fn is_simd(&self) -> bool {
+        self.simd.is_some()
+    }
+
+    /// Run the 1×1 conv — SIMD when eligible and aligned, scalar otherwise.
+    pub fn run(
+        &self,
+        input: &[i8],
+        weights: &[i8],
+        bias: &[i32],
+        output: &mut [i8],
+        scratch: &mut [u8],
+    ) -> Result<(), KernelError> {
+        #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+        if let Some((mac_shift, ocd8, cdiv, use_relu)) = self.simd {
+            let in_ptr = input.as_ptr();
+            let w_ptr = weights.as_ptr();
+            let b_ptr = bias.as_ptr();
+            let out_ptr = output.as_mut_ptr();
+            let aligned = (in_ptr as usize) % 16 == 0
+                && (w_ptr as usize) % 16 == 0
+                && (b_ptr as usize) % 16 == 0
+                && (out_ptr as usize) % 16 == 0;
+            if aligned {
+                unsafe {
+                    conv1x1_simd::dispatch_1x1(out_ptr, in_ptr, w_ptr, b_ptr, mac_shift, ocd8, cdiv, use_relu);
+                }
+                let _ = scratch;
+                return Ok(());
+            }
+        }
+        conv2d_1x1(input, weights, bias, self.params, output, scratch)
+    }
+}
+
 /// Conv2D 1×1 GEMM — scalar kernel (host-compilable, bit-exact vs per-channel golden).
 ///
 /// Mirrors the `hematite-ref/src/conv.rs` arithmetic exactly: bias-init i32
@@ -139,23 +244,8 @@ pub fn conv2d_1x1(
     // it there.
     #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
     {
-        let mult = params.output_multiplier_per_channel;
-        let shift = params.output_shift_per_channel;
-        let mult_uniform = !mult.is_empty() && mult.iter().all(|&m| m == mult[0]) && mult[0] == 1 << 30;
-        let shift_uniform = !shift.is_empty() && shift.iter().all(|&s| s == shift[0]);
-        let full_range = params.quantized_activation_min == i8::MIN as i32
-            && params.quantized_activation_max == i8::MAX as i32;
-        let relu_range = params.quantized_activation_min == 0
-            && params.quantized_activation_max == i8::MAX as i32;
-
-        if params.input_offset == 0
-            && params.output_offset == 0
-            && (full_range || relu_range)
-            && mult_uniform
-            && shift_uniform
-            && input_c % 16 == 0
-            && input_c >= 16
-            && out_channels % 16 == 0
+        if let Some((mac_shift, ocd8, cdiv, use_relu)) =
+            simd_eligible_conv1x1(params, input_c, out_channels)
         {
             let in_ptr = input.as_ptr();
             let w_ptr = weights.as_ptr();
@@ -167,16 +257,15 @@ pub fn conv2d_1x1(
                 && (out_ptr as usize) % 16 == 0;
 
             if aligned {
-                let use_relu = relu_range && !full_range;
                 unsafe {
                     conv1x1_simd::dispatch_1x1(
                         out_ptr,
                         in_ptr,
                         w_ptr,
                         b_ptr,
-                        shift[0],
-                        out_channels / 16,
-                        input_c / 16 - 1,
+                        mac_shift,
+                        ocd8,
+                        cdiv,
                         use_relu,
                     );
                 }
@@ -451,25 +540,25 @@ mod conv1x1_simd {
         c_div_x_1: i32,
         use_relu: bool,
     ) {
-        let args = Tie728ConvArgs {
-            _pad0: [0u8; 48],
-            filter,
-            _pad1: [0u8; 12],
-            mac_shift,
-            bias,
-            _pad2: [0u8; 4],
-            activation_alpha: 0,
-            _pad3: [0u8; 4],
-            activation_shift: if use_relu { 0 } else { -1 },
-            _pad4: [0u8; 8],
-            output_channel_div_8,
-            c_div_x_1,
-            filter_channel_factor: core::ptr::null(),
-        };
+        // Build the args struct writing ONLY the 8 fields the asm reads
+        // (+48/+64/+68/+76/+84/+96/+100/+104), leaving all padding
+        // uninitialized. A struct literal would emit a memset + dead pad
+        // stores per call (~50+ cycles of pure overhead on the hot path).
+        let mut args = core::mem::MaybeUninit::<Tie728ConvArgs>::uninit();
+        let p = args.as_mut_ptr();
+        p.cast::<u8>().add(48).cast::<*const i8>().write(filter);
+        p.cast::<u8>().add(64).cast::<i32>().write(mac_shift);
+        p.cast::<u8>().add(68).cast::<*const i32>().write(bias);
+        p.cast::<u8>().add(76).cast::<i32>().write(0);
+        p.cast::<u8>().add(84).cast::<i32>().write(if use_relu { 0 } else { -1 });
+        p.cast::<u8>().add(96).cast::<i32>().write(output_channel_div_8);
+        p.cast::<u8>().add(100).cast::<i32>().write(c_div_x_1);
+        p.cast::<u8>().add(104).cast::<*const i16>().write(core::ptr::null());
+        let args = args.assume_init_ref();
         if use_relu {
-            conv2d_1x1_simd_relu(output, input, &args);
+            conv2d_1x1_simd_relu(output, input, args);
         } else {
-            conv2d_1x1_simd_aligned(output, input, &args);
+            conv2d_1x1_simd_aligned(output, input, args);
         }
     }
 }

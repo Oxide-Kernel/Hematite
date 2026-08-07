@@ -35,6 +35,97 @@ use hematite_core::op_params::FullyConnectedParams;
 use hematite_core::KernelError;
 use hematite_int8::{multiply_by_quantized_multiplier, saturating_cast};
 
+/// Shared TIE728 SIMD eligibility gate for the FC/GEMM kernel — host-compilable.
+///
+/// Returns `Some((mac_shift, output_channel_div_8, c_div_x_1, use_relu))` when
+/// the params qualify for the reused `dl_tie728_s8_conv2d_11cn` entry point,
+/// `None` otherwise. Single source of truth for both the legacy `fully_connected`
+/// dispatch and the [`PreparedFc`] handle.
+#[inline]
+pub(crate) fn simd_eligible_fc(
+    params: &FullyConnectedParams<'_>,
+    input_dim: i32,
+    output_dim: i32,
+) -> Option<(i32, i32, i32, bool)> {
+    let mult = params.output_multiplier_per_channel;
+    let shift = params.output_shift_per_channel;
+    let mult_uniform = !mult.is_empty()
+        && mult.iter().all(|&m| m == mult[0])
+        && mult[0] == 1 << 30;
+    let shift_uniform = !shift.is_empty() && shift.iter().all(|&s| s == shift[0]);
+    let full_range = params.quantized_activation_min == i8::MIN as i32
+        && params.quantized_activation_max == i8::MAX as i32;
+    let relu_range = params.quantized_activation_min == 0
+        && params.quantized_activation_max == i8::MAX as i32;
+
+    if params.input_offset == 0
+        && params.output_offset == 0
+        && (full_range || relu_range)
+        && mult_uniform
+        && shift_uniform
+        && input_dim % 16 == 0
+        && input_dim >= 16
+        && output_dim % 16 == 0
+    {
+        let use_relu = relu_range && !full_range;
+        Some((shift[0], output_dim / 16, input_dim / 16 - 1, use_relu))
+    } else {
+        None
+    }
+}
+
+/// Prepared FC/GEMM handle — runs the SIMD gate ONCE at construction, then
+/// `run` only re-checks pointer alignment and dispatches. Closes the
+/// wrapper-overhead gap vs C raw-asm (1288 cyc vs Rust s3 3187 cyc).
+pub struct PreparedFc {
+    simd: Option<(i32, i32, i32, bool)>,
+    params: &'static FullyConnectedParams<'static>,
+}
+
+impl PreparedFc {
+    pub fn new(params: &'static FullyConnectedParams<'static>) -> Result<Self, KernelError> {
+        let input_dim = params.input_dim as i32;
+        let output_dim = params.output_dim as i32;
+        let simd = simd_eligible_fc(params, input_dim, output_dim)
+            .filter(|_| cfg!(all(target_arch = "xtensa", not(feature = "qemu"))));
+        Ok(Self { simd, params })
+    }
+
+    #[inline]
+    pub fn is_simd(&self) -> bool {
+        self.simd.is_some()
+    }
+
+    pub fn run(
+        &self,
+        input: &[i8],
+        weights: &[i8],
+        bias: &[i32],
+        output: &mut [i8],
+        scratch: &mut [u8],
+    ) -> Result<(), KernelError> {
+        #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+        if let Some((mac_shift, ocd8, cdiv, use_relu)) = self.simd {
+            let in_ptr = input.as_ptr();
+            let w_ptr = weights.as_ptr();
+            let b_ptr = bias.as_ptr();
+            let out_ptr = output.as_mut_ptr();
+            let aligned = (in_ptr as usize) % 16 == 0
+                && (w_ptr as usize) % 16 == 0
+                && (b_ptr as usize) % 16 == 0
+                && (out_ptr as usize) % 16 == 0;
+            if aligned {
+                unsafe {
+                    gemm_simd::dispatch_fc(out_ptr, in_ptr, w_ptr, b_ptr, mac_shift, ocd8, cdiv, use_relu);
+                }
+                let _ = scratch;
+                return Ok(());
+            }
+        }
+        fully_connected(input, weights, bias, self.params, output, scratch)
+    }
+}
+
 /// Fully-connected layer — scalar kernel (host-compilable, bit-exact vs per-channel golden).
 ///
 /// Mirrors `hematite-ref/src/fully_connected.rs` semantics exactly: bias-init
@@ -82,23 +173,8 @@ pub fn fully_connected(
     // the scalar path; real hardware still gets SIMD.
     #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
     {
-        let mult_uniform = !multipliers.is_empty()
-            && multipliers.iter().all(|&m| m == multipliers[0])
-            && multipliers[0] == 1 << 30;
-        let shift_uniform = !shifts.is_empty() && shifts.iter().all(|&s| s == shifts[0]);
-        let full_range = params.quantized_activation_min == i8::MIN as i32
-            && params.quantized_activation_max == i8::MAX as i32;
-        let relu_range = params.quantized_activation_min == 0
-            && params.quantized_activation_max == i8::MAX as i32;
-
-        if params.input_offset == 0
-            && params.output_offset == 0
-            && (full_range || relu_range)
-            && mult_uniform
-            && shift_uniform
-            && input_dim % 16 == 0
-            && input_dim >= 16
-            && output_dim % 16 == 0
+        if let Some((mac_shift, ocd8, cdiv, use_relu)) =
+            simd_eligible_fc(params, input_dim as i32, output_dim as i32)
         {
             let in_ptr = input.as_ptr();
             let w_ptr = weights.as_ptr();
@@ -110,16 +186,15 @@ pub fn fully_connected(
                 && (out_ptr as usize) % 16 == 0;
 
             if aligned {
-                let use_relu = relu_range && !full_range;
                 unsafe {
                     gemm_simd::dispatch_fc(
                         out_ptr,
                         in_ptr,
                         w_ptr,
                         b_ptr,
-                        shifts[0],
-                        (output_dim / 16) as i32,
-                        (input_dim / 16) as i32 - 1,
+                        mac_shift,
+                        ocd8,
+                        cdiv,
                         use_relu,
                     );
                 }
@@ -270,6 +345,7 @@ mod gemm_simd {
     ///
     /// Same safety contract as `fc_simd_aligned` / `fc_simd_relu`.
     #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     pub(super) unsafe fn dispatch_fc(
         output: *mut i8,
         input: *const i8,
@@ -280,25 +356,24 @@ mod gemm_simd {
         c_div_x_1: i32,
         use_relu: bool,
     ) {
-        let args = Tie728GemmArgs {
-            _pad0: [0u8; 48],
-            filter,
-            _pad1: [0u8; 12],
-            mac_shift,
-            bias,
-            _pad2: [0u8; 4],
-            activation_alpha: 0,
-            activation_alpha_ptr: core::ptr::null(),
-            activation_shift: if use_relu { 0 } else { -1 },
-            _pad3: [0u8; 8],
-            output_channel_div_8,
-            c_div_x_1,
-            filter_channel_factor: core::ptr::null(),
-        };
+        // MaybeUninit args build — write ONLY the asm-read fields
+        // (+48/+64/+68/+76/+84/+96/+100/+104), no memset/dead pad stores.
+        let mut args = core::mem::MaybeUninit::<Tie728GemmArgs>::uninit();
+        let p = args.as_mut_ptr();
+        p.cast::<u8>().add(48).cast::<*const i8>().write(filter);
+        p.cast::<u8>().add(64).cast::<i32>().write(mac_shift);
+        p.cast::<u8>().add(68).cast::<*const i32>().write(bias);
+        p.cast::<u8>().add(76).cast::<i32>().write(0);
+        p.cast::<u8>().add(80).cast::<*const u8>().write(core::ptr::null());
+        p.cast::<u8>().add(84).cast::<i32>().write(if use_relu { 0 } else { -1 });
+        p.cast::<u8>().add(96).cast::<i32>().write(output_channel_div_8);
+        p.cast::<u8>().add(100).cast::<i32>().write(c_div_x_1);
+        p.cast::<u8>().add(104).cast::<*const i16>().write(core::ptr::null());
+        let args = args.assume_init_ref();
         if use_relu {
-            fc_simd_relu(output, input, &args);
+            fc_simd_relu(output, input, args);
         } else {
-            fc_simd_aligned(output, input, &args);
+            fc_simd_aligned(output, input, args);
         }
     }
 }

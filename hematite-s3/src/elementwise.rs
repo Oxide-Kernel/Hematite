@@ -460,10 +460,14 @@ mod elementwise_simd {
         input2: *const i8,
         num_elements: u32,
     ) {
-        let args = AddSubAlignedArgs {
-            length: num_elements,
-            ..Default::default()
-        };
+        // Only the length field (@44) is read by the asm.
+        let mut args = core::mem::MaybeUninit::<AddSubAlignedArgs>::uninit();
+        args.as_mut_ptr()
+            .cast::<u8>()
+            .add(44)
+            .cast::<u32>()
+            .write(num_elements);
+        let args = unsafe { args.assume_init_ref() };
         core::arch::asm!(
             "mov a10, {output}",
             "mov a11, {input1}",
@@ -473,7 +477,7 @@ mod elementwise_simd {
             output = in(reg) output,
             input1 = in(reg) input1,
             input2 = in(reg) input2,
-            args = in(reg) &args,
+            args = in(reg) args,
             clobber_abi("C"),
         );
     }
@@ -504,11 +508,12 @@ mod elementwise_simd {
         num_elements: u32,
         mul_shift: i32,
     ) {
-        let args = MulAlignedArgs {
-            c_div_x_1: (num_elements / 16) as i32 - 1,
-            mul_shift,
-            ..Default::default()
-        };
+        // Only c_div_x_1 (@64) and mul_shift (@80) are read by the asm.
+        let mut args = core::mem::MaybeUninit::<MulAlignedArgs>::uninit();
+        let p = args.as_mut_ptr();
+        p.cast::<u8>().add(64).cast::<i32>().write((num_elements / 16) as i32 - 1);
+        p.cast::<u8>().add(80).cast::<i32>().write(mul_shift);
+        let args = unsafe { args.assume_init_ref() };
         core::arch::asm!(
             "mov a10, {output}",
             "mov a11, {input1}",
@@ -518,7 +523,7 @@ mod elementwise_simd {
             output = in(reg) output,
             input1 = in(reg) input1,
             input2 = in(reg) input2,
-            args = in(reg) &args,
+            args = in(reg) args,
             clobber_abi("C"),
         );
     }
@@ -546,10 +551,14 @@ mod elementwise_simd {
         input2: *const i8,
         num_elements: u32,
     ) {
-        let args = AddSubAlignedArgs {
-            length: num_elements,
-            ..Default::default()
-        };
+        // Only the length field (@44) is read by the asm.
+        let mut args = core::mem::MaybeUninit::<AddSubAlignedArgs>::uninit();
+        args.as_mut_ptr()
+            .cast::<u8>()
+            .add(44)
+            .cast::<u32>()
+            .write(num_elements);
+        let args = unsafe { args.assume_init_ref() };
         core::arch::asm!(
             "mov a10, {output}",
             "mov a11, {input1}",
@@ -559,7 +568,7 @@ mod elementwise_simd {
             output = in(reg) output,
             input1 = in(reg) input1,
             input2 = in(reg) input2,
-            args = in(reg) &args,
+            args = in(reg) args,
             clobber_abi("C"),
         );
     }
@@ -572,3 +581,190 @@ pub use elementwise_simd::add_simd_aligned;
 pub use elementwise_simd::mul_simd_aligned;
 #[cfg(target_arch = "xtensa")]
 pub use elementwise_simd::sub_simd_aligned;
+
+// ── Prepared-elementwise fast path ───────────────────────────────────────
+
+/// Shared SIMD-eligibility gate for add/sub (identity quant-affine chain).
+///
+/// Host-compilable: returns `true` when `dl_tie728_s8_{add,sub}_w1_16_w2_16`
+/// produces output bit-exact vs the scalar kernel (raw int8 add/sub with no
+/// offset/rescale/requantize, which only matches the scalar when every
+/// quant-affine step degenerates to the identity pair `(1<<30, 1)`).
+pub(crate) fn simd_eligible_add_sub(params: &ElementwiseParams) -> bool {
+    let identity = |m: i32, s: i32| m == 1 << 30 && s == 1;
+    params.input1_offset == 0
+        && params.input2_offset == 0
+        && params.output_offset == 0
+        && params.quantized_activation_min == i8::MIN as i32
+        && params.quantized_activation_max == i8::MAX as i32
+        && params.left_shift <= 0
+        && identity(params.input1_multiplier, params.input1_shift)
+        && identity(params.input2_multiplier, params.input2_shift)
+        && identity(params.output_multiplier, params.output_shift)
+}
+
+/// Shared SIMD-eligibility gate for mul (raw int8 product + fixed requantize).
+///
+/// Returns `Some(mul_shift)` when `dl_tie728_s8_mul_w1_16_w2_16` is bit-exact
+/// vs the scalar kernel. `mul_shift = 1 - output_shift`.
+pub(crate) fn simd_eligible_mul(params: &ElementwiseParams) -> Option<i32> {
+    if params.input1_offset == 0
+        && params.input2_offset == 0
+        && params.output_offset == 0
+        && params.quantized_activation_min == i8::MIN as i32
+        && params.quantized_activation_max == i8::MAX as i32
+        && params.output_multiplier == 1 << 30
+        && params.output_shift <= 1
+    {
+        Some(1 - params.output_shift)
+    } else {
+        None
+    }
+}
+
+/// Prepared elementwise add — runs the SIMD gate once at construction.
+pub struct PreparedAdd {
+    simd: bool,
+    params: &'static ElementwiseParams,
+}
+
+impl PreparedAdd {
+    /// Run the SIMD gate once; subsequent `run` calls skip it.
+    pub fn new(params: &'static ElementwiseParams) -> Result<Self, KernelError> {
+        let simd = simd_eligible_add_sub(params) && cfg!(all(target_arch = "xtensa"));
+        Ok(Self { simd, params })
+    }
+
+    /// Whether the TIE728 SIMD path is active for these params.
+    pub fn is_simd(&self) -> bool {
+        self.simd
+    }
+
+    /// Run elementwise add on `input1` + `input2` → `output`.
+    pub fn run(
+        &self,
+        input1: &[i8],
+        input2: &[i8],
+        output: &mut [i8],
+        scratch: &mut [u8],
+    ) -> Result<(), KernelError> {
+        #[cfg(target_arch = "xtensa")]
+        {
+            let n = self.params.num_elements as usize;            if self.simd && n % 16 == 0 {
+                let in1_ptr = input1.as_ptr();
+                let in2_ptr = input2.as_ptr();
+                let out_ptr = output.as_mut_ptr();
+                if (in1_ptr as usize) % 16 == 0
+                    && (in2_ptr as usize) % 16 == 0
+                    && (out_ptr as usize) % 16 == 0
+                {
+                    unsafe {
+                        add_simd_aligned(out_ptr, in1_ptr, in2_ptr, n as u32);
+                    }
+                    let _ = scratch;
+                    return Ok(());
+                }
+            }
+        }
+        add(input1, input2, self.params, output, scratch)
+    }
+}
+
+/// Prepared elementwise mul — runs the SIMD gate once at construction.
+pub struct PreparedMul {
+    mul_shift: Option<i32>,
+    params: &'static ElementwiseParams,
+}
+
+impl PreparedMul {
+    /// Run the SIMD gate once; subsequent `run` calls skip it.
+    pub fn new(params: &'static ElementwiseParams) -> Result<Self, KernelError> {
+        let mul_shift =
+            simd_eligible_mul(params).filter(|_| cfg!(all(target_arch = "xtensa")));
+        Ok(Self { mul_shift, params })
+    }
+
+    /// Whether the TIE728 SIMD path is active for these params.
+    pub fn is_simd(&self) -> bool {
+        self.mul_shift.is_some()
+    }
+
+    /// Run elementwise mul on `input1` * `input2` → `output`.
+    pub fn run(
+        &self,
+        input1: &[i8],
+        input2: &[i8],
+        output: &mut [i8],
+        scratch: &mut [u8],
+    ) -> Result<(), KernelError> {
+        #[cfg(target_arch = "xtensa")]
+        {
+            let n = self.params.num_elements as usize;            if let Some(mul_shift) = self.mul_shift {
+                if n % 16 == 0 {
+                    let in1_ptr = input1.as_ptr();
+                    let in2_ptr = input2.as_ptr();
+                    let out_ptr = output.as_mut_ptr();
+                    if (in1_ptr as usize) % 16 == 0
+                        && (in2_ptr as usize) % 16 == 0
+                        && (out_ptr as usize) % 16 == 0
+                    {
+                        unsafe {
+                            mul_simd_aligned(out_ptr, in1_ptr, in2_ptr, n as u32, mul_shift);
+                        }
+                        let _ = scratch;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        mul(input1, input2, self.params, output, scratch)
+    }
+}
+
+/// Prepared elementwise sub — runs the SIMD gate once at construction.
+pub struct PreparedSub {
+    simd: bool,
+    params: &'static ElementwiseParams,
+}
+
+impl PreparedSub {
+    /// Run the SIMD gate once; subsequent `run` calls skip it.
+    pub fn new(params: &'static ElementwiseParams) -> Result<Self, KernelError> {
+        let simd = simd_eligible_add_sub(params) && cfg!(all(target_arch = "xtensa"));
+        Ok(Self { simd, params })
+    }
+
+    /// Whether the TIE728 SIMD path is active for these params.
+    pub fn is_simd(&self) -> bool {
+        self.simd
+    }
+
+    /// Run elementwise sub on `input1` − `input2` → `output`.
+    pub fn run(
+        &self,
+        input1: &[i8],
+        input2: &[i8],
+        output: &mut [i8],
+        scratch: &mut [u8],
+    ) -> Result<(), KernelError> {
+        #[cfg(target_arch = "xtensa")]
+        {
+            let n = self.params.num_elements as usize;            if self.simd && n % 16 == 0 {
+                let in1_ptr = input1.as_ptr();
+                let in2_ptr = input2.as_ptr();
+                let out_ptr = output.as_mut_ptr();
+                if (in1_ptr as usize) % 16 == 0
+                    && (in2_ptr as usize) % 16 == 0
+                    && (out_ptr as usize) % 16 == 0
+                {
+                    unsafe {
+                        sub_simd_aligned(out_ptr, in1_ptr, in2_ptr, n as u32);
+                    }
+                    let _ = scratch;
+                    return Ok(());
+                }
+            }
+        }
+        sub(input1, input2, self.params, output, scratch)
+    }
+}
