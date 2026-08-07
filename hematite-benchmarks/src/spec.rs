@@ -27,8 +27,8 @@
 //! 10× internal bar (T3.0) — both attributed to the plan in `source` fields.
 
 use hematite_core::op_params::{
-    Conv2DParams, DepthwiseConv2DParams, FullyConnectedParams, FusedActivation, Padding,
-    PoolParams, SoftmaxParams,
+    ActivationParams, Conv2DParams, DepthwiseConv2DParams, ElementwiseParams,
+    FullyConnectedParams, FusedActivation, Padding, PoolParams, SoftmaxParams,
 };
 use hematite_core::KernelError;
 
@@ -53,6 +53,9 @@ const MULT_64: [i32; 64] = mults::<64>();
 const SHIFT_64: [i32; 64] = shifts::<64>();
 const MULT_1000: [i32; 1000] = mults::<1000>();
 const SHIFT_1000: [i32; 1000] = shifts::<1000>();
+
+/// Element count for the SIMD relu / elementwise bench rows (n % 16 == 0).
+const RELU_NUM_ELEMENTS: usize = 256;
 
 /// Working-set memory tier label — every report row must state SRAM or PSRAM.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +87,11 @@ pub enum OpKind {
     FullyConnected,
     Softmax,
     AvgPool,
+    MaxPool,
+    Relu,
+    Add,
+    Mul,
+    Sub,
 }
 
 /// A documented competitor / acceptance baseline for a row.
@@ -110,6 +118,8 @@ pub enum KernelParams {
     Fc(&'static FullyConnectedParams<'static>),
     Softmax(&'static SoftmaxParams),
     Pool(&'static PoolParams),
+    Activation(&'static ActivationParams<'static>),
+    Elementwise(&'static ElementwiseParams),
 }
 
 /// A single per-kernel benchmark row.
@@ -297,6 +307,157 @@ const AVGPOOL_7X7_1280_PARAMS: PoolParams = PoolParams {
     quantized_activation_max: 127,
 };
 
+// ── SIMD-eligible SRAM rows (per-op C-SIMD comparison, Phase A) ────────────
+
+/// 3×3 conv with VALID padding (pad=0) and channel counts %16 — the only
+/// configuration the TIE728 `dl_tie728_s8_conv2d_33cn` gate accepts.
+const SIMD_CONV3X3_32X32_PARAMS: Conv2DParams<'static> = Conv2DParams {
+    input_shape: [1, 32, 32, 64],
+    filter_shape: [64, 3, 3, 64],
+    output_shape: [1, 30, 30, 64],
+    padding: Padding::Valid,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_64,
+    output_shift_per_channel: &SHIFT_64,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// FC with input_dim 256 and output_dim 64 (both %16) — fires the TIE728
+/// `dl_tie728_s8_conv2d_11cn` path (the same entry point conv1x1 uses).
+const SIMD_FC_256X64_PARAMS: FullyConnectedParams<'static> = FullyConnectedParams {
+    input_dim: 256,
+    output_dim: 64,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_64,
+    output_shift_per_channel: &SHIFT_64,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 2×2 max-pool, stride 2, VALID, channels 16 (%16) — fires
+/// `dl_tie728_s8_max_pool2d_22c1` (hardcoded 2x2/stride-2 pattern).
+const SIMD_MAXPOOL_32X32_PARAMS: PoolParams = PoolParams {
+    input_shape: [1, 32, 32, 16],
+    output_shape: [1, 16, 16, 16],
+    filter_width: 2,
+    filter_height: 2,
+    stride_width: 2,
+    stride_height: 2,
+    padding: Padding::Valid,
+    activation: FusedActivation::None,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 2×2 avg-pool, stride 2, VALID, channels 16 (%16) — fires
+/// `dl_tie728_s8_avg_pool2d_22c1`.
+const SIMD_AVGPOOL_32X32_PARAMS: PoolParams = PoolParams {
+    input_shape: [1, 32, 32, 16],
+    output_shape: [1, 16, 16, 16],
+    filter_width: 2,
+    filter_height: 2,
+    stride_width: 2,
+    stride_height: 2,
+    padding: Padding::Valid,
+    activation: FusedActivation::None,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// ReLU over 256 elements with the identity requantize pair
+/// (mult=1<<30, shift=1) and zero offsets — fires `dl_tie728_s8_relu_11c`
+/// (the Phase-0-fixed dispatch gate in `hematite-s3::activations::relu`).
+const SIMD_RELU_256_PARAMS: ActivationParams<'static> = ActivationParams {
+    input_offset: 0,
+    output_offset: 0,
+    output_multiplier: 1 << 30,
+    output_shift: 1,
+    quantized_activation_min: 0,
+    quantized_activation_max: 127,
+    input_multiplier: 0,
+    input_left_shift: 0,
+    input_range_radius: 0,
+    output_multiplier_alpha: 0,
+    output_shift_alpha: 0,
+    output_multiplier_identity: 0,
+    output_shift_identity: 0,
+    alpha_offset: 0,
+    alpha_data: &[],
+    output_multiplier_1: 0,
+    output_shift_1: 0,
+    output_multiplier_2: 0,
+    output_shift_2: 0,
+    reluish_multiplier_fixedpoint_int16: 0,
+    reluish_multiplier_exponent: 0,
+    output_multiplier_fixedpoint_int16: 0,
+    output_multiplier_exponent: 0,
+};
+
+/// Elementwise ADD over 256 elements with the full identity contract
+/// (zero offsets, no left shift, all (mult,shift) pairs == (1<<30,1), full
+/// int8 activation range) — fires `dl_tie728_s8_add_w1_16_w2_16`.
+const SIMD_ADD_256_PARAMS: ElementwiseParams = ElementwiseParams {
+    num_elements: 256,
+    input1_offset: 0,
+    input2_offset: 0,
+    output_offset: 0,
+    output_multiplier: 1 << 30,
+    output_shift: 1,
+    left_shift: 0,
+    input1_multiplier: 1 << 30,
+    input1_shift: 1,
+    input2_multiplier: 1 << 30,
+    input2_shift: 1,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// Elementwise MUL over 256 elements with zero offsets and the identity
+/// output pair (mult=1<<30, shift≤1) — fires `dl_tie728_s8_mul_w1_16_w2_16`
+/// with `mul_shift = 1 - output_shift`.
+const SIMD_MUL_256_PARAMS: ElementwiseParams = ElementwiseParams {
+    num_elements: 256,
+    input1_offset: 0,
+    input2_offset: 0,
+    output_offset: 0,
+    output_multiplier: 1 << 30,
+    output_shift: 0,
+    left_shift: 0,
+    input1_multiplier: 1 << 30,
+    input1_shift: 1,
+    input2_multiplier: 1 << 30,
+    input2_shift: 1,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// Elementwise SUB over 256 elements with the same identity contract as ADD
+/// — fires `dl_tie728_s8_sub_w1_16_w2_16`.
+const SIMD_SUB_256_PARAMS: ElementwiseParams = ElementwiseParams {
+    num_elements: 256,
+    input1_offset: 0,
+    input2_offset: 0,
+    output_offset: 0,
+    output_multiplier: 1 << 30,
+    output_shift: 1,
+    left_shift: 0,
+    input1_multiplier: 1 << 30,
+    input1_shift: 1,
+    input2_multiplier: 1 << 30,
+    input2_shift: 1,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
 /// The full per-kernel benchmark table (order = report row order).
 pub const fn kernel_specs() -> &'static [KernelSpec] {
     &[
@@ -351,6 +512,70 @@ pub const fn kernel_specs() -> &'static [KernelSpec] {
                 source: "plan T5.3 line 309: 'Column-2: beat ember-esp-nn's 15.57× on conv 1×1 64×1×1×64'",
             }),
             note: "Column-2 acceptance bar: our speedup vs our scalar ref must exceed 15.57×.",
+        },
+        KernelSpec {
+            name: "conv3x3_s8 32x32,64x3x3x64 VALID (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Conv2d3x3,
+            params: KernelParams::Conv(&SIMD_CONV3X3_32X32_PARAMS),
+            reference: None,
+            note: "TIE728 33cn SIMD row: pad=0 (VALID), channels %16, mult/shift uniform.",
+        },
+        KernelSpec {
+            name: "fc_s8 256row,64out (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::FullyConnected,
+            params: KernelParams::Fc(&SIMD_FC_256X64_PARAMS),
+            reference: None,
+            note: "TIE728 11cn SIMD row: input_dim 256 (%16) x output_dim 64 (%16).",
+        },
+        KernelSpec {
+            name: "max_pool_s8 2x2x16 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::MaxPool,
+            params: KernelParams::Pool(&SIMD_MAXPOOL_32X32_PARAMS),
+            reference: None,
+            note: "TIE728 max_pool2d_22c1 SIMD row: 2x2 stride2 VALID, channels 16.",
+        },
+        KernelSpec {
+            name: "avg_pool_s8 2x2x16 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::AvgPool,
+            params: KernelParams::Pool(&SIMD_AVGPOOL_32X32_PARAMS),
+            reference: None,
+            note: "TIE728 avg_pool2d_22c1 SIMD row: 2x2 stride2 VALID, channels 16.",
+        },
+        KernelSpec {
+            name: "relu_s8 256 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Relu,
+            params: KernelParams::Activation(&SIMD_RELU_256_PARAMS),
+            reference: None,
+            note: "TIE728 relu_11c SIMD row: identity requantize (1<<30,1), n=256.",
+        },
+        KernelSpec {
+            name: "add_s8 256 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Add,
+            params: KernelParams::Elementwise(&SIMD_ADD_256_PARAMS),
+            reference: None,
+            note: "TIE728 add_w1_16_w2_16 SIMD row: identity contract, n=256.",
+        },
+        KernelSpec {
+            name: "mul_s8 256 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Mul,
+            params: KernelParams::Elementwise(&SIMD_MUL_256_PARAMS),
+            reference: None,
+            note: "TIE728 mul_w1_16_w2_16 SIMD row: output pair (1<<30,0), n=256.",
+        },
+        KernelSpec {
+            name: "sub_s8 256 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Sub,
+            params: KernelParams::Elementwise(&SIMD_SUB_256_PARAMS),
+            reference: None,
+            note: "TIE728 sub_w1_16_w2_16 SIMD row: identity contract, n=256.",
         },
         KernelSpec {
             name: "conv_s8 224x224x3->32 (ESP-DL/MobileNetV2 first layer)",
@@ -453,6 +678,29 @@ pub fn layout(spec: &KernelSpec) -> SpecLayout {
             weights_len: 0,
             bias_len: 0,
             output_len: shape_product(&p.output_shape),
+        },
+        // Relu acts on a single flat int8 tensor: input_len == output_len,
+        // no weights or bias. The element count is carried in the spec name
+        // but the slices' lengths are what the kernel validates.
+        KernelParams::Activation(p) => {
+            // Relu has no num_elements field — the caller's input slice
+            // length drives the kernel; the spec row fixes it at 256 for
+            // SIMD eligibility. We encode it via a fixed constant.
+            let n = RELU_NUM_ELEMENTS;
+            SpecLayout {
+                input_len: n,
+                weights_len: 0,
+                bias_len: 0,
+                output_len: n,
+            }
+        }
+        // Elementwise ops consume input1=input slice, input2=weights slice
+        // (both length n), produce n outputs.
+        KernelParams::Elementwise(p) => SpecLayout {
+            input_len: p.num_elements as usize,
+            weights_len: p.num_elements as usize,
+            bias_len: 0,
+            output_len: p.num_elements as usize,
         },
     }
 }
@@ -589,6 +837,26 @@ pub fn run_kernel(spec: &KernelSpec, bufs: &mut SpecBufs<'_>, scratch: &mut [u8]
             let p = params_pool(spec);
             hematite_s3::pool::average_pool_2d(bufs.input, p, bufs.output, scratch)
         }
+        OpKind::MaxPool => {
+            let p = params_pool(spec);
+            hematite_s3::pool::max_pool_2d(bufs.input, p, bufs.output, scratch)
+        }
+        OpKind::Relu => {
+            let p = params_activation(spec);
+            hematite_s3::activations::relu(bufs.input, p, bufs.output, scratch)
+        }
+        OpKind::Add => {
+            let p = params_elementwise(spec);
+            hematite_s3::elementwise::add(bufs.input, bufs.weights, p, bufs.output, scratch)
+        }
+        OpKind::Mul => {
+            let p = params_elementwise(spec);
+            hematite_s3::elementwise::mul(bufs.input, bufs.weights, p, bufs.output, scratch)
+        }
+        OpKind::Sub => {
+            let p = params_elementwise(spec);
+            hematite_s3::elementwise::sub(bufs.input, bufs.weights, p, bufs.output, scratch)
+        }
     }
 }
 
@@ -627,6 +895,20 @@ fn params_pool(spec: &KernelSpec) -> &'static PoolParams {
         _ => panic!("spec.op pool requires KernelParams::Pool"),
     }
 }
+#[cfg(target_arch = "xtensa")]
+fn params_activation(spec: &KernelSpec) -> &'static ActivationParams<'static> {
+    match spec.params {
+        KernelParams::Activation(p) => p,
+        _ => panic!("spec.op activation requires KernelParams::Activation"),
+    }
+}
+#[cfg(target_arch = "xtensa")]
+fn params_elementwise(spec: &KernelSpec) -> &'static ElementwiseParams {
+    match spec.params {
+        KernelParams::Elementwise(p) => p,
+        _ => panic!("spec.op elementwise requires KernelParams::Elementwise"),
+    }
+}
 
 /// Dispatch a spec through the matching `hematite-ref` scalar kernel — the
 /// column-1 baseline, measured on device (never a pre-filled number).
@@ -660,6 +942,26 @@ pub fn run_ref_kernel(
         OpKind::AvgPool => {
             let p = params_pool(spec);
             hematite_ref::pool::average_pool_2d(bufs.input, p, bufs.output, scratch)
+        }
+        OpKind::MaxPool => {
+            let p = params_pool(spec);
+            hematite_ref::pool::max_pool_2d(bufs.input, p, bufs.output, scratch)
+        }
+        OpKind::Relu => {
+            let p = params_activation(spec);
+            hematite_ref::activation::relu(bufs.input, p, bufs.output, scratch)
+        }
+        OpKind::Add => {
+            let p = params_elementwise(spec);
+            hematite_ref::elementwise::add(bufs.input, bufs.weights, p, bufs.output, scratch)
+        }
+        OpKind::Mul => {
+            let p = params_elementwise(spec);
+            hematite_ref::elementwise::mul(bufs.input, bufs.weights, p, bufs.output, scratch)
+        }
+        OpKind::Sub => {
+            let p = params_elementwise(spec);
+            hematite_ref::elementwise::sub(bufs.input, bufs.weights, p, bufs.output, scratch)
         }
     }
 }
@@ -714,6 +1016,41 @@ mod tests {
                 };
                 hematite_s3::pool::average_pool_2d(bufs.input, p, bufs.output, scratch)
             }
+            OpKind::MaxPool => {
+                let p = match spec.params {
+                    KernelParams::Pool(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                hematite_s3::pool::max_pool_2d(bufs.input, p, bufs.output, scratch)
+            }
+            OpKind::Relu => {
+                let p = match spec.params {
+                    KernelParams::Activation(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                hematite_s3::activations::relu(bufs.input, p, bufs.output, scratch)
+            }
+            OpKind::Add => {
+                let p = match spec.params {
+                    KernelParams::Elementwise(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                hematite_s3::elementwise::add(bufs.input, bufs.weights, p, bufs.output, scratch)
+            }
+            OpKind::Mul => {
+                let p = match spec.params {
+                    KernelParams::Elementwise(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                hematite_s3::elementwise::mul(bufs.input, bufs.weights, p, bufs.output, scratch)
+            }
+            OpKind::Sub => {
+                let p = match spec.params {
+                    KernelParams::Elementwise(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                hematite_s3::elementwise::sub(bufs.input, bufs.weights, p, bufs.output, scratch)
+            }
         };
         let out_after = bufs.output.to_vec();
         bufs.output.copy_from_slice(&out);
@@ -762,6 +1099,41 @@ mod tests {
                     _ => return Err("op/params mismatch".into()),
                 };
                 hematite_ref::pool::average_pool_2d(bufs.input, p, bufs.output, scratch)
+            }
+            OpKind::MaxPool => {
+                let p = match spec.params {
+                    KernelParams::Pool(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                hematite_ref::pool::max_pool_2d(bufs.input, p, bufs.output, scratch)
+            }
+            OpKind::Relu => {
+                let p = match spec.params {
+                    KernelParams::Activation(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                hematite_ref::activation::relu(bufs.input, p, bufs.output, scratch)
+            }
+            OpKind::Add => {
+                let p = match spec.params {
+                    KernelParams::Elementwise(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                hematite_ref::elementwise::add(bufs.input, bufs.weights, p, bufs.output, scratch)
+            }
+            OpKind::Mul => {
+                let p = match spec.params {
+                    KernelParams::Elementwise(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                hematite_ref::elementwise::mul(bufs.input, bufs.weights, p, bufs.output, scratch)
+            }
+            OpKind::Sub => {
+                let p = match spec.params {
+                    KernelParams::Elementwise(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                hematite_ref::elementwise::sub(bufs.input, bufs.weights, p, bufs.output, scratch)
             }
         };
         let out_after = bufs.output.to_vec();
