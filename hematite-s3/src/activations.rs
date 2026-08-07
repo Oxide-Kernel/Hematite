@@ -47,6 +47,34 @@ pub fn relu(
         return Err(KernelError::ShapeMismatch);
     }
 
+    // ── TIE728 SIMD dispatch (device-only; compiled out entirely on host) ──
+    // `dl_tie728_s8_relu_11c` computes `max(x + 0, 0)` via VRELU.S8 with
+    // alpha=0, so it is bit-exact vs the scalar path below only when the
+    // quant-affine steps degenerate to the identity: zero offsets and an
+    // identity requantize pair. (mult=1<<30, shift=1) is the identity pair:
+    // `(v·2³⁰ + 2²⁹) >> 30 = v` exactly (round half-up is swallowed by the
+    // 30-bit shift).
+    #[cfg(target_arch = "xtensa")]
+    {
+        if params.input_offset == 0
+            && params.output_offset == 0
+            && params.output_multiplier == 1 << 30
+            && params.output_shift == 1
+            && n % 16 == 0
+            && n >= 16
+        {
+            let in_ptr = input.as_ptr();
+            let out_ptr = output.as_mut_ptr();
+            if (in_ptr as usize) % 16 == 0 && (out_ptr as usize) % 16 == 0 {
+                unsafe {
+                    relu_simd(out_ptr, in_ptr, n as u32, 0, 0);
+                }
+                let _ = scratch;
+                return Ok(());
+            }
+        }
+    }
+
     for i in 0..n {
         let val = i32::from(input[i]) + params.input_offset;
         let act = val.max(0);
@@ -173,9 +201,13 @@ pub fn hard_swish(
 /// ### ReLU 11c (aligned) — `dl_tie728_s8_relu_11c`
 /// * +76: activation_alpha (i32) — 0 for standard ReLU, >0 for LeakyReLU slope
 /// * +84: activation_shift (i32) — negative → no activation; 0/non-negative → apply ReLU
-/// * +88: c_rs1_1 (i32) — c / 32 - 1 (each iteration processes 2×16 = 32 elements)
-/// * +92: c_rs2_1 (i32) — (c % 32) / 16 (single-16 remainder after 32-wide loops)
+/// * +88: c_rs1_1 (i32) — (c − 16) / 32 (each iteration processes 2×16 = 32 elements)
+/// * +92: c_rs2_1 (i32) — ((c − 16) % 32) / 16 (single-16 remainder after 32-wide loops)
 /// * +136: c_remainder (i32) — used by unaligned variant only
+///
+/// The asm always processes a final unconditional 16-element block before
+/// `retw`, so the loop counts must reserve it (subtract 16 first). This is
+/// the corrected off-by-16 contract (see problems.md).
 ///
 /// ## ReLU6
 ///
@@ -195,9 +227,13 @@ pub fn hard_swish(
 /// * Leg (a): SIMD output must match a per-tensor TFLM golden (Phase 5 fixture).
 /// * Leg (c): SIMD vs scalar ref cross-check tolerance ≤1 LSB.
 //
-// relu_simd has a known off-by-16 trip-count bug (last 16 elements left
-// unprocessed for any input size) — tracked in
-// local-notes/notepads/hematite-nn/problems.md. Do not dispatch until fixed.
+// relu_simd: the vendored `dl_tie728_s8_relu_11c` processes
+// `32·c_rs1_1 + 16·c_rs2_1 + 16` elements — it always has an unconditional
+// trailing 16-element block before `retw`. The arg fields must therefore
+// reserve that block: `c_rs1_1 = (c − 16)/32`, `c_rs2_1 = ((c − 16)%32)/16`.
+// The earlier `c/32 − 1` / `(c%32)/16` formulas left the last 16 elements
+// unprocessed for any input size (tracked in
+// local-notes/notepads/hematite-nn/problems.md, fixed for Phase 10.1).
 #[cfg(target_arch = "xtensa")]
 mod activation_simd {
     /// Include the vendored TIE728 shared macros and relu entry points.
@@ -207,6 +243,10 @@ mod activation_simd {
     );
 
     // ── Args struct — derived from vendored .S l32i offsets ──────────────
+
+    extern "C" {
+        fn dl_tie728_s8_relu_11c();
+    }
 
     /// Args for aligned ReLU 1×1×c — matches `dl_tie728_s8_relu_11c`.
     ///
@@ -224,8 +264,8 @@ mod activation_simd {
         activation_alpha: i32,    // offset 76
         _pad1: [u8; 4],           // offset 80-83
         activation_shift: i32,    // offset 84
-        c_rs1_1: i32,             // offset 88: c / 32 - 1
-        c_rs2_1: i32,             // offset 92: (c % 32) / 16
+        c_rs1_1: i32,             // offset 88: (c - 16) / 32 (32-wide loop trip count)
+        c_rs2_1: i32,             // offset 92: ((c - 16) % 32) / 16 (16-wide remainder)
     }
 
     impl Default for Tie728ReluArgs {
@@ -257,8 +297,9 @@ mod activation_simd {
     ///
     /// # Preconditions (caller MUST guarantee)
     ///
-    /// * `num_elements` must be a multiple of 32 (2×16-wide SIMD lanes)
-    ///   for the aligned variant. The unaligned variant handles remainders.
+    /// * `num_elements` must be a multiple of 16 (`num_elements % 16 == 0`)
+    ///   and ≥ 16 for the aligned variant. The unaligned variant handles
+    ///   remainders.
     /// * All pointers must be 16-byte aligned for EE.VLD.128.IP / EE.VST.128.IP.
     /// * `activation_alpha = 0` for standard ReLU (non-zero = LeakyReLU slope).
     /// * `activation_shift ≥ 0` enables ReLU; negative disables activation.
@@ -270,21 +311,27 @@ mod activation_simd {
         activation_alpha: i32,
         activation_shift: i32,
     ) {
+        // The vendored asm processes `32·c_rs1_1 + 16·c_rs2_1 + 16` elements
+        // (it always has a final unconditional 16-element block), so the loop
+        // counts must reserve that trailing block.
+        let c = num_elements as i32;
         let args = Tie728ReluArgs {
             activation_alpha,
             activation_shift,
-            c_rs1_1: (num_elements / 32) as i32 - 1,
-            c_rs2_1: ((num_elements % 32) / 16) as i32,
+            c_rs1_1: (c - 16) / 32,
+            c_rs2_1: ((c - 16) % 32) / 16,
             ..Default::default()
         };
+        let target = dl_tie728_s8_relu_11c as unsafe extern "C" fn() as usize;
         core::arch::asm!(
             "mov a10, {output}",
             "mov a11, {input}",
             "mov a12, {args}",
-            "call8 dl_tie728_s8_relu_11c",
+            "callx8 {target}",
             output = in(reg) output,
             input = in(reg) input,
             args = in(reg) &args,
+            target = in(reg) target,
             clobber_abi("C"),
         );
     }

@@ -28,7 +28,7 @@
     .text
     .global dl_tie728_s8_avg_pool2d_22c1
     .type	dl_tie728_s8_avg_pool2d_22c1, @function
-    .section .iram1
+    # .section .iram1
 dl_tie728_s8_avg_pool2d_22c1:
     .align      4
     entry       sp,     16
@@ -83,7 +83,7 @@ dl_tie728_s8_avg_pool2d_22c1:
     .text
     .global dl_tie728_s8_unaligned_avg_pool2d_22c1
     .type   dl_tie728_s8_unaligned_avg_pool2d_22c1, @function
-    .section .iram1
+    # .section .iram1
 dl_tie728_s8_unaligned_avg_pool2d_22c1:
     .align      4
     entry       sp,     16
@@ -253,7 +253,7 @@ dl_tie728_s8_unaligned_avg_pool2d_22c1_end:
     .text
     .global dl_tie728_s8_avg_pool2d_hwc1
     .type	dl_tie728_s8_avg_pool2d_hwc1, @function
-    .section .iram1
+    # .section .iram1
 dl_tie728_s8_avg_pool2d_hwc1:
     .align      4
     entry       sp,     16
@@ -386,7 +386,7 @@ dl_tie728_s8_avg_pool2d_h1_small_channel:
     .text
     .global dl_tie728_s8_unaligned_avg_pool2d_hwc1
     .type	dl_tie728_s8_unaligned_avg_pool2d_hwc1, @function
-    .section .iram1
+    # .section .iram1
 dl_tie728_s8_unaligned_avg_pool2d_hwc1:
     .align      4
     entry       sp,     16

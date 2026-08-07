@@ -446,6 +446,7 @@ mod pool_simd {
     // untouched.
     extern "C" {
         fn dl_tie728_s8_avg_pool2d_22c1();
+        fn dl_tie728_s8_max_pool2d_22c1();
     }
 
     // ── Args structs — derived from vendored .S l32i offsets ──────────────
@@ -590,14 +591,16 @@ mod pool_simd {
             c_div_x_1,
             ..Default::default()
         };
+        let target = dl_tie728_s8_max_pool2d_22c1 as unsafe extern "C" fn() as usize;
         core::arch::asm!(
             "mov a10, {output}",
             "mov a11, {input}",
             "mov a12, {args}",
-            "call8 dl_tie728_s8_max_pool2d_22c1",
+            "callx8 {target}",
             output = in(reg) output,
             input = in(reg) input,
             args = in(reg) &args,
+            target = in(reg) target,
             clobber_abi("C"),
         );
     }
