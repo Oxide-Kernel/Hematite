@@ -87,6 +87,48 @@ Key facts established:
    2824, fc 1288, max-pool 1396, avg-pool 7181, relu 175, add 167, sub 265,
    mul 539 cycles — the raw TIE728 kernel costs on this chip.
 
+## Rust prepared-path vs C raw-asm (the wrapper-gap closure)
+
+The Rust `hematite-s3` **prepared handles** (`PreparedConv1x1`, `PreparedFc`,
+etc.) run the SIMD eligibility gate **once at construction** (`Prepared*::new`)
+instead of on every call, then `run` only re-checks pointer alignment and
+dispatches. `hematite-benchmarks` (`firmware.rs bench_kernel`) measures this
+path (construct once outside the timed window) as a `prepared:` line next to
+the public-API `s3` row. Results from the `bench11b` device report — every
+prepared checksum is bit-exact equal to the public s3 checksum:
+
+| Operation (row) | C raw-asm | Rust public s3 | Rust prepared | prepared ≈ C raw |
+|---|---|---|---|---|
+| conv1x1 64x1x1x64 | 472 | 2509 / 2521 | **669 / 669** | 1.42x |
+| conv3x3 32x32 VALID | 2824 | 4662 / 4662 | **3075 / 3102** | 1.10x |
+| fc 256→64 | 1288 | 3335 / 3335 | **1547 / 1574** | 1.22x |
+| max-pool 2x2, 32x32x16 | 1396 | 1896 / 1896 | **1829 / 1856** | 1.33x |
+| avg-pool 2x2, 32x32x16 | 7181 | 7361 / 7388 | **7274 / 7301** | 1.02x |
+| relu 256 | 175 | 361 / 388 | **354 / 354** | 2.02x |
+| add 256 | 167 | 414 / 441 | **363 / 363** | 2.17x |
+| sub 256 | 265 | 494 / 494 | **442 / 442** | 1.67x |
+| mul 256 | 539 | 777 / 781 | **743 / 743** | 1.38x |
+
+The prepared path lands within ~1.0–2.2x of the raw asm — down from the
+~2.5–5.5x gap of the legacy public API (e.g. conv1x1 went 2509 → 669 cycles).
+Remaining overhead is the per-call pointer-alignment check plus the args
+struct build.
+
+Engineering notes from this work:
+
+1. **MaybeUninit args build**: all `Tie728*Args` constructions now write only
+   the fields the asm actually reads (via `core::mem::MaybeUninit` +
+   byte-offset `write`s), eliminating the `memset`/dead-pad-store the struct
+   literal with `..Default::default()` emitted.
+2. **`#[inline(never)]` on `dispatch_fc`**: inlining the args-building
+   dispatch into `fully_connected` caused the Xtensa backend to source args
+   from wrong registers (a real miscompile — the fc row's checksum diverged
+   until the dispatch was forced out-of-line). Kept as a standalone fn.
+3. **ReLU off-by-16 fix validated on-device**: `c_rs1_1=(c-16)/32`,
+   `c_rs2_1=((c-16)%32)/16` reserves the asm's trailing 16-element block;
+   the relu row is bit-exact vs scalar (0x6c620b3d) on both the C and Rust
+   SIMD paths.
+
 ## Files
 
 | File | Role |

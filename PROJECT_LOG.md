@@ -360,6 +360,60 @@ semantics — avg-pool uses `shift/area_inv` fixed-point vs scalar
 ops and ReLU are bit-exact vs scalar, validating the identity contracts and
 the relu fix.
 
+### Phase 12 — Prepared-kernel fast path (wrapper-overhead closure)
+
+Motivated by the Phase 10/11 finding that the Rust public API measured 2.5–5.5x
+the C raw-asm cycles even though the underlying TIE728 kernel is identical
+(bit-exact checksums proved the kernel cost is the same). The gap was
+**wrapper overhead**, not language: slice-length validation + SIMD gate + args
+struct build paid on every call.
+
+What was added:
+
+1. **Prepared handle structs in `hematite-s3`** — one per SIMD-capable op:
+   `PreparedConv1x1`, `PreparedConv3x3`, `PreparedFc`, `PreparedRelu`,
+   `PreparedMaxPool`, `PreparedAvgPool`, `PreparedAdd`, `PreparedMul`,
+   `PreparedSub`. `new(params)` runs the full SIMD eligibility gate ONCE and
+   caches the arg fields (`ocd8`/`cdiv`/`mac_shift`/`use_relu`, pool offsets,
+   `mul_shift`, …); `run(input, …, output, scratch)` then only re-checks
+   16-byte pointer alignment and dispatches. Falls back to the scalar kernel
+   when not SIMD-eligible. Shared host-compilable `simd_eligible_*` gates
+   reused by the legacy public paths (single source of truth).
+2. **MaybeUninit args builds** — every `Tie728*Args` dispatch now writes only
+   the fields the asm reads (byte-offset `ptr::write`s on a
+   `MaybeUninit::uninit()`), removing the `memset`/dead-pad-store that the
+   struct literal `..Default::default()` emitted.
+3. **`#[inline(never)]` on `gemm_simd::dispatch_fc`** — found during the
+   fc-row regression: inlining the args-building dispatch into
+   `fully_connected` produced a genuine Xtensa miscompile (args sourced from
+   wrong registers; the fc 256→64 checksum diverged to `0x68e95989` vs the
+   correct `0x16542aba`). Forcing the dispatch out-of-line fixed it.
+4. **Prepared benchmark in the firmware** — `spec.rs` gained
+   `PreparedKernel` enum + `prepare_kernel(spec)` + a host-compilable
+   `run_kernel_scalar` fallback; `firmware.rs bench_kernel` constructs the
+   handle once (outside the timed window) and emits a `prepared:` line
+   (min/med cycles + FNV checksum) per row. New host test
+   `every_spec_prepared_matches_ref_bit_exact` (suite: 30 tests).
+
+Device results (`bench11b`, ESP32-S3 @ 240 MHz) — prepared out_fnv is
+bit-exact equal to the public s3 checksum on **every** row:
+
+| Row | C raw-asm | Rust public s3 | Rust prepared |
+|---|---|---|---|
+| conv1x1 64x1x1x64 | 472 | 2509 / 2521 | **669 / 669** |
+| conv3x3 32x32 VALID | 2824 | 4662 / 4662 | **3075 / 3102** |
+| fc 256→64 | 1288 | 3335 / 3335 | **1547 / 1574** |
+| max-pool 2x2x16 | 1396 | 1896 / 1896 | **1829 / 1856** |
+| avg-pool 2x2x16 | 7181 | 7361 / 7388 | **7274 / 7301** |
+| relu 256 | 175 | 361 / 388 | **354 / 354** |
+| add 256 | 167 | 414 / 441 | **363 / 363** |
+| sub 256 | 265 | 494 / 494 | **442 / 442** |
+| mul 256 | 539 | 777 / 781 | **743 / 743** |
+
+The prepared path closes the gap to ~1.0–2.2x of C raw-asm (was 2.5–5.5x).
+Documented in `benchmarks/espdl-baseline/README.md` under "Rust prepared-path
+vs C raw-asm".
+
 ---
 
 ## 3. Known divergences and open technical debt
@@ -443,9 +497,11 @@ the relu fix.
 
 All 37 original plan tasks are complete and the Final Verification Wave
 approved. Hardware bring-up (Phase 9), the C-SIMD bit-exact output match
-(Phase 10), and the per-operation all-SIMD comparison + relu fix (Phase 11)
-are committed. Host test suite: 80 suites, 0 failures, maintained
-throughout every change in this log.
+(Phase 10), the per-operation all-SIMD comparison + relu fix (Phase 11),
+and the prepared-kernel fast path (Phase 12) are complete; Phases 9-11 are
+committed, Phase 12 is uncommitted. Host test suite: 80 suites, 0 failures,
+maintained throughout every change in this log (30 tests in
+`hematite-benchmarks`).
 
 On-device benchmark state: all **9 SIMD-capable operations** (conv1x1,
 conv3x3, fc, max/avg-pool, relu, add/sub/mul) run the real TIE728 asm and
@@ -457,11 +513,17 @@ deterministic layout/rounding semantics (C↔Rust agree). Other SRAM rows
 are legitimately scalar (pad/input_c/out-channel gates); PSRAM-tier rows
 require a PSRAM-equipped board.
 
+The **prepared-kernel fast path** (Phase 12) closes the Rust wrapper
+overhead to ~1.0–2.2x of C raw-asm (was 2.5–5.5x): the SIMD gate runs once
+at `Prepared*::new`, per-call `run` only checks pointer alignment and
+dispatches; MaybeUninit args builds eliminate the memset; an
+`#[inline(never)]` on `dispatch_fc` avoids an Xtensa miscompile. Prepared
+checksums are bit-exact equal to the public s3 checksums on all 12 rows.
+
 **Open decisions awaiting explicit direction:**
 1. Force-push the rewritten git history to `origin/main`?
 2. The `person_detect`/`mobilenet_v2` rounding divergence's practical
    impact on hardware (now that real timing exists).
 3. The conv1x1/conv3x3/fc SIMD filter-layout gap (see §3): transpose the
    weights to match the asm's `[g][ic][lane]` layout to make SIMD output
-   equal the scalar reference, and to recover the remaining wrapper
-   overhead (2628 → 1767+ cycles).
+   equal the scalar reference.
