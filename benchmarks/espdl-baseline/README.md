@@ -9,19 +9,27 @@ It is the C side of the *"match output and cycles against C-SIMD"* work:
 - **Output match**: FNV-1a checksums of the SIMD kernel output (and of the
   scalar reference) printed on device, byte-identical to the Rust firmware's
   `out_fnv(ref/s3)` report.
-- **Cycle match**: CCOUNT deltas around the raw asm entry and around a C
-  mirror of the Rust `conv2d_1x1` public API, vs the Rust firmware's
-  `run_repeated` measurement.
+- **Cycle match**: CCOUNT deltas around a thin C wrapper that builds the
+  asm args struct and calls the entry, vs the Rust firmware's
+  `run_repeated` measurement of the full public API.
 
 > ⚠️ **Hardware measurements** (real ESP32-S3 @ 240 MHz, NOT QEMU). Requires
 > the physical board and the encrypted-flash pipeline below.
 
 ## What it measures
 
-One row: `conv1x1_s8 64x1x1x64` (the ember-esp-nn row — the only benchmark
-row where the TIE728 SIMD gate fires: `input_c=64%16==0`,
-`out_channels=64%16==0`, 16-aligned pointers, offsets 0, activation
-`-128/127`, `mult=[1<<30;64]`, `shift=[0;64]`).
+**All nine SIMD-capable operations** — one row each, sized so every TIE728
+SIMD eligibility gate fires (16-byte aligned pointers, channels/dims
+multiples of 16, offsets 0, identity requantize `mult=1<<30`):
+conv1x1 (`_11cn`), conv3x3 (`_33cn`, VALID/pad-0), fully-connected (`_11cn`),
+max-pool 2x2 (`_22c1`), avg-pool 2x2 (`_22c1`), ReLU (`_relu_11c`), and
+add / sub / mul elementwise (`_w1_16_w2_16`). These are exactly the rows
+added to the Rust firmware as `SIMD_*` specs in `kernel_specs()`
+(`hematite-benchmarks/src/spec.rs`), so each row has a Rust
+`out_fnv(ref/s3)` counterpart from the `bench10` device report.
+
+Depthwise conv is **scalar-only by design** in `hematite-s3` (no SIMD
+entry exists) — it is not benchmarked here.
 
 Fill pattern (identical to `hematite-benchmarks/src/spec.rs`):
 `input[i]=(i*7+3)&0xFF`, `weights[i]=(i*13+11)&0xFF`, `bias[i]=i*17-8`,
@@ -29,37 +37,55 @@ Fill pattern (identical to `hematite-benchmarks/src/spec.rs`):
 
 ## Results (hardware, ESP32-S3 rev v0.2 @ 240 MHz)
 
-| Measurement | Cycles (min/median) | FNV-1a checksum | Notes |
-|---|---|---|---|
-| C raw-asm (`dl_tie728_s8_conv2d_11cn` direct call) | **380 / 380** | `0x5eee898e` | Pure asm kernel; == Rust s3 SIMD output (bit-exact) |
-| C full-API mirror (gate + Tie728ConvArgs build + call) | **1767 / 1767** | `0x5eee898e` | Mirrors Rust `conv2d_1x1` wrapper in C |
-| Rust `hematite-s3` SIMD (bench9 firmware) | **2626 / 2628** | `0x5eee898e` | Full Rust public API incl. validation + dispatch |
-| Rust `hematite-ref` scalar (bench9 firmware) | — | `0x0bea8225` | == C scalar-ref checksum (bit-exact) |
-| C scalar-ref (same loop as `hematite-ref`) | — | `0x0bea8225` | == Rust ref checksum (bit-exact) |
+`C-SIMD` = raw vendored-asm entry called from a thin C wrapper (args struct
+built on the stack each call). `Rust s3` = `hematite-s3` public kernel
+(`bench10` firmware report). All FNV-1a checksums are sign-extending, the
+same convention as the Rust firmware.
+
+| Operation (row) | C-SIMD cycles min/med | Rust s3 cycles min/med | C-SIMD checksum | Rust s3 checksum | Bit-exact? | Scalar checksum (C == Rust) | SIMD == scalar? |
+|---|---|---|---|---|---|---|---|
+| conv1x1 64x1x1x64 | 472 / 472 | 2627 / 2628 | `0x5eee898e` | `0x5eee898e` | ✅ | `0x0bea8225` | no (filter layout) |
+| conv3x3 32x32 64x3x3x64 VALID | 2824 / 2824 | 4849 / 4876 | `0xd1a9b601` | `0xd1a9b601` | ✅ | `0x0a181085` | no (filter layout) |
+| fc 256→64 | 1288 / 1288 | 3187 / 3214 | `0x16542aba` | `0x16542aba` | ✅ | `0x32e35185` | no (filter layout) |
+| max-pool 2x2, 32x32x16 | 1396 / 1396 | 1978 / 1992 | `0x50d8f9c5` | `0x50d8f9c5` | ✅ | `0x651bfdc5` | no |
+| avg-pool 2x2, 32x32x16 | 7181 / 7181 | 7378 / 7405 | `0xdedd2dc5` | `0xdedd2dc5` | ✅ | `0xb8a6ddc5` | no |
+| relu 256 | 175 / 175 | 425 / 426 | `0x6c620b3d` | `0x6c620b3d` | ✅ | `0x6c620b3d` | yes |
+| add 256 | 167 / 167 | 467 / 481 | `0x14834bbb` | `0x14834bbb` | ✅ | `0x14834bbb` | yes |
+| sub 256 | 265 / 265 | 547 / 574 | `0x62d74671` | `0x62d74671` | ✅ | `0x62d74671` | yes |
+| mul 256 | 539 / 539 | 876 / 876 | `0xd3c0a7f1` | `0xd3c0a7f1` | ✅ | `0xd3c0a7f1` | yes |
 
 Key facts established:
 
-1. **Output match (bit-exact)**.  C-SIMD checksum `0x5eee898e` == Rust s3
-   SIMD `0x5eee898e`; C scalar-ref `0x0bea8225` == Rust ref `0x0bea8225`.
-   The same vendored asm fed the same data produces identical bytes on
-   device, whether driven from C (ESP-IDF) or Rust (`global_asm!`).
+1. **Output match (bit-exact), for every operation.**  All 9 C-SIMD
+   checksums equal the Rust s3 `out_fnv` from `bench10` — the same vendored
+   asm fed the same data produces identical bytes whether driven from C
+   (ESP-IDF) or Rust (`global_asm!`).  All 9 C scalar-refs equal the Rust
+   `ref` checksums too.
 2. **The FNV convention matters**: the Rust firmware's `fnv1a(&[i8])` does
    `h ^= b as u32`, which **sign-extends** negative bytes (e.g. `0x80` →
    `0xffffff80`).  The C harness must do the same (`h ^= (uint32_t)(int8_t)b`),
    not XOR raw `uint8_t` bytes, or the checksums diverge.
-3. **Cycle gap is wrapper overhead, not kernel cost**.  The raw asm call is
-   380 cycles (0.09 cyc/MAC for 4096 MACs — 16-wide TIE728).  Rust's
-   measured 2628 cycles includes the full `conv2d_1x1` public API
-   (slice-length validation, SIMD eligibility gate over 64 channels,
-   `Tie728ConvArgs` construction, call).  A thin C mirror of that wrapper
-   measures 1767 cycles; Rust's full implementation lands at 2628.  The
-   *kernel itself* is identical between the two languages.
-4. **SIMD output ≠ scalar reference** (filter-layout question, confirmed on
-   hardware).  `0x5eee898e` vs `0x0bea8225`.  Both Rust and C feed the raw
-   `[oc][ic]` weights straight to the asm; the asm indexes them as
-   `[g][ic][lane]`, so the SIMD result is a different-but-deterministic
-   layout transform of the scalar result.  This is a known property of the
-   vendored ESP-DL asm calling convention, not a checksum bug.
+3. **Cycle gap is wrapper overhead, not kernel cost.**  For every row the
+   raw asm (C) is substantially faster than Rust's measured number, which
+   includes the full public API (slice-length validation, SIMD eligibility
+   gate, `Tie728*Args` construction, dispatch).  E.g. conv1x1: 472 vs
+   2627 cycles; relu: 175 vs 425.  The *kernel itself* is identical between
+   the two languages.
+4. **SIMD output ≠ scalar reference for the weighted/positional ops** —
+   conv1x1, conv3x3, fc (filter-layout: the asm indexes weights as
+   `[g][ic][lane]` instead of the scalar `[oc][ic]`), and **also for
+   max-pool and avg-pool** (pooling semantics in the asm differ from the
+   scalar ref — e.g. avg-pool's `shift/area_inv` fixed-point rounding vs
+   `round_half_away_zero`).  The C-SIMD and Rust-s3 checksums agree with
+   each other in all cases; only the *reference* differs.  These are
+   deterministic properties of the vendored ESP-DL asm, not checksum bugs.
+   ReLU / add / sub / mul are **bit-exact vs scalar** (elementwise identity
+   contracts — and the ReLU match also validates the off-by-16 trip-count
+   fix in `hematite-s3/src/activations.rs`, which reserves the asm's
+   trailing 16-element block via `c_rs1_1=(c-16)/32`, `c_rs2_1=((c-16)%32)/16`).
+5. **Cycle reference points** (per-op, C raw asm): conv1x1 472, conv3x3
+   2824, fc 1288, max-pool 1396, avg-pool 7181, relu 175, add 167, sub 265,
+   mul 539 cycles — the raw TIE728 kernel costs on this chip.
 
 ## Files
 
@@ -67,8 +93,8 @@ Key facts established:
 |---|---|
 | `CMakeLists.txt` | ESP-IDF project (`project(espdl_baseline)`); sources the main component only |
 | `sdkconfig.defaults` | `CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y` — match the Rust firmware's 240 MHz benchmark clock |
-| `main/CMakeLists.txt` | Registers `main.c` + the two vendored asm files from `hematite-s3/src/asm/` (compiled with `-x assembler-with-cpp`) |
-| `main/main.c` | Harness: fill_pattern, `Tie728ConvArgs` C struct, `conv2d_1x1_full` wrapper mirror, `scalar_conv1x1` ref, FNV-1a (sign-extending), CCOUNT timing (1 warm-up + 10 timed, min+median), UART report |
+| `main/CMakeLists.txt` | Registers `main.c` + **all 8** vendored asm files from `hematite-s3/src/asm/` (compiled with `-x assembler-with-cpp`) |
+| `main/main.c` | Harness: per-op fill_pattern + scalar refs, all `Tie728*Args` C structs, one SIMD wrapper + `run_bench` (1 warm-up + 10 timed, min+median) per op, sign-extending FNV-1a, UART report |
 | `.gitignore` | `build/`, `sdkconfig*`, `managed_components/`, `dependencies.lock` |
 
 ## Build + run on hardware
@@ -91,8 +117,8 @@ $ESPTOOL --port /dev/cu.usbserial-1110 --baud 921600 \
   write-flash --encrypt 0x0 /tmp/espdl.bin
 ```
 
-Capture the UART report (115200 baud) — see the board log in the repo for
-the reference output.
+Capture the UART report (115200 baud) — the reference output is the
+9-row table above.
 
 ## Notes
 
