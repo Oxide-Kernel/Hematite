@@ -63,37 +63,121 @@ pub(crate) fn simd_eligible_fc(
         && (full_range || relu_range)
         && mult_uniform
         && shift_uniform
+        && shift[0] <= 1
         && input_dim % 16 == 0
         && input_dim >= 16
         && output_dim % 16 == 0
     {
         let use_relu = relu_range && !full_range;
-        Some((shift[0], output_dim / 16, input_dim / 16 - 1, use_relu))
+        // See conv1x1::simd_eligible_conv1x1 for the mac_shift semantics:
+        // the asm round_result(acc, mac_shift) reproduces the scalar
+        // multiply_by_quantized_multiplier for mult==1<<30 only when
+        // mac_shift == 1 - shift[0].
+        Some((1 - shift[0], output_dim / 16, input_dim / 16 - 1, use_relu))
     } else {
         None
     }
 }
 
-/// Prepared FC/GEMM handle — runs the SIMD gate ONCE at construction, then
-/// `run` only re-checks pointer alignment and dispatches. Closes the
-/// wrapper-overhead gap vs C raw-asm (1288 cyc vs Rust s3 3187 cyc).
+/// Context for the ACCX FC/GEMM dispatch — bundled into one `&mut` arg so the
+/// Xtensa LLVM backend generates a 1-arg call (multi-arg calls are miscompiled
+/// on device; see the `dispatch_fc` inline regression and `ReqCtx`).
+#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+pub(crate) struct FcAccxCtx<'a> {
+    pub input: &'a [i8],
+    pub weights: &'a [i8],
+    pub bias: &'a [i32],
+    pub params: &'a FullyConnectedParams<'a>,
+    pub output: &'a mut [i8],
+    pub scratch: &'a mut [u8],
+}
+
+/// ACCX SIMD dispatch for the FC/GEMM kernel — device-only.
+///
+/// Mirrors the conv1x1 ACCX path: the bespoke `s8_accx_conv1x1` kernel
+/// computes the exact 32-bit dot product per output unit into `scratch`, then
+/// the bit-exact TFLite requantize epilogue runs in Rust.
+///
+/// Returns `Ok(true)` when the ACCX path handled the layer, `Ok(false)` when
+/// the layer is not ACCX-eligible (caller falls through to scalar).
+#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+#[inline(never)]
+fn fc_accx_dispatch(ctx: &mut FcAccxCtx<'_>) -> Result<bool, KernelError> {
+    let params = ctx.params;
+    let input_dim = params.input_dim as usize;
+    let output_dim = params.output_dim as usize;
+
+    if params.input_offset != 0
+        || !crate::accx::accx_eligible_1x1(input_dim, output_dim)
+    {
+        return Ok(false);
+    }
+
+    let need = output_dim * 4;
+    if ctx.scratch.len() < need {
+        return Ok(false);
+    }
+
+    let in_ptr = ctx.input.as_ptr();
+    let w_ptr = ctx.weights.as_ptr();
+    let out_ptr = ctx.output.as_mut_ptr();
+    let accs = ctx.scratch.as_mut_ptr() as *mut i32;
+    if (in_ptr as usize) % 16 != 0
+        || (w_ptr as usize) % 16 != 0
+        || (out_ptr as usize) % 16 != 0
+        || (accs as usize) % 4 != 0
+    {
+        return Ok(false);
+    }
+
+    let multipliers = params.output_multiplier_per_channel;
+    let shifts = params.output_shift_per_channel;
+    let act_min = params.quantized_activation_min;
+    let act_max = params.quantized_activation_max;
+    let out_offset = params.output_offset;
+
+    unsafe {
+        crate::accx::accx_conv1x1(in_ptr, w_ptr, accs, input_dim, output_dim);
+    }
+    // TEMP-DEBUG: requantize re-enabled for call-site diffing.
+    let acc_slice = unsafe { core::slice::from_raw_parts_mut(accs, output_dim) };
+    crate::accx::requantize_1x1(&mut crate::accx::ReqCtx {
+        accs: acc_slice,
+        bias: ctx.bias,
+        multipliers,
+        shifts,
+        output_offset: out_offset,
+        act_min,
+        act_max,
+        out_base: 0,
+        output: ctx.output,
+    });
+    Ok(true)
+}
+
+/// Prepared FC/GEMM handle — runs the SIMD eligibility gate ONCE at
+/// construction, then `run` only re-checks pointer alignment and dispatches.
+///
+/// The bespoke ACCX kernel (`s8_accx_conv1x1`) computes exact 32-bit dot
+/// products, so SIMD output is bit-exact vs the scalar reference.
 pub struct PreparedFc {
-    simd: Option<(i32, i32, i32, bool)>,
+    /// Whether the bespoke ACCX SIMD kernel is eligible on this target.
+    accx: bool,
     params: &'static FullyConnectedParams<'static>,
 }
 
 impl PreparedFc {
     pub fn new(params: &'static FullyConnectedParams<'static>) -> Result<Self, KernelError> {
-        let input_dim = params.input_dim as i32;
-        let output_dim = params.output_dim as i32;
-        let simd = simd_eligible_fc(params, input_dim, output_dim)
-            .filter(|_| cfg!(all(target_arch = "xtensa", not(feature = "qemu"))));
-        Ok(Self { simd, params })
+        let input_dim = params.input_dim as usize;
+        let output_dim = params.output_dim as usize;
+        let accx = cfg!(all(target_arch = "xtensa", not(feature = "qemu")))
+            && crate::accx::accx_eligible_1x1(input_dim, output_dim);
+        Ok(Self { accx, params })
     }
 
     #[inline]
     pub fn is_simd(&self) -> bool {
-        self.simd.is_some()
+        self.accx
     }
 
     pub fn run(
@@ -105,20 +189,16 @@ impl PreparedFc {
         scratch: &mut [u8],
     ) -> Result<(), KernelError> {
         #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
-        if let Some((mac_shift, ocd8, cdiv, use_relu)) = self.simd {
-            let in_ptr = input.as_ptr();
-            let w_ptr = weights.as_ptr();
-            let b_ptr = bias.as_ptr();
-            let out_ptr = output.as_mut_ptr();
-            let aligned = (in_ptr as usize) % 16 == 0
-                && (w_ptr as usize) % 16 == 0
-                && (b_ptr as usize) % 16 == 0
-                && (out_ptr as usize) % 16 == 0;
-            if aligned {
-                unsafe {
-                    gemm_simd::dispatch_fc(out_ptr, in_ptr, w_ptr, b_ptr, mac_shift, ocd8, cdiv, use_relu);
-                }
-                let _ = scratch;
+        {
+            let mut accx_ctx = FcAccxCtx {
+                input,
+                weights,
+                bias,
+                params: self.params,
+                output,
+                scratch,
+            };
+            if fc_accx_dispatch(&mut accx_ctx)? {
                 return Ok(());
             }
         }
@@ -162,45 +242,26 @@ pub fn fully_connected(
     let shifts = params.output_shift_per_channel;
 
     // ── TIE728 SIMD dispatch (device-only; compiled out entirely on host) ──
-    // Same eligibility contract as conv1x1's dispatch, for input_dim/output_dim
-    // in place of Cin/Cout (an FC layer is a 1x1 conv with H=W=1).
+    // Bespoke ACCX kernel: exact 32-bit dot product per output unit, then a
+    // bit-exact TFLite requantize in Rust. Bit-exact vs the scalar path.
     //
-    // ALSO gated off under the `qemu` feature: this reuses conv1x1's entry
-    // point (`dl_tie728_s8_conv2d_11cn`), whose `EE.VSMULAS.S8.QACC.LD.INCP`
-    // MAC instruction QEMU's TIE728 emulation does not correctly execute
-    // (confirmed by direct bisection — see
-    // local-notes/notepads/hematite-nn/problems.md). QEMU builds fall through to
+    // ALSO gated off under the `qemu` feature: QEMU's xtensa/esp32s3 TIE728
+    // emulation does not correctly execute the TIE MAC instructions this
+    // kernel depends on (confirmed by direct instruction-level bisection —
+    // see local-notes/notepads/hematite-nn/problems.md). QEMU builds fall through to
     // the scalar path; real hardware still gets SIMD.
     #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
     {
-        if let Some((mac_shift, ocd8, cdiv, use_relu)) =
-            simd_eligible_fc(params, input_dim as i32, output_dim as i32)
-        {
-            let in_ptr = input.as_ptr();
-            let w_ptr = weights.as_ptr();
-            let b_ptr = bias.as_ptr();
-            let out_ptr = output.as_mut_ptr();
-            let aligned = (in_ptr as usize) % 16 == 0
-                && (w_ptr as usize) % 16 == 0
-                && (b_ptr as usize) % 16 == 0
-                && (out_ptr as usize) % 16 == 0;
-
-            if aligned {
-                unsafe {
-                    gemm_simd::dispatch_fc(
-                        out_ptr,
-                        in_ptr,
-                        w_ptr,
-                        b_ptr,
-                        mac_shift,
-                        ocd8,
-                        cdiv,
-                        use_relu,
-                    );
-                }
-                let _ = scratch;
-                return Ok(());
-            }
+        let mut accx_ctx = FcAccxCtx {
+            input,
+            weights,
+            bias,
+            params,
+            output,
+            scratch,
+        };
+        if fc_accx_dispatch(&mut accx_ctx)? {
+            return Ok(());
         }
     }
 

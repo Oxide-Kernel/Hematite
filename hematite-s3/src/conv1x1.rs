@@ -91,15 +91,160 @@ pub(crate) fn simd_eligible_conv1x1(
         && (full_range || relu_range)
         && mult_uniform
         && shift_uniform
+        && shift[0] <= 1
         && input_c % 16 == 0
         && input_c >= 16
         && out_channels % 16 == 0
     {
         let use_relu = relu_range && !full_range;
-        Some((shift[0], out_channels / 16, input_c / 16 - 1, use_relu))
+        // Asm rounding semantics: the TIE728 per-layer path applies
+        // round_result(acc, mac_shift) ≈ (acc + 2^(mac_shift-1)) >> mac_shift.
+        // For mult == 1<<30 the scalar reference computes
+        // (acc*2^30 + 2^30) >> 31 == (acc+1) >> 1, i.e. mac_shift must be
+        // `1 - shift[0]` (NOT shift[0]) to reproduce the reference bit-exact.
+        // shift[0] == 1 (identity) → mac_shift 0 = plain extract = identity.
+        Some((1 - shift[0], out_channels / 16, input_c / 16 - 1, use_relu))
     } else {
         None
     }
+}
+
+/// Transform weights from the caller's `[oc][ic]` (OHWI) layout into the
+/// TIE728 11cn `[g][ic][lane]` SIMD layout.
+///
+/// The vendored asm consumes the filter sequentially as, per 16-output-channel
+/// group `g`, `(c_div_x_1 + 1)` chunks of 16 bytes — the `k`-th VSMULAS
+/// multiplies input byte `k` with filter vector `k` (see the 11c16 macro). So
+/// the asm reads `filter[g * (in_c * 16) + ic * 16 + lane]`, which must equal
+/// `weights[(g * 16 + lane) * in_c + ic]` for the SIMD output to match the
+/// scalar reference bit-exact. This is a pure no_std permutation
+/// (host-compilable, unit-tested).
+///
+/// `src` length must be `in_c * out_channels`; `dst` length must match.
+/// Returns [`KernelError::ShapeMismatch`] otherwise.
+pub fn transform_weights_11cn(
+    input_c: usize,
+    out_channels: usize,
+    src: &[i8],
+    dst: &mut [i8],
+) -> Result<(), KernelError> {
+    if input_c % 16 != 0 || out_channels % 16 != 0 {
+        return Err(KernelError::ShapeMismatch);
+    }
+    if src.len() != input_c * out_channels || dst.len() != src.len() {
+        return Err(KernelError::ShapeMismatch);
+    }
+    let groups = out_channels / 16;
+    for g in 0..groups {
+        let g_base = g * input_c * 16;
+        for ic in 0..input_c {
+            let ic_base = g_base + ic * 16;
+            for lane in 0..16 {
+                let src_oc = g * 16 + lane;
+                dst[ic_base + lane] = src[src_oc * input_c + ic];
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Context for the ACCX 1×1 conv dispatch — bundled into one `&mut` arg so the
+/// Xtensa LLVM backend generates a 1-arg call (multi-arg calls are miscompiled
+/// on device; see the `dispatch_fc` inline regression and `ReqCtx`).
+#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+pub(crate) struct Conv1x1AccxCtx<'a> {
+    pub input: &'a [i8],
+    pub weights: &'a [i8],
+    pub bias: &'a [i32],
+    pub params: &'a Conv2DParams<'a>,
+    pub output: &'a mut [i8],
+    pub scratch: &'a mut [u8],
+}
+
+/// Attempt the bespoke ACCX 1×1 conv SIMD path (bit-exact), returning
+/// `Ok(true)` if handled, `Ok(false)` if ineligible / unaligned / insufficient
+/// scratch (caller falls through to the scalar kernel).
+///
+/// Device-only. Uses `EE.VMULAS.S8.ACCX` (32-bit element accumulator, full
+/// 16-bit products) so the output is bit-identical to the scalar reference for
+/// any per-channel `mult`/`shift`/offset/activation and any `out_c`.
+///
+/// Eligibility: `input_offset == 0`, stride/dilation 1, `out_h == in_h`,
+/// `out_w == in_w` (pad 0), `in_c % 16 == 0`, `in_c >= 16`, `out_c >= 1`,
+/// all pointers 16-byte aligned, `scratch >= out_c * 4`.
+#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+fn conv1x1_accx_dispatch(ctx: &mut Conv1x1AccxCtx<'_>) -> Result<bool, KernelError> {
+    let params = ctx.params;
+    let input_c = params.input_shape[3] as usize;
+    let out_c = params.output_shape[3] as usize;
+    let in_h = params.input_shape[1] as usize;
+    let in_w = params.input_shape[2] as usize;
+    let out_h = params.output_shape[1] as usize;
+    let out_w = params.output_shape[2] as usize;
+
+    if params.input_offset != 0
+        || params.stride_height != 1
+        || params.stride_width != 1
+        || params.dilation_height_factor != 1
+        || params.dilation_width_factor != 1
+        || in_h != out_h
+        || in_w != out_w
+        || !crate::accx::accx_eligible_1x1(input_c, out_c)
+    {
+        return Ok(false);
+    }
+
+    let need = out_c * 4;
+    if ctx.scratch.len() < need {
+        return Ok(false);
+    }
+
+    let in_ptr = ctx.input.as_ptr();
+    let w_ptr = ctx.weights.as_ptr();
+    let out_ptr = ctx.output.as_mut_ptr();
+    let accs = ctx.scratch.as_mut_ptr() as *mut i32;
+    if (in_ptr as usize) % 16 != 0
+        || (w_ptr as usize) % 16 != 0
+        || (out_ptr as usize) % 16 != 0
+        || (accs as usize) % 4 != 0
+    {
+        return Ok(false);
+    }
+
+    let multipliers = params.output_multiplier_per_channel;
+    let shifts = params.output_shift_per_channel;
+    let act_min = params.quantized_activation_min;
+    let act_max = params.quantized_activation_max;
+    let out_offset = params.output_offset;
+
+    for oh in 0..out_h {
+        for ow in 0..out_w {
+            let px_in = (oh * in_w + ow) * input_c;
+            let px_out = (oh * out_w + ow) * out_c;
+            unsafe {
+                crate::accx::accx_conv1x1(
+                    in_ptr.add(px_in),
+                    w_ptr,
+                    accs,
+                    input_c,
+                    out_c,
+                );
+            }
+            let acc_slice = unsafe { core::slice::from_raw_parts_mut(accs, out_c) };
+            crate::accx::requantize_1x1(&mut crate::accx::ReqCtx {
+                accs: acc_slice,
+                bias: ctx.bias,
+                multipliers,
+                shifts,
+                output_offset: out_offset,
+                act_min,
+                act_max,
+                out_base: px_out,
+                output: ctx.output,
+            });
+        }
+    }
+    Ok(true)
 }
 
 /// Prepared 1×1 conv handle — runs the SIMD eligibility gate ONCE at
@@ -113,33 +258,32 @@ pub(crate) fn simd_eligible_conv1x1(
 /// When the gate fails (or on host where the SIMD backend is compiled out),
 /// `run` falls through to the scalar kernel — output is bit-exact either way.
 pub struct PreparedConv1x1 {
-    /// Cached `(mac_shift, output_channel_div_8, c_div_x_1, use_relu)` from the
-    /// gate, `None` when not SIMD-eligible on this target.
-    simd: Option<(i32, i32, i32, bool)>,
+    /// Whether the bespoke ACCX SIMD kernel is eligible on this target.
+    accx: bool,
     params: &'static Conv2DParams<'static>,
 }
 
 impl PreparedConv1x1 {
-    /// Evaluate the SIMD gate for the given layer params.
+    /// Evaluate the ACCX SIMD gate for the given layer params.
     ///
     /// `input_c` / `out_channels` are taken from the params by the caller; this
     /// keeps the constructor free of shape-product slicing so it stays cheap
     /// (used once per layer at model build time).
     pub fn new(params: &'static Conv2DParams<'static>) -> Result<Self, KernelError> {
-        let input_c = params.input_shape[3];
-        let out_channels = params.output_shape[3];
-        let simd = simd_eligible_conv1x1(params, input_c, out_channels)
-            .filter(|_| cfg!(all(target_arch = "xtensa", not(feature = "qemu"))));
-        Ok(Self { simd, params })
+        let input_c = params.input_shape[3] as usize;
+        let out_channels = params.output_shape[3] as usize;
+        let accx = cfg!(all(target_arch = "xtensa", not(feature = "qemu")))
+            && crate::accx::accx_eligible_1x1(input_c, out_channels);
+        Ok(Self { accx, params })
     }
 
     /// Whether this layer is SIMD-eligible on the current target.
     #[inline]
     pub fn is_simd(&self) -> bool {
-        self.simd.is_some()
+        self.accx
     }
 
-    /// Run the 1×1 conv — SIMD when eligible and aligned, scalar otherwise.
+    /// Run the 1×1 conv — ACCX SIMD when eligible and aligned, scalar otherwise.
     pub fn run(
         &self,
         input: &[i8],
@@ -149,20 +293,16 @@ impl PreparedConv1x1 {
         scratch: &mut [u8],
     ) -> Result<(), KernelError> {
         #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
-        if let Some((mac_shift, ocd8, cdiv, use_relu)) = self.simd {
-            let in_ptr = input.as_ptr();
-            let w_ptr = weights.as_ptr();
-            let b_ptr = bias.as_ptr();
-            let out_ptr = output.as_mut_ptr();
-            let aligned = (in_ptr as usize) % 16 == 0
-                && (w_ptr as usize) % 16 == 0
-                && (b_ptr as usize) % 16 == 0
-                && (out_ptr as usize) % 16 == 0;
-            if aligned {
-                unsafe {
-                    conv1x1_simd::dispatch_1x1(out_ptr, in_ptr, w_ptr, b_ptr, mac_shift, ocd8, cdiv, use_relu);
-                }
-                let _ = scratch;
+        {
+            let mut accx_ctx = Conv1x1AccxCtx {
+                input,
+                weights,
+                bias,
+                params: self.params,
+                output,
+                scratch,
+            };
+            if conv1x1_accx_dispatch(&mut accx_ctx)? {
                 return Ok(());
             }
         }
@@ -244,34 +384,16 @@ pub fn conv2d_1x1(
     // it there.
     #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
     {
-        if let Some((mac_shift, ocd8, cdiv, use_relu)) =
-            simd_eligible_conv1x1(params, input_c, out_channels)
-        {
-            let in_ptr = input.as_ptr();
-            let w_ptr = weights.as_ptr();
-            let b_ptr = bias.as_ptr();
-            let out_ptr = output.as_mut_ptr();
-            let aligned = (in_ptr as usize) % 16 == 0
-                && (w_ptr as usize) % 16 == 0
-                && (b_ptr as usize) % 16 == 0
-                && (out_ptr as usize) % 16 == 0;
-
-            if aligned {
-                unsafe {
-                    conv1x1_simd::dispatch_1x1(
-                        out_ptr,
-                        in_ptr,
-                        w_ptr,
-                        b_ptr,
-                        mac_shift,
-                        ocd8,
-                        cdiv,
-                        use_relu,
-                    );
-                }
-                let _ = scratch;
-                return Ok(());
-            }
+        let mut accx_ctx = Conv1x1AccxCtx {
+            input,
+            weights,
+            bias,
+            params,
+            output,
+            scratch,
+        };
+        if conv1x1_accx_dispatch(&mut accx_ctx)? {
+            return Ok(());
         }
     }
 

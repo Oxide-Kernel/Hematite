@@ -62,6 +62,7 @@ pub(crate) fn simd_eligible_conv3x3(
         && (full_range || relu_range)
         && mult_uniform
         && shift_uniform
+        && shift[0] <= 1
         && input_c % 16 == 0
         && input_c >= 16
         && out_channels % 16 == 0
@@ -71,38 +72,211 @@ pub(crate) fn simd_eligible_conv3x3(
         && filter_w == 3
     {
         let use_relu = relu_range && !full_range;
-        let dilation_x_offset = params.dilation_width_factor * params.stride_width;
-        let dilation_y_offset = params.dilation_height_factor * params.stride_height;
-        Some((shift[0], out_channels / 16, input_c / 16 - 1, dilation_x_offset, dilation_y_offset, use_relu))
+        // mac_shift: same correction as conv1x1 — for mult==1<<30 the scalar
+        // reference computes (acc+1)>>1 == asm round_result(acc, mac_shift)
+        // requires mac_shift == 1 - shift[0].
+        //
+        // dilation offsets: per the 33c16 asm comment (dl_tie728_s8_conv2d.S
+        // lines 1240-1241), with no padding (pad_h==pad_w==0):
+        //   dil_x = (dilation_x * in_c - in_c) * sizeof(out)
+        //   dil_y = (dilation_y * in_w * in_c - in_c - dilation_x * in_c * (filter_w-1)) * sizeof(out)
+        // sizeof(out)=1 for i8, in_c_pad==in_c, in_w_pad==in_w. The 11c16 tap
+        // already advances input by in_c bytes, so dil_x==0 for dilation_x==1
+        // and dil_y jumps the tap down to the next row. (The previous code
+        // passed dilation*stride — WRONG; e.g. 32x32x64 stride1 needs dil_x=0,
+        // dil_y=1856.)
+        let input_w = params.input_shape[2];
+        let dilation_x_offset = (params.dilation_width_factor - 1) * input_c;
+        let dilation_y_offset = (params.dilation_height_factor * input_w
+            - 1
+            - params.dilation_width_factor * (filter_w - 1))
+            * input_c;
+        Some((
+            1 - shift[0],
+            out_channels / 16,
+            input_c / 16 - 1,
+            dilation_x_offset,
+            dilation_y_offset,
+            use_relu,
+        ))
     } else {
         None
     }
 }
 
+/// Transform weights from the caller's `[oc][fh][fw][ic]` (OHWI) layout into
+/// the TIE728 33cn `[g][tap][ic][lane]` SIMD layout.
+///
+/// The vendored `dl_tie728_s8_conv2d_33cn` computes **one output pixel per
+/// call**: per 16-output-channel group `g` it runs the 33c16 macro, which
+/// executes the 11c16 inner loop NINE times (one per 3×3 tap, order
+/// (0,0),(0,1),(0,2),(1,0),…,(2,2)), each consuming `in_c * 16` filter bytes.
+/// So the asm reads `filter[g*(9*in_c*16) + tap*(in_c*16) + ic*16 + lane]`,
+/// which must equal `src[(g*16+lane)*(9*in_c) + tap*in_c + ic]` for the SIMD
+/// output to match the scalar reference bit-exact. Pure no_std permutation
+/// (host-compilable, unit-tested).
+///
+/// `src` length must be `out_channels * 9 * input_c`; `dst` must match.
+/// Returns [`KernelError::ShapeMismatch`] otherwise.
+pub fn transform_weights_33cn(
+    input_c: usize,
+    out_channels: usize,
+    src: &[i8],
+    dst: &mut [i8],
+) -> Result<(), KernelError> {
+    if input_c % 16 != 0 || out_channels % 16 != 0 {
+        return Err(KernelError::ShapeMismatch);
+    }
+    let taps = 9;
+    if src.len() != out_channels * taps * input_c || dst.len() != src.len() {
+        return Err(KernelError::ShapeMismatch);
+    }
+    let groups = out_channels / 16;
+    let per_group = taps * input_c * 16;
+    for g in 0..groups {
+        let g_base = g * per_group;
+        for tap in 0..taps {
+            let tap_base = g_base + tap * input_c * 16;
+            for ic in 0..input_c {
+                let ic_base = tap_base + ic * 16;
+                for lane in 0..16 {
+                    let src_oc = g * 16 + lane;
+                    dst[ic_base + lane] = src[src_oc * (taps * input_c) + tap * input_c + ic];
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+
+/// Context for the ACCX 3×3 conv dispatch — bundled into one `&mut` arg so the
+/// Xtensa LLVM backend generates a 1-arg call (multi-arg calls are miscompiled
+/// on device; see the `dispatch_fc` inline regression and `ReqCtx`).
+#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+pub(crate) struct Conv3x3AccxCtx<'a> {
+    pub input: &'a [i8],
+    pub weights: &'a [i8],
+    pub bias: &'a [i32],
+    pub params: &'a Conv2DParams<'a>,
+    pub output: &'a mut [i8],
+    pub scratch: &'a mut [u8],
+}
+
+/// ACCX SIMD dispatch for the 3×3 conv kernel — device-only.
+///
+/// The bespoke `s8_accx_conv3x3` kernel computes the exact 32-bit dot product
+/// for ONE output pixel (all out_c channels) from the raw `[oc][fh][fw][ic]`
+/// weights, into `scratch`; the bit-exact TFLite requantize epilogue runs in
+/// Rust. The caller strides over the output image, one kernel call per pixel.
+///
+/// Returns `Ok(true)` when the ACCX path handled the layer, `Ok(false)` when
+/// the layer is not ACCX-eligible (caller falls through to scalar).
+#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+fn conv3x3_accx_dispatch(ctx: &mut Conv3x3AccxCtx<'_>) -> Result<bool, KernelError> {
+    let params = ctx.params;
+    let input_c = params.input_shape[3] as usize;
+    let out_c = params.output_shape[3] as usize;
+    let in_w = params.input_shape[2] as usize;
+    let out_h = params.output_shape[1] as usize;
+    let out_w = params.output_shape[2] as usize;
+    let filter_h = params.filter_shape[1];
+    let filter_w = params.filter_shape[2];
+
+    let dilated_filter_h = (filter_h - 1) * params.dilation_height_factor + 1;
+    let dilated_filter_w = (filter_w - 1) * params.dilation_width_factor + 1;
+    let pad_h = ((params.output_shape[1] - 1) * params.stride_height + dilated_filter_h
+        - params.input_shape[1])
+        / 2;
+    let pad_w = ((params.output_shape[2] - 1) * params.stride_width + dilated_filter_w
+        - params.input_shape[2])
+        / 2;
+
+    if params.input_offset != 0
+        || params.dilation_height_factor != 1
+        || params.dilation_width_factor != 1
+        || filter_h != 3
+        || filter_w != 3
+        || pad_h != 0
+        || pad_w != 0
+        || !crate::accx::accx_eligible_3x3(input_c, out_c)
+    {
+        return Ok(false);
+    }
+
+    let need = out_c * 4;
+    if ctx.scratch.len() < need {
+        return Ok(false);
+    }
+
+    let in_ptr = ctx.input.as_ptr();
+    let w_ptr = ctx.weights.as_ptr();
+    let out_ptr = ctx.output.as_mut_ptr();
+    let accs = ctx.scratch.as_mut_ptr() as *mut i32;
+    if (in_ptr as usize) % 16 != 0
+        || (w_ptr as usize) % 16 != 0
+        || (out_ptr as usize) % 16 != 0
+        || (accs as usize) % 4 != 0
+    {
+        return Ok(false);
+    }
+
+    let multipliers = params.output_multiplier_per_channel;
+    let shifts = params.output_shift_per_channel;
+    let act_min = params.quantized_activation_min;
+    let act_max = params.quantized_activation_max;
+    let out_offset = params.output_offset;
+    let stride_h = params.stride_height as usize;
+    let stride_w = params.stride_width as usize;
+    let row_delta = if in_w >= 3 { (in_w - 3) * input_c } else { 0 };
+
+    for oh in 0..out_h {
+        for ow in 0..out_w {
+            let px = (oh * stride_h * in_w + ow * stride_w) * input_c;
+            let po = (oh * out_w + ow) * out_c;
+            unsafe {
+                crate::accx::accx_conv3x3(in_ptr.add(px), w_ptr, accs, input_c, out_c, row_delta);
+            }
+            let acc_slice = unsafe { core::slice::from_raw_parts_mut(accs, out_c) };
+            crate::accx::requantize_1x1(&mut crate::accx::ReqCtx {
+                accs: acc_slice,
+                bias: ctx.bias,
+                multipliers,
+                shifts,
+                output_offset: out_offset,
+                act_min,
+                act_max,
+                out_base: po,
+                output: ctx.output,
+            });
+        }
+    }
+    Ok(true)
+}
+
 /// Prepared 3×3 conv handle — runs the SIMD gate ONCE at construction, then
-/// `run` only re-checks pointer alignment and dispatches. Closes the
-/// wrapper-overhead gap vs C raw-asm (2824 cyc vs Rust s3 4849 cyc).
+/// `run` only re-checks pointer alignment and dispatches.
+///
+/// The bespoke ACCX kernel (`s8_accx_conv3x3`) computes exact 32-bit dot
+/// products, so SIMD output is bit-exact vs the scalar reference.
 pub struct PreparedConv3x3 {
-    simd: Option<(i32, i32, i32, i32, i32, bool)>,
+    /// Whether the bespoke ACCX SIMD kernel is eligible on this target.
+    accx: bool,
     params: &'static Conv2DParams<'static>,
 }
 
 impl PreparedConv3x3 {
     pub fn new(params: &'static Conv2DParams<'static>) -> Result<Self, KernelError> {
-        let input_c = params.input_shape[3];
-        let out_channels = params.output_shape[3];
-        let filter_h = params.filter_shape[1];
-        let filter_w = params.filter_shape[2];
-        let pad_h = conv_pad_h(params);
-        let pad_w = conv_pad_w(params);
-        let simd = simd_eligible_conv3x3(params, input_c, out_channels, filter_h, filter_w, pad_h, pad_w)
-            .filter(|_| cfg!(all(target_arch = "xtensa", not(feature = "qemu"))));
-        Ok(Self { simd, params })
+        let input_c = params.input_shape[3] as usize;
+        let out_channels = params.output_shape[3] as usize;
+        let accx = cfg!(all(target_arch = "xtensa", not(feature = "qemu")))
+            && crate::accx::accx_eligible_3x3(input_c, out_channels);
+        Ok(Self { accx, params })
     }
 
     #[inline]
     pub fn is_simd(&self) -> bool {
-        self.simd.is_some()
+        self.accx
     }
 
     pub fn run(
@@ -114,22 +288,16 @@ impl PreparedConv3x3 {
         scratch: &mut [u8],
     ) -> Result<(), KernelError> {
         #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
-        if let Some((mac_shift, ocd8, cdiv, dil_x, dil_y, use_relu)) = self.simd {
-            let in_ptr = input.as_ptr();
-            let w_ptr = weights.as_ptr();
-            let b_ptr = bias.as_ptr();
-            let out_ptr = output.as_mut_ptr();
-            let aligned = (in_ptr as usize) % 16 == 0
-                && (w_ptr as usize) % 16 == 0
-                && (b_ptr as usize) % 16 == 0
-                && (out_ptr as usize) % 16 == 0;
-            if aligned {
-                unsafe {
-                    conv3x3_simd::dispatch_3x3(
-                        out_ptr, in_ptr, w_ptr, b_ptr, mac_shift, ocd8, cdiv, dil_x, dil_y, use_relu,
-                    );
-                }
-                let _ = scratch;
+        {
+            let mut accx_ctx = Conv3x3AccxCtx {
+                input,
+                weights,
+                bias,
+                params: self.params,
+                output,
+                scratch,
+            };
+            if conv3x3_accx_dispatch(&mut accx_ctx)? {
                 return Ok(());
             }
         }
@@ -220,48 +388,26 @@ pub fn conv2d_3x3(
     let pad_w = ((out_w - 1) * params.stride_width + dilated_filter_w - input_w) / 2;
 
     // ── TIE728 SIMD dispatch (device-only; compiled out entirely on host) ──
-    // Same eligibility contract as conv1x1's dispatch, plus VALID padding
-    // only (the hardware 3x3 kernel has no bounds-checking) and a check
-    // that the filter really is 3x3 (this scalar kernel is reused for
-    // arbitrary filter sizes; the vendored asm hardcodes a 9-MAC unroll).
+    // Bespoke ACCX kernel: exact 32-bit dot product per output pixel/channel,
+    // then a bit-exact TFLite requantize in Rust. Bit-exact vs the scalar path.
     //
-    // ALSO gated off under the `qemu` feature: this entry point shares the
-    // same `EE.VSMULAS.S8.QACC.LD.INCP`-based MAC macro as conv1x1, which
-    // QEMU's TIE728 emulation does not correctly execute (confirmed by
-    // direct bisection — see local-notes/notepads/hematite-nn/problems.md). QEMU
-    // builds fall through to the scalar path; real hardware still gets SIMD.
+    // ALSO gated off under the `qemu` feature: QEMU's xtensa/esp32s3 TIE728
+    // emulation does not correctly execute the TIE MAC instructions this
+    // kernel depends on (confirmed by direct bisection — see
+    // local-notes/notepads/hematite-nn/problems.md). QEMU builds fall through to the
+    // scalar path; real hardware still gets SIMD.
     #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
     {
-        if let Some((mac_shift, ocd8, cdiv, dil_x, dil_y, use_relu)) =
-            simd_eligible_conv3x3(params, input_c, out_channels, filter_h, filter_w, pad_h, pad_w)
-        {
-            let in_ptr = input.as_ptr();
-            let w_ptr = weights.as_ptr();
-            let b_ptr = bias.as_ptr();
-            let out_ptr = output.as_mut_ptr();
-            let aligned = (in_ptr as usize) % 16 == 0
-                && (w_ptr as usize) % 16 == 0
-                && (b_ptr as usize) % 16 == 0
-                && (out_ptr as usize) % 16 == 0;
-
-            if aligned {
-                unsafe {
-                    conv3x3_simd::dispatch_3x3(
-                        out_ptr,
-                        in_ptr,
-                        w_ptr,
-                        b_ptr,
-                        mac_shift,
-                        ocd8,
-                        cdiv,
-                        dil_x,
-                        dil_y,
-                        use_relu,
-                    );
-                }
-                let _ = scratch;
-                return Ok(());
-            }
+        let mut accx_ctx = Conv3x3AccxCtx {
+            input,
+            weights,
+            bias,
+            params,
+            output,
+            scratch,
+        };
+        if conv3x3_accx_dispatch(&mut accx_ctx)? {
+            return Ok(());
         }
     }
 

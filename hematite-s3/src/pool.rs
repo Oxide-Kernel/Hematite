@@ -125,18 +125,18 @@ pub fn average_pool_2d(
             let out_ptr = output.as_mut_ptr();
             if (in_ptr as usize) % 16 == 0 && (out_ptr as usize) % 16 == 0 {
                 let total_out = out_h * out_w * channels;
-                let area_inv = [64i8; 16];
+                let mut ctx = pool_simd::AvgPoolSimdCtx {
+                    output: out_ptr,
+                    input: in_ptr,
+                    input_channel: channels,
+                    input_y_offset: input_w * channels,
+                    input_x_offset: channels,
+                    shift: 8,
+                    avg_pool_area_inv: [64i8; 16],
+                    c_div_x_1: total_out / 16 - 1,
+                };
                 unsafe {
-                    avg_pool_2d_simd(
-                        out_ptr,
-                        in_ptr,
-                        channels,
-                        input_w * channels,
-                        channels,
-                        8,
-                        &area_inv,
-                        total_out / 16 - 1,
-                    );
+                    pool_simd::avg_pool_2d_simd_ctx(&mut ctx);
                 }
                 let _ = scratch;
                 return Ok(());
@@ -606,6 +606,9 @@ mod pool_simd {
             input = in(reg) input,
             args = in(reg) args,
             target = in(reg) target,
+            out("a13") _,
+            out("a14") _,
+            out("a15") _,
             clobber_abi("C"),
         );
     }
@@ -640,6 +643,10 @@ mod pool_simd {
         avg_pool_area_inv: &[i8; 16],
         c_div_x_1: i32,
     ) {
+        // NOTE: an 8-arg call like this is the Xtensa-LLVM multi-arg-call
+        // miscompile class (args spill to stack and get scrambled, cf.
+        // `dispatch_fc` inline and the `accx` ctx refactors). Callers must
+        // route through `avg_pool_2d_simd_ctx` (single `&mut` arg) instead.
         let mut area_inv = [0i8; 16];
         area_inv.copy_from_slice(avg_pool_area_inv);
         // Write only the asm-read fields (+4/+16/+20/+56/+64/+104).
@@ -667,6 +674,60 @@ mod pool_simd {
             input = in(reg) input,
             args = in(reg) args,
             target = in(reg) target,
+            out("a13") _,
+            out("a14") _,
+            out("a15") _,
+            clobber_abi("C"),
+        );
+    }
+
+    /// Avg-pool SIMD via a single `&mut` context — dodges the Xtensa-LLVM
+    /// multi-arg-call miscompile (an 8-arg `avg_pool_2d_simd` call is
+    /// scrambled by the backend; a 1-arg call is not).
+    #[allow(dead_code)]
+    pub(crate) struct AvgPoolSimdCtx {
+        pub(crate) output: *mut i8,
+        pub(crate) input: *const i8,
+        pub(crate) input_channel: i32,
+        pub(crate) input_y_offset: i32,
+        pub(crate) input_x_offset: i32,
+        pub(crate) shift: i32,
+        pub(crate) avg_pool_area_inv: [i8; 16],
+        pub(crate) c_div_x_1: i32,
+    }
+
+    /// Same contract as `avg_pool_2d_simd`; build an `AvgPoolSimdCtx` in the
+    /// caller and pass it by `&mut` so the call has a single register arg.
+    /// `#[inline(never)]`: when inlined, the Xtensa LLVM backend emits a
+    /// scrambled `or a10,a7,a7` (clobbering the output pointer with scratch).
+    #[inline(never)]
+    #[allow(dead_code)]
+    pub unsafe fn avg_pool_2d_simd_ctx(ctx: &mut AvgPoolSimdCtx) {
+        // Build the args as a plain struct literal: the MaybeUninit
+        // pointer-cast build is miscompiled by the Xtensa LLVM backend when it
+        // contains a 16-byte array copy (scalar/array field groups get swapped,
+        // and the asm operands are clobbered). The struct-literal form emits
+        // ordinary stores and is the pattern proven on device.
+        let args = Tie728AvgPoolArgs {
+            input_channel: ctx.input_channel,
+            input_y_offset: ctx.input_y_offset,
+            input_x_offset: ctx.input_x_offset,
+            filter_height: 2,
+            filter_width: 2,
+            shift: ctx.shift,
+            avg_pool_area_inv: ctx.avg_pool_area_inv,
+            c_div_x_1: ctx.c_div_x_1,
+            ..Tie728AvgPoolArgs::default()
+        };
+        let target = dl_tie728_s8_avg_pool2d_22c1 as unsafe extern "C" fn() as usize;
+        core::arch::asm!(
+            "callx8 a13",
+            in("a10") ctx.output,
+            in("a11") ctx.input,
+            in("a12") &args,
+            in("a13") target,
+            out("a14") _,
+            out("a15") _,
             clobber_abi("C"),
         );
     }
@@ -802,18 +863,18 @@ impl PreparedAvgPool {
                 let in_ptr = input.as_ptr();
                 let out_ptr = output.as_mut_ptr();
                 if (in_ptr as usize) % 16 == 0 && (out_ptr as usize) % 16 == 0 {
-                    let area_inv = [64i8; 16];
+                    let mut ctx = pool_simd::AvgPoolSimdCtx {
+                        output: out_ptr,
+                        input: in_ptr,
+                        input_channel,
+                        input_y_offset,
+                        input_x_offset,
+                        shift: 8,
+                        avg_pool_area_inv: [64i8; 16],
+                        c_div_x_1,
+                    };
                     unsafe {
-                        avg_pool_2d_simd(
-                            out_ptr,
-                            in_ptr,
-                            input_channel,
-                            input_y_offset,
-                            input_x_offset,
-                            8,
-                            &area_inv,
-                            c_div_x_1,
-                        );
+                        pool_simd::avg_pool_2d_simd_ctx(&mut ctx);
                     }
                     let _ = scratch;
                     return Ok(());
