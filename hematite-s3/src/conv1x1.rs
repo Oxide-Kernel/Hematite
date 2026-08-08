@@ -65,6 +65,257 @@ fn shape_product(shape: &[i32; 4]) -> usize {
     shape[0] as usize * shape[1] as usize * shape[2] as usize * shape[3] as usize
 }
 
+/// Shared TIE728 SIMD eligibility gate for the 1×1 conv — host-compilable.
+///
+/// Returns `Some((mac_shift, output_channel_div_8, c_div_x_1, use_relu))` when
+/// the params qualify for the vendored `dl_tie728_s8_conv2d_11cn` entry point,
+/// `None` otherwise. This is the single source of truth reused by both the
+/// legacy `conv2d_1x1` dispatch and the [`PreparedConv1x1`] handle.
+#[inline]
+pub(crate) fn simd_eligible_conv1x1(
+    params: &Conv2DParams<'_>,
+    input_c: i32,
+    out_channels: i32,
+) -> Option<(i32, i32, i32, bool)> {
+    let mult = params.output_multiplier_per_channel;
+    let shift = params.output_shift_per_channel;
+    let mult_uniform = !mult.is_empty() && mult.iter().all(|&m| m == mult[0]) && mult[0] == 1 << 30;
+    let shift_uniform = !shift.is_empty() && shift.iter().all(|&s| s == shift[0]);
+    let full_range = params.quantized_activation_min == i8::MIN as i32
+        && params.quantized_activation_max == i8::MAX as i32;
+    let relu_range = params.quantized_activation_min == 0
+        && params.quantized_activation_max == i8::MAX as i32;
+
+    if params.input_offset == 0
+        && params.output_offset == 0
+        && (full_range || relu_range)
+        && mult_uniform
+        && shift_uniform
+        && shift[0] <= 1
+        && input_c % 16 == 0
+        && input_c >= 16
+        && out_channels % 16 == 0
+    {
+        let use_relu = relu_range && !full_range;
+        // Asm rounding semantics: the TIE728 per-layer path applies
+        // round_result(acc, mac_shift) ≈ (acc + 2^(mac_shift-1)) >> mac_shift.
+        // For mult == 1<<30 the scalar reference computes
+        // (acc*2^30 + 2^30) >> 31 == (acc+1) >> 1, i.e. mac_shift must be
+        // `1 - shift[0]` (NOT shift[0]) to reproduce the reference bit-exact.
+        // shift[0] == 1 (identity) → mac_shift 0 = plain extract = identity.
+        Some((1 - shift[0], out_channels / 16, input_c / 16 - 1, use_relu))
+    } else {
+        None
+    }
+}
+
+/// Transform weights from the caller's `[oc][ic]` (OHWI) layout into the
+/// TIE728 11cn `[g][ic][lane]` SIMD layout.
+///
+/// The vendored asm consumes the filter sequentially as, per 16-output-channel
+/// group `g`, `(c_div_x_1 + 1)` chunks of 16 bytes — the `k`-th VSMULAS
+/// multiplies input byte `k` with filter vector `k` (see the 11c16 macro). So
+/// the asm reads `filter[g * (in_c * 16) + ic * 16 + lane]`, which must equal
+/// `weights[(g * 16 + lane) * in_c + ic]` for the SIMD output to match the
+/// scalar reference bit-exact. This is a pure no_std permutation
+/// (host-compilable, unit-tested).
+///
+/// `src` length must be `in_c * out_channels`; `dst` length must match.
+/// Returns [`KernelError::ShapeMismatch`] otherwise.
+pub fn transform_weights_11cn(
+    input_c: usize,
+    out_channels: usize,
+    src: &[i8],
+    dst: &mut [i8],
+) -> Result<(), KernelError> {
+    if input_c % 16 != 0 || out_channels % 16 != 0 {
+        return Err(KernelError::ShapeMismatch);
+    }
+    if src.len() != input_c * out_channels || dst.len() != src.len() {
+        return Err(KernelError::ShapeMismatch);
+    }
+    let groups = out_channels / 16;
+    for g in 0..groups {
+        let g_base = g * input_c * 16;
+        for ic in 0..input_c {
+            let ic_base = g_base + ic * 16;
+            for lane in 0..16 {
+                let src_oc = g * 16 + lane;
+                dst[ic_base + lane] = src[src_oc * input_c + ic];
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Context for the ACCX 1×1 conv dispatch — bundled into one `&mut` arg so the
+/// Xtensa LLVM backend generates a 1-arg call (multi-arg calls are miscompiled
+/// on device; see the `dispatch_fc` inline regression and `ReqCtx`).
+#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+pub(crate) struct Conv1x1AccxCtx<'a> {
+    pub input: &'a [i8],
+    pub weights: &'a [i8],
+    pub bias: &'a [i32],
+    pub params: &'a Conv2DParams<'a>,
+    pub output: &'a mut [i8],
+    pub scratch: &'a mut [u8],
+}
+
+/// Attempt the bespoke ACCX 1×1 conv SIMD path (bit-exact), returning
+/// `Ok(true)` if handled, `Ok(false)` if ineligible / unaligned / insufficient
+/// scratch (caller falls through to the scalar kernel).
+///
+/// Device-only. Uses `EE.VMULAS.S8.ACCX` (32-bit element accumulator, full
+/// 16-bit products) so the output is bit-identical to the scalar reference for
+/// any per-channel `mult`/`shift`/offset/activation and any `out_c`.
+///
+/// Eligibility: `input_offset == 0`, stride/dilation 1, `out_h == in_h`,
+/// `out_w == in_w` (pad 0), `in_c % 16 == 0`, `in_c >= 16`, `out_c >= 1`,
+/// all pointers 16-byte aligned, `scratch >= out_c * 4`.
+#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+fn conv1x1_accx_dispatch(ctx: &mut Conv1x1AccxCtx<'_>) -> Result<bool, KernelError> {
+    let params = ctx.params;
+    let input_c = params.input_shape[3] as usize;
+    let out_c = params.output_shape[3] as usize;
+    let in_h = params.input_shape[1] as usize;
+    let in_w = params.input_shape[2] as usize;
+    let out_h = params.output_shape[1] as usize;
+    let out_w = params.output_shape[2] as usize;
+
+    if params.input_offset != 0
+        || params.stride_height != 1
+        || params.stride_width != 1
+        || params.dilation_height_factor != 1
+        || params.dilation_width_factor != 1
+        || in_h != out_h
+        || in_w != out_w
+        || !crate::accx::accx_eligible_1x1(input_c, out_c)
+    {
+        return Ok(false);
+    }
+
+    let need = out_c * 4;
+    if ctx.scratch.len() < need {
+        return Ok(false);
+    }
+
+    let in_ptr = ctx.input.as_ptr();
+    let w_ptr = ctx.weights.as_ptr();
+    let out_ptr = ctx.output.as_mut_ptr();
+    let accs = ctx.scratch.as_mut_ptr() as *mut i32;
+    if (in_ptr as usize) % 16 != 0
+        || (w_ptr as usize) % 16 != 0
+        || (out_ptr as usize) % 16 != 0
+        || (accs as usize) % 4 != 0
+    {
+        return Ok(false);
+    }
+
+    let multipliers = params.output_multiplier_per_channel;
+    let shifts = params.output_shift_per_channel;
+    let act_min = params.quantized_activation_min;
+    let act_max = params.quantized_activation_max;
+    let out_offset = params.output_offset;
+    let (uniform_mult, uniform_shift) = match crate::accx::uniform_scale(multipliers, shifts) {
+        Some((m, s)) => (m, s),
+        None => (0, i32::MIN),
+    };
+
+    for oh in 0..out_h {
+        for ow in 0..out_w {
+            let px_in = (oh * in_w + ow) * input_c;
+            let px_out = (oh * out_w + ow) * out_c;
+            unsafe {
+                crate::accx::accx_conv1x1(
+                    in_ptr.add(px_in),
+                    w_ptr,
+                    accs,
+                    input_c,
+                    out_c,
+                );
+            }
+            let acc_slice = unsafe { core::slice::from_raw_parts_mut(accs, out_c) };
+            crate::accx::requantize_1x1(&mut crate::accx::ReqCtx {
+                accs: acc_slice,
+                bias: ctx.bias,
+                multipliers,
+                shifts,
+                output_offset: out_offset,
+                act_min,
+                act_max,
+                out_base: px_out,
+                output: ctx.output,
+                uniform_mult,
+                uniform_shift,
+            });
+        }
+    }
+    Ok(true)
+}
+
+/// Prepared 1×1 conv handle — runs the SIMD eligibility gate ONCE at
+/// construction, then `run` only re-checks pointer alignment and dispatches.
+///
+/// This closes the wrapper-overhead gap vs C (raw-asm 472 cyc vs Rust public
+/// API 2628 cyc): the per-call path is reduced to 4 alignment ANDs + a
+/// MaybeUninit args build + the call8, instead of re-validating shapes and
+/// re-scanning the per-channel multiplier/shift arrays every call.
+///
+/// When the gate fails (or on host where the SIMD backend is compiled out),
+/// `run` falls through to the scalar kernel — output is bit-exact either way.
+pub struct PreparedConv1x1 {
+    /// Whether the bespoke ACCX SIMD kernel is eligible on this target.
+    accx: bool,
+    params: &'static Conv2DParams<'static>,
+}
+
+impl PreparedConv1x1 {
+    /// Evaluate the ACCX SIMD gate for the given layer params.
+    ///
+    /// `input_c` / `out_channels` are taken from the params by the caller; this
+    /// keeps the constructor free of shape-product slicing so it stays cheap
+    /// (used once per layer at model build time).
+    pub fn new(params: &'static Conv2DParams<'static>) -> Result<Self, KernelError> {
+        let input_c = params.input_shape[3] as usize;
+        let out_channels = params.output_shape[3] as usize;
+        let accx = cfg!(all(target_arch = "xtensa", not(feature = "qemu")))
+            && crate::accx::accx_eligible_1x1(input_c, out_channels);
+        Ok(Self { accx, params })
+    }
+
+    /// Whether this layer is SIMD-eligible on the current target.
+    #[inline]
+    pub fn is_simd(&self) -> bool {
+        self.accx
+    }
+
+    /// Run the 1×1 conv — ACCX SIMD when eligible and aligned, scalar otherwise.
+    pub fn run(
+        &self,
+        input: &[i8],
+        weights: &[i8],
+        bias: &[i32],
+        output: &mut [i8],
+        scratch: &mut [u8],
+    ) -> Result<(), KernelError> {
+        #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+        {
+            let mut accx_ctx = Conv1x1AccxCtx {
+                input,
+                weights,
+                bias,
+                params: self.params,
+                output,
+                scratch,
+            };
+            if conv1x1_accx_dispatch(&mut accx_ctx)? {
+                return Ok(());
+            }
+        }
+        conv2d_1x1(input, weights, bias, self.params, output, scratch)
+    }
+}
+
 /// Conv2D 1×1 GEMM — scalar kernel (host-compilable, bit-exact vs per-channel golden).
 ///
 /// Mirrors the `hematite-ref/src/conv.rs` arithmetic exactly: bias-init i32
@@ -139,50 +390,16 @@ pub fn conv2d_1x1(
     // it there.
     #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
     {
-        let mult = params.output_multiplier_per_channel;
-        let shift = params.output_shift_per_channel;
-        let mult_uniform = !mult.is_empty() && mult.iter().all(|&m| m == mult[0]) && mult[0] == 1 << 30;
-        let shift_uniform = !shift.is_empty() && shift.iter().all(|&s| s == shift[0]);
-        let full_range = params.quantized_activation_min == i8::MIN as i32
-            && params.quantized_activation_max == i8::MAX as i32;
-        let relu_range = params.quantized_activation_min == 0
-            && params.quantized_activation_max == i8::MAX as i32;
-
-        if params.input_offset == 0
-            && params.output_offset == 0
-            && (full_range || relu_range)
-            && mult_uniform
-            && shift_uniform
-            && input_c % 16 == 0
-            && input_c >= 16
-            && out_channels % 16 == 0
-        {
-            let in_ptr = input.as_ptr();
-            let w_ptr = weights.as_ptr();
-            let b_ptr = bias.as_ptr();
-            let out_ptr = output.as_mut_ptr();
-            let aligned = (in_ptr as usize) % 16 == 0
-                && (w_ptr as usize) % 16 == 0
-                && (b_ptr as usize) % 16 == 0
-                && (out_ptr as usize) % 16 == 0;
-
-            if aligned {
-                let use_relu = relu_range && !full_range;
-                unsafe {
-                    conv1x1_simd::dispatch_1x1(
-                        out_ptr,
-                        in_ptr,
-                        w_ptr,
-                        b_ptr,
-                        shift[0],
-                        out_channels / 16,
-                        input_c / 16 - 1,
-                        use_relu,
-                    );
-                }
-                let _ = scratch;
-                return Ok(());
-            }
+        let mut accx_ctx = Conv1x1AccxCtx {
+            input,
+            weights,
+            bias,
+            params,
+            output,
+            scratch,
+        };
+        if conv1x1_accx_dispatch(&mut accx_ctx)? {
+            return Ok(());
         }
     }
 
@@ -384,10 +601,15 @@ mod conv1x1_simd {
         // appropriate entry point.
 
         core::arch::asm!(
-            // Load arguments into the ABI registers
-            "mov a2, {output}",
-            "mov a3, {input}",
-            "mov a4, {args}",
+            // Load arguments into the ABI registers.
+            //
+            // `dl_tie728_s8_conv2d_11cn` uses `entry sp, 128`, so it is called
+            // with the windowed `call8` convention: the callee's a2/a3/a4 are
+            // the caller's a10/a11/a12 (the window rotates by 8). Placing the
+            // args in a2/a3/a4 would deliver garbage pointers to the callee.
+            "mov a10, {output}",
+            "mov a11, {input}",
+            "mov a12, {args}",
 
             // Branch to dl_tie728_s8_conv2d_11cn (aligned, no fused activation)
             "call8 dl_tie728_s8_conv2d_11cn",
@@ -414,9 +636,9 @@ mod conv1x1_simd {
         args: &Tie728ConvArgs,
     ) {
         core::arch::asm!(
-            "mov a2, {output}",
-            "mov a3, {input}",
-            "mov a4, {args}",
+            "mov a10, {output}",
+            "mov a11, {input}",
+            "mov a12, {args}",
             "call8 dl_tie728_s8_conv2d_11cn_relu",
             output = in(reg) output,
             input  = in(reg) input,
@@ -446,25 +668,25 @@ mod conv1x1_simd {
         c_div_x_1: i32,
         use_relu: bool,
     ) {
-        let args = Tie728ConvArgs {
-            _pad0: [0u8; 48],
-            filter,
-            _pad1: [0u8; 12],
-            mac_shift,
-            bias,
-            _pad2: [0u8; 4],
-            activation_alpha: 0,
-            _pad3: [0u8; 4],
-            activation_shift: if use_relu { 0 } else { -1 },
-            _pad4: [0u8; 8],
-            output_channel_div_8,
-            c_div_x_1,
-            filter_channel_factor: core::ptr::null(),
-        };
+        // Build the args struct writing ONLY the 8 fields the asm reads
+        // (+48/+64/+68/+76/+84/+96/+100/+104), leaving all padding
+        // uninitialized. A struct literal would emit a memset + dead pad
+        // stores per call (~50+ cycles of pure overhead on the hot path).
+        let mut args = core::mem::MaybeUninit::<Tie728ConvArgs>::uninit();
+        let p = args.as_mut_ptr();
+        p.cast::<u8>().add(48).cast::<*const i8>().write(filter);
+        p.cast::<u8>().add(64).cast::<i32>().write(mac_shift);
+        p.cast::<u8>().add(68).cast::<*const i32>().write(bias);
+        p.cast::<u8>().add(76).cast::<i32>().write(0);
+        p.cast::<u8>().add(84).cast::<i32>().write(if use_relu { 0 } else { -1 });
+        p.cast::<u8>().add(96).cast::<i32>().write(output_channel_div_8);
+        p.cast::<u8>().add(100).cast::<i32>().write(c_div_x_1);
+        p.cast::<u8>().add(104).cast::<*const i16>().write(core::ptr::null());
+        let args = args.assume_init_ref();
         if use_relu {
-            conv2d_1x1_simd_relu(output, input, &args);
+            conv2d_1x1_simd_relu(output, input, args);
         } else {
-            conv2d_1x1_simd_aligned(output, input, &args);
+            conv2d_1x1_simd_aligned(output, input, args);
         }
     }
 }

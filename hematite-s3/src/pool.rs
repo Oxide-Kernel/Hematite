@@ -124,19 +124,39 @@ pub fn average_pool_2d(
             let in_ptr = input.as_ptr();
             let out_ptr = output.as_mut_ptr();
             if (in_ptr as usize) % 16 == 0 && (out_ptr as usize) % 16 == 0 {
-                let total_out = out_h * out_w * channels;
-                let area_inv = [64i8; 16];
+                // `dl_tie728_s8_avg_pool2d_22c1` computes ONE output pixel per
+                // call (looping over `channels/16` channel-groups); the caller
+                // loops over the output image, stepping the input by
+                // `stride * channels` per pixel (stride == 2 here, pad == 0).
+                // `c_div_x_1` is the channel-group count minus one, NOT the
+                // total-output count — passing `total_out/16 - 1` makes the
+                // kernel walk a stride-1 window across the whole buffer.
+                let c_div_x_1 = channels / 16 - 1;
+                let y_off = input_w * channels;
+                let x_off = channels;
+                let in_row_step = (2 * input_w) * channels;
+                let out_row_step = out_w * channels;
+                let mut ctx = pool_simd::AvgPoolSimdCtx {
+                    output: out_ptr,
+                    input: in_ptr,
+                    input_channel: channels,
+                    input_y_offset: y_off,
+                    input_x_offset: x_off,
+                    shift: 8,
+                    avg_pool_area_inv: [64i8; 16],
+                    c_div_x_1,
+                };
                 unsafe {
-                    avg_pool_2d_simd(
-                        out_ptr,
-                        in_ptr,
-                        channels,
-                        input_w * channels,
-                        channels,
-                        8,
-                        &area_inv,
-                        total_out / 16 - 1,
-                    );
+                    for oh in 0..out_h {
+                        let mut in_px = in_ptr.add((oh * in_row_step) as usize);
+                        for ow in 0..out_w {
+                            ctx.input = in_px;
+                            pool_simd::avg_pool_2d_simd_ctx(&mut ctx);
+                            ctx.output = ctx.output.add(channels as usize);
+                            in_px = in_px.add((2 * channels) as usize);
+                        }
+                        ctx.output = out_ptr.add(((oh + 1) * out_row_step) as usize);
+                    }
                 }
                 let _ = scratch;
                 return Ok(());
@@ -249,16 +269,37 @@ pub fn max_pool_2d(
             let in_ptr = input.as_ptr();
             let out_ptr = output.as_mut_ptr();
             if (in_ptr as usize) % 16 == 0 && (out_ptr as usize) % 16 == 0 {
-                let total_out = out_h * out_w * channels;
+                // `dl_tie728_s8_max_pool2d_22c1` computes ONE output pixel per
+                // call (looping over `channels/16` channel-groups); the caller
+                // loops over the output image, stepping the input by
+                // `stride * channels` per pixel (stride == 2 here, pad == 0).
+                // `c_div_x_1` is the channel-group count minus one, NOT the
+                // total-output count — passing `total_out/16 - 1` makes the
+                // kernel walk a stride-1 window across the whole buffer.
+                let c_div_x_1 = channels / 16 - 1;
+                let y_off = input_w * channels;
+                let x_off = channels;
+                let in_row_step = (2 * input_w) * channels;
+                let out_row_step = out_w * channels;
+                let mut ctx = pool_simd::MaxPoolSimdCtx {
+                    output: out_ptr,
+                    input: in_ptr,
+                    input_channel: channels,
+                    input_y_offset: y_off,
+                    input_x_offset: x_off,
+                    c_div_x_1,
+                };
                 unsafe {
-                    max_pool_2d_simd(
-                        out_ptr,
-                        in_ptr,
-                        channels,
-                        input_w * channels,
-                        channels,
-                        total_out / 16 - 1,
-                    );
+                    for oh in 0..out_h {
+                        let mut in_px = in_ptr.add((oh * in_row_step) as usize);
+                        ctx.output = out_ptr.add((oh * out_row_step) as usize);
+                        for ow in 0..out_w {
+                            ctx.input = in_px;
+                            pool_simd::max_pool_2d_simd_ctx(&mut ctx);
+                            ctx.output = ctx.output.add(channels as usize);
+                            in_px = in_px.add((2 * channels) as usize);
+                        }
+                    }
                 }
                 let _ = scratch;
                 return Ok(());
@@ -584,23 +625,79 @@ mod pool_simd {
         input_x_offset: i32,
         c_div_x_1: i32,
     ) {
-        let args = Tie728MaxPoolArgs {
-            input_channel,
-            input_y_offset,
-            input_x_offset,
-            c_div_x_1,
-            ..Default::default()
-        };
+        // Write only the asm-read fields (+4/+16/+20/+48/+52/+60/+104);
+        // _pad bytes are never read by the asm, so leave uninitialized.
+        let mut args = core::mem::MaybeUninit::<Tie728MaxPoolArgs>::uninit();
+        let p = args.as_mut_ptr();
+        p.cast::<u8>().add(4).cast::<i32>().write(input_channel);
+        p.cast::<u8>().add(16).cast::<i32>().write(input_y_offset);
+        p.cast::<u8>().add(20).cast::<i32>().write(input_x_offset);
+        p.cast::<u8>().add(48).cast::<i32>().write(2); // filter_height
+        p.cast::<u8>().add(52).cast::<i32>().write(2); // filter_width
+        p.cast::<u8>().add(60).cast::<i32>().write(0); // c_remainder
+        p.cast::<u8>().add(104).cast::<i32>().write(c_div_x_1);
+        let args = unsafe { args.assume_init_ref() };
         let target = dl_tie728_s8_max_pool2d_22c1 as unsafe extern "C" fn() as usize;
         core::arch::asm!(
-            "mov a2, {output}",
-            "mov a3, {input}",
-            "mov a4, {args}",
+            "mov a10, {output}",
+            "mov a11, {input}",
+            "mov a12, {args}",
             "callx8 {target}",
             output = in(reg) output,
             input = in(reg) input,
-            args = in(reg) &args,
+            args = in(reg) args,
             target = in(reg) target,
+            out("a13") _,
+            out("a14") _,
+            out("a15") _,
+            clobber_abi("C"),
+        );
+    }
+
+    /// Max-pool SIMD via a single `&mut` context — dodges the Xtensa-LLVM
+    /// multi-arg-call miscompile (a repeated 6-arg `max_pool_2d_simd` call is
+    /// scrambled by the backend; a 1-arg call is not — same rationale as
+    /// `AvgPoolSimdCtx`).
+    #[allow(dead_code)]
+    pub(crate) struct MaxPoolSimdCtx {
+        pub(crate) output: *mut i8,
+        pub(crate) input: *const i8,
+        pub(crate) input_channel: i32,
+        pub(crate) input_y_offset: i32,
+        pub(crate) input_x_offset: i32,
+        pub(crate) c_div_x_1: i32,
+    }
+
+    /// Same contract as `max_pool_2d_simd`; build a `MaxPoolSimdCtx` in the
+    /// caller and pass it by `&mut` so the call has a single register arg.
+    #[inline(never)]
+    #[allow(dead_code)]
+    pub unsafe fn max_pool_2d_simd_ctx(ctx: &mut MaxPoolSimdCtx) {
+        // Mirror `avg_pool_2d_simd_ctx` EXACTLY: plain struct literal for the
+        // args (the MaybeUninit pointer-cast build is miscompiled by the Xtensa
+        // LLVM backend) and pinned-register asm operands with NO `mov`
+        // instructions (a `mov a12,{args}` template gets clobbered by the
+        // backend's register allocation). Both patterns are proven on device
+        // via the avg-pool path.
+        let args = Tie728MaxPoolArgs {
+            input_channel: ctx.input_channel,
+            input_y_offset: ctx.input_y_offset,
+            input_x_offset: ctx.input_x_offset,
+            filter_height: 2,
+            filter_width: 2,
+            c_remainder: 0,
+            c_div_x_1: ctx.c_div_x_1,
+            ..Tie728MaxPoolArgs::default()
+        };
+        let target = dl_tie728_s8_max_pool2d_22c1 as unsafe extern "C" fn() as usize;
+        core::arch::asm!(
+            "callx8 a13",
+            in("a10") ctx.output,
+            in("a11") ctx.input,
+            in("a12") &args,
+            in("a13") target,
+            out("a14") _,
+            out("a15") _,
             clobber_abi("C"),
         );
     }
@@ -635,27 +732,91 @@ mod pool_simd {
         avg_pool_area_inv: &[i8; 16],
         c_div_x_1: i32,
     ) {
+        // NOTE: an 8-arg call like this is the Xtensa-LLVM multi-arg-call
+        // miscompile class (args spill to stack and get scrambled, cf.
+        // `dispatch_fc` inline and the `accx` ctx refactors). Callers must
+        // route through `avg_pool_2d_simd_ctx` (single `&mut` arg) instead.
         let mut area_inv = [0i8; 16];
         area_inv.copy_from_slice(avg_pool_area_inv);
-        let args = Tie728AvgPoolArgs {
-            input_channel,
-            input_y_offset,
-            input_x_offset,
-            shift,
-            avg_pool_area_inv: area_inv,
-            c_div_x_1,
-            ..Default::default()
-        };
+        // Write only the asm-read fields (+4/+16/+20/+56/+64/+104).
+        let mut args = core::mem::MaybeUninit::<Tie728AvgPoolArgs>::uninit();
+        let p = args.as_mut_ptr();
+        p.cast::<u8>().add(4).cast::<i32>().write(input_channel);
+        p.cast::<u8>().add(16).cast::<i32>().write(input_y_offset);
+        p.cast::<u8>().add(20).cast::<i32>().write(input_x_offset);
+        p.cast::<u8>().add(48).cast::<i32>().write(2); // filter_height
+        p.cast::<u8>().add(52).cast::<i32>().write(2); // filter_width
+        p.cast::<u8>().add(56).cast::<i32>().write(shift);
+        p.cast::<u8>().add(64).cast::<i8>().copy_from_nonoverlapping(
+            area_inv.as_ptr(),
+            16,
+        );
+        p.cast::<u8>().add(104).cast::<i32>().write(c_div_x_1);
+        let args = unsafe { args.assume_init_ref() };
         let target = dl_tie728_s8_avg_pool2d_22c1 as unsafe extern "C" fn() as usize;
         core::arch::asm!(
-            "mov a2, {output}",
-            "mov a3, {input}",
-            "mov a4, {args}",
+            "mov a10, {output}",
+            "mov a11, {input}",
+            "mov a12, {args}",
             "callx8 {target}",
             output = in(reg) output,
             input = in(reg) input,
-            args = in(reg) &args,
+            args = in(reg) args,
             target = in(reg) target,
+            out("a13") _,
+            out("a14") _,
+            out("a15") _,
+            clobber_abi("C"),
+        );
+    }
+
+    /// Avg-pool SIMD via a single `&mut` context — dodges the Xtensa-LLVM
+    /// multi-arg-call miscompile (an 8-arg `avg_pool_2d_simd` call is
+    /// scrambled by the backend; a 1-arg call is not).
+    #[allow(dead_code)]
+    pub(crate) struct AvgPoolSimdCtx {
+        pub(crate) output: *mut i8,
+        pub(crate) input: *const i8,
+        pub(crate) input_channel: i32,
+        pub(crate) input_y_offset: i32,
+        pub(crate) input_x_offset: i32,
+        pub(crate) shift: i32,
+        pub(crate) avg_pool_area_inv: [i8; 16],
+        pub(crate) c_div_x_1: i32,
+    }
+
+    /// Same contract as `avg_pool_2d_simd`; build an `AvgPoolSimdCtx` in the
+    /// caller and pass it by `&mut` so the call has a single register arg.
+    /// `#[inline(never)]`: when inlined, the Xtensa LLVM backend emits a
+    /// scrambled `or a10,a7,a7` (clobbering the output pointer with scratch).
+    #[inline(never)]
+    #[allow(dead_code)]
+    pub unsafe fn avg_pool_2d_simd_ctx(ctx: &mut AvgPoolSimdCtx) {
+        // Build the args as a plain struct literal: the MaybeUninit
+        // pointer-cast build is miscompiled by the Xtensa LLVM backend when it
+        // contains a 16-byte array copy (scalar/array field groups get swapped,
+        // and the asm operands are clobbered). The struct-literal form emits
+        // ordinary stores and is the pattern proven on device.
+        let args = Tie728AvgPoolArgs {
+            input_channel: ctx.input_channel,
+            input_y_offset: ctx.input_y_offset,
+            input_x_offset: ctx.input_x_offset,
+            filter_height: 2,
+            filter_width: 2,
+            shift: ctx.shift,
+            avg_pool_area_inv: ctx.avg_pool_area_inv,
+            c_div_x_1: ctx.c_div_x_1,
+            ..Tie728AvgPoolArgs::default()
+        };
+        let target = dl_tie728_s8_avg_pool2d_22c1 as unsafe extern "C" fn() as usize;
+        core::arch::asm!(
+            "callx8 a13",
+            in("a10") ctx.output,
+            in("a11") ctx.input,
+            in("a12") &args,
+            in("a13") target,
+            out("a14") _,
+            out("a15") _,
             clobber_abi("C"),
         );
     }
@@ -665,3 +826,186 @@ mod pool_simd {
 pub use pool_simd::avg_pool_2d_simd;
 #[cfg(target_arch = "xtensa")]
 pub use pool_simd::max_pool_2d_simd;
+
+// ── Prepared-pool fast path ──────────────────────────────────────────────
+
+/// Shared SIMD-eligibility gate for 2×2/stride-2 pooling (both avg and max).
+///
+/// Host-compilable: returns `Some(cfg)` when the TIE728 `*_22c1` entry points
+/// can run, so a handle can be built once and reused across calls without
+/// re-running the gate. `cfg` is `(input_channel, input_y_offset, input_x_offset,
+/// c_div_x_1)`.
+pub(crate) fn simd_eligible_pool(
+    params: &PoolParams,
+) -> Option<(i32, i32, i32, i32)> {
+    let input_h = params.input_shape[1];
+    let input_w = params.input_shape[2];
+    let channels = params.input_shape[3];
+    let filter_h = params.filter_height;
+    let filter_w = params.filter_width;
+    let out_h = params.output_shape[1];
+    let out_w = params.output_shape[2];
+
+    let pad_h = ((out_h - 1) * params.stride_height + filter_h - input_h) / 2;
+    let pad_w = ((out_w - 1) * params.stride_width + filter_w - input_w) / 2;
+
+    if filter_h == 2
+        && filter_w == 2
+        && params.stride_height == 2
+        && params.stride_width == 2
+        && pad_h == 0
+        && pad_w == 0
+        && channels % 16 == 0
+        && params.quantized_activation_min == i8::MIN as i32
+        && params.quantized_activation_max == i8::MAX as i32
+    {
+        // `c_div_x_1` is the channel-group count minus one (`channels/16 - 1`),
+        // NOT `total_out/16 - 1`: the 22c1 kernel computes ONE output pixel per
+        // call, looping over `channels/16` channel-groups. The caller loops the
+        // output image itself. (Passing `total_out/16 - 1` makes the kernel
+        // walk a stride-1 window across the whole buffer — the pre-Phase-12 bug
+        // that made pool SIMD output diverge from the scalar reference.)
+        Some((channels, input_w * channels, channels, channels / 16 - 1))
+    } else {
+        None
+    }
+}
+
+/// Prepared 2×2 max pool — runs the SIMD gate once at construction.
+pub struct PreparedMaxPool {
+    simd: Option<(i32, i32, i32, i32)>,
+    params: &'static PoolParams,
+}
+
+impl PreparedMaxPool {
+    /// Run the SIMD gate once; subsequent `run` calls skip it.
+    pub fn new(params: &'static PoolParams) -> Result<Self, KernelError> {
+        let simd = simd_eligible_pool(params).filter(|_| cfg!(all(target_arch = "xtensa")));
+        Ok(Self { simd, params })
+    }
+
+    /// Whether the TIE728 SIMD path is active for these params.
+    pub fn is_simd(&self) -> bool {
+        self.simd.is_some()
+    }
+
+    /// Run max pool on `input` → `output`.
+    pub fn run(
+        &self,
+        input: &[i8],
+        output: &mut [i8],
+        scratch: &mut [u8],
+    ) -> Result<(), KernelError> {
+        #[cfg(target_arch = "xtensa")]
+        {
+            if let Some((input_channel, input_y_offset, input_x_offset, c_div_x_1)) = self.simd {
+                let in_ptr = input.as_ptr();
+                let out_ptr = output.as_mut_ptr();
+                if (in_ptr as usize) % 16 == 0 && (out_ptr as usize) % 16 == 0 {
+                    // `dl_tie728_s8_max_pool2d_22c1` computes ONE output pixel
+                    // per call; loop over the output image (stride 2, pad 0 —
+                    // guaranteed by `simd_eligible_pool`).
+                    let channels = input_channel as usize;
+                    let in_w = self.params.input_shape[2] as usize;
+                    let out_w = self.params.output_shape[2] as usize;
+                    let out_h = self.params.output_shape[1] as usize;
+                    let in_row_step = (2 * in_w) * channels;
+                    let out_row_step = out_w * channels;
+                    let mut ctx = pool_simd::MaxPoolSimdCtx {
+                        output: out_ptr,
+                        input: in_ptr,
+                        input_channel,
+                        input_y_offset,
+                        input_x_offset,
+                        c_div_x_1,
+                    };
+                    unsafe {
+                        for oh in 0..out_h {
+                            let mut in_px = in_ptr.add(oh * in_row_step);
+                            ctx.output = out_ptr.add(oh * out_row_step);
+                            for _ow in 0..out_w {
+                                ctx.input = in_px;
+                                pool_simd::max_pool_2d_simd_ctx(&mut ctx);
+                                ctx.output = ctx.output.add(channels as usize);
+                                in_px = in_px.add((2 * channels) as usize);
+                            }
+                        }
+                    }
+                    let _ = scratch;
+                    return Ok(());
+                }
+            }
+        }
+        max_pool_2d(input, self.params, output, scratch)
+    }
+}
+
+/// Prepared 2×2 average pool — runs the SIMD gate once at construction.
+pub struct PreparedAvgPool {
+    simd: Option<(i32, i32, i32, i32)>,
+    params: &'static PoolParams,
+}
+
+impl PreparedAvgPool {
+    /// Run the SIMD gate once; subsequent `run` calls skip it.
+    pub fn new(params: &'static PoolParams) -> Result<Self, KernelError> {
+        let simd = simd_eligible_pool(params).filter(|_| cfg!(all(target_arch = "xtensa")));
+        Ok(Self { simd, params })
+    }
+
+    /// Whether the TIE728 SIMD path is active for these params.
+    pub fn is_simd(&self) -> bool {
+        self.simd.is_some()
+    }
+
+    /// Run average pool on `input` → `output`.
+    pub fn run(
+        &self,
+        input: &[i8],
+        output: &mut [i8],
+        scratch: &mut [u8],
+    ) -> Result<(), KernelError> {
+        #[cfg(target_arch = "xtensa")]
+        {
+            if let Some((input_channel, input_y_offset, input_x_offset, c_div_x_1)) = self.simd {
+                let in_ptr = input.as_ptr();
+                let out_ptr = output.as_mut_ptr();
+                if (in_ptr as usize) % 16 == 0 && (out_ptr as usize) % 16 == 0 {
+                    // `dl_tie728_s8_avg_pool2d_22c1` computes ONE output pixel
+                    // per call; loop over the output image (stride 2, pad 0).
+                    let channels = input_channel as usize;
+                    let in_w = self.params.input_shape[2] as usize;
+                    let out_w = self.params.output_shape[2] as usize;
+                    let out_h = self.params.output_shape[1] as usize;
+                    let in_row_step = (2 * in_w) * channels;
+                    let out_row_step = out_w * channels;
+                    let mut ctx = pool_simd::AvgPoolSimdCtx {
+                        output: out_ptr,
+                        input: in_ptr,
+                        input_channel,
+                        input_y_offset,
+                        input_x_offset,
+                        shift: 8,
+                        avg_pool_area_inv: [64i8; 16],
+                        c_div_x_1,
+                    };
+                    unsafe {
+                        for oh in 0..out_h {
+                            let mut in_px = in_ptr.add(oh * in_row_step);
+                            ctx.output = out_ptr.add(oh * out_row_step);
+                            for _ow in 0..out_w {
+                                ctx.input = in_px;
+                                pool_simd::avg_pool_2d_simd_ctx(&mut ctx);
+                                ctx.output = ctx.output.add(channels as usize);
+                                in_px = in_px.add((2 * channels) as usize);
+                            }
+                        }
+                    }
+                    let _ = scratch;
+                    return Ok(());
+                }
+            }
+        }
+        average_pool_2d(input, self.params, output, scratch)
+    }
+}

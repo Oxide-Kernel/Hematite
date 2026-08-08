@@ -39,7 +39,7 @@ XT_GCC=$(find ~/.rustup/toolchains/esp -name 'xtensa-esp32s3-elf-gcc' | head -1)
 ## Build
 
 ```sh
-cd tools/qemu-baseline
+cd benchmarks/qemu-baseline
 make all
 ```
 
@@ -163,10 +163,10 @@ cd <repo root>
 export PATH="$HOME/.cargo/bin:$PATH" && source ~/export-esp.sh >/dev/null 2>&1
 cargo xtensa-build -p hematite-benchmarks --features qemu   # debug profile
 ~/.cargo/bin/espflash save-image --chip esp32s3 --merge \
-  target/xtensa-esp32s3-none-elf/debug/hematite-benchmarks tools/qemu-baseline/rust.bin
+  target/xtensa-esp32s3-none-elf/debug/hematite-benchmarks benchmarks/qemu-baseline/rust.bin
 ~/.esp-qemu/qemu/bin/qemu-system-xtensa -nographic -machine esp32s3 \
-  -drive file=tools/qemu-baseline/rust.bin,if=mtd,format=raw \
-  -monitor none -serial file:tools/qemu-baseline/rust_run1.log -icount 3 &
+  -drive file=benchmarks/qemu-baseline/rust.bin,if=mtd,format=raw \
+  -monitor none -serial file:benchmarks/qemu-baseline/rust_run1.log -icount 3 &
 sleep 60; kill -INT %1
 ```
 

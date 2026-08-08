@@ -98,6 +98,22 @@ pub fn depthwise_conv2d(
         return Err(KernelError::ShapeMismatch);
     }
 
+    // ── SIMD dispatch (bespoke QACC depthwise kernel, bit-exact) ─────────
+    #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+    {
+        let mut accx_ctx = DepthwiseAccxCtx {
+            input,
+            weights,
+            bias,
+            params,
+            output,
+            scratch,
+        };
+        if depthwise_accx_dispatch(&mut accx_ctx)? {
+            return Ok(());
+        }
+    }
+
     // ── Derived pad values ──────────────────────────────────────────────
     let dilated_filter_h = (filter_h - 1) * params.dilation_height_factor + 1;
     let dilated_filter_w = (filter_w - 1) * params.dilation_width_factor + 1;
@@ -182,43 +198,167 @@ pub fn depthwise_conv2d(
 // TIE728 SIMD backend — device-only (NEVER compiled on host)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// TIE728 SIMD backend for depthwise conv2d.
+/// Context for the bespoke QACC depthwise dispatch — bundled into one `&mut`
+/// arg so the Xtensa LLVM backend generates a 1-arg call (multi-arg calls are
+/// miscompiled on device; see the `dispatch_fc` inline regression and
+/// `ReqCtx`).
+#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+pub(crate) struct DepthwiseAccxCtx<'a> {
+    pub input: &'a [i8],
+    pub weights: &'a [i8],
+    pub bias: &'a [i32],
+    pub params: &'a DepthwiseConv2DParams<'a>,
+    pub output: &'a mut [i8],
+    pub scratch: &'a mut [u8],
+}
+
+/// Bespoke QACC SIMD dispatch for the depthwise conv kernel — device-only.
 ///
-/// Depthwise is memory-bound. The SIMD path uses the vendored
-/// `tie728_s8_conv2d_per_channel_result` macros from
-/// `dl_tie728_s8.S` for the requantize epilogue only — the inner (fh, fw)
-/// MAC loop remains scalar.
+/// The `s8_accx_depthwise` kernel computes the exact 32-bit accumulators for
+/// ONE output pixel (all `out_c` channels) from the raw HWCN weights, into
+/// `scratch`; the bit-exact TFLite requantize epilogue runs in Rust. The
+/// caller strides over the output image, one kernel call per pixel.
 ///
-/// This module is cfg-gated behind `#[cfg(target_arch = "xtensa")]`.
-/// ABI unverified — validate at T5.3 on device.
-//
-// No real TIE728 depthwise-MAC entry point exists in the vendored asm
-// (depthwise_simd only has shared requantize macros) — scalar-only by
-// design, not a missing optimization.
-#[cfg(target_arch = "xtensa")]
-mod depthwise_simd {
-    /// TIE728 depthwise args struct.
-    ///
-    /// Field offsets derived from the shared result macros in
-    /// `dl_tie728_s8.S`. The `tie728_s8_conv2d_per_channel_result` macro
-    /// reads scale_factor_ptr from its argument (filter_channel_factor).
-    /// The `tie728_s8_conv2d_per_channel_with_bias_result` macro additionally
-    /// reads bias_ptr.
-    ///
-    /// ABI unverified — validate at T5.3 on device.
-    #[repr(C)]
-    #[allow(dead_code)]
-    struct Tie728DepthwiseArgs {
-        _pad0: [u8; 64],
-        mac_shift: i32,                // +64
-        bias: *const i32,              // +68
-        _pad1: [u8; 32],               // +72..+103
-        filter_channel_factor: *const i16, // +104
+/// Returns `Ok(true)` when the ACCX path handled the layer, `Ok(false)` when
+/// the layer is not eligible (caller falls through to scalar).
+#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, KernelError> {
+    let params = ctx.params;
+    let input_c = params.input_shape[3] as usize;
+    let out_c = params.output_shape[3] as usize;
+    let in_w = params.input_shape[2] as usize;
+    let in_h = params.input_shape[1] as usize;
+    let out_h = params.output_shape[1] as usize;
+    let out_w = params.output_shape[2] as usize;
+    let filter_h = params.filter_shape[1];
+    let filter_w = params.filter_shape[2];
+
+    let dilated_filter_h = (filter_h - 1) * params.dilation_height_factor + 1;
+    let dilated_filter_w = (filter_w - 1) * params.dilation_width_factor + 1;
+    let pad_h = ((params.output_shape[1] - 1) * params.stride_height + dilated_filter_h
+        - params.input_shape[1])
+        / 2;
+    let pad_w = ((params.output_shape[2] - 1) * params.stride_width + dilated_filter_w
+        - params.input_shape[2])
+        / 2;
+
+    if params.input_offset != 0
+        || params.depth_multiplier != 1
+        || params.dilation_height_factor != 1
+        || params.dilation_width_factor != 1
+        || params.stride_height != 1
+        || params.stride_width != 1
+        || filter_h != 3
+        || filter_w != 3
+        || pad_h != 0
+        || pad_w != 0
+        || !crate::accx::accx_eligible_depthwise(input_c, out_c)
+    {
+        return Ok(false);
     }
 
-    /// Include the vendored TIE728 shared macros.
-    core::arch::global_asm!(
-        include_str!("../src/asm/dl_tie728_s8.S"),
-        include_str!("../src/asm/dl_tie728_s8_conv2d.S"),
-    );
+    let need = out_c * 4;
+    if ctx.scratch.len() < need {
+        return Ok(false);
+    }
+
+    let in_ptr = ctx.input.as_ptr();
+    let w_ptr = ctx.weights.as_ptr();
+    let out_ptr = ctx.output.as_mut_ptr();
+    let accs = ctx.scratch.as_mut_ptr() as *mut i32;
+    if (in_ptr as usize) % 16 != 0
+        || (w_ptr as usize) % 16 != 0
+        || (out_ptr as usize) % 16 != 0
+        || (accs as usize) % 4 != 0
+    {
+        return Ok(false);
+    }
+
+    let multipliers = params.output_multiplier_per_channel;
+    let shifts = params.output_shift_per_channel;
+    let act_min = params.quantized_activation_min;
+    let act_max = params.quantized_activation_max;
+    let out_offset = params.output_offset;
+    let (uniform_mult, uniform_shift) = match crate::accx::uniform_scale(multipliers, shifts) {
+        Some((m, s)) => (m, s),
+        None => (0, i32::MIN),
+    };
+    let row_delta = if in_w >= 3 { (in_w - 3) * input_c } else { 0 };
+    let _ = in_h;
+
+    for oh in 0..out_h {
+        for ow in 0..out_w {
+            let px = (oh * in_w + ow) * input_c;
+            let po = (oh * out_w + ow) * out_c;
+            unsafe {
+                crate::accx::accx_depthwise(in_ptr.add(px), w_ptr, accs, input_c, out_c, row_delta);
+            }
+            let acc_slice = unsafe { core::slice::from_raw_parts_mut(accs, out_c) };
+            crate::accx::requantize_1x1(&mut crate::accx::ReqCtx {
+                accs: acc_slice,
+                bias: ctx.bias,
+                multipliers,
+                shifts,
+                output_offset: out_offset,
+                act_min,
+                act_max,
+                out_base: po,
+                output: ctx.output,
+                uniform_mult,
+                uniform_shift,
+            });
+        }
+    }
+    Ok(true)
+}
+
+/// Prepared depthwise handle — runs the SIMD gate ONCE at construction, then
+/// `run` only re-checks pointer alignment and dispatches.
+///
+/// The bespoke QACC kernel (`s8_accx_depthwise`) computes exact 32-bit
+/// per-lane accumulators, so SIMD output is bit-exact vs the scalar reference.
+pub struct PreparedDepthwise {
+    /// Whether the bespoke QACC SIMD kernel is eligible on this target.
+    accx: bool,
+    params: &'static DepthwiseConv2DParams<'static>,
+}
+
+impl PreparedDepthwise {
+    pub fn new(params: &'static DepthwiseConv2DParams<'static>) -> Result<Self, KernelError> {
+        let input_c = params.input_shape[3] as usize;
+        let out_channels = params.output_shape[3] as usize;
+        let accx = cfg!(all(target_arch = "xtensa", not(feature = "qemu")))
+            && crate::accx::accx_eligible_depthwise(input_c, out_channels);
+        Ok(Self { accx, params })
+    }
+
+    #[inline]
+    pub fn is_simd(&self) -> bool {
+        self.accx
+    }
+
+    pub fn run(
+        &self,
+        input: &[i8],
+        weights: &[i8],
+        bias: &[i32],
+        output: &mut [i8],
+        scratch: &mut [u8],
+    ) -> Result<(), KernelError> {
+        #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+        {
+            let mut accx_ctx = DepthwiseAccxCtx {
+                input,
+                weights,
+                bias,
+                params: self.params,
+                output,
+                scratch,
+            };
+            if depthwise_accx_dispatch(&mut accx_ctx)? {
+                return Ok(());
+            }
+        }
+        depthwise_conv2d(input, weights, bias, self.params, output, scratch)
+    }
 }

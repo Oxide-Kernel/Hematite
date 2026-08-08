@@ -21,7 +21,7 @@
     .text
     .global dl_tie728_s8_relu_11c
     .type   dl_tie728_s8_relu_11c, @function
-    .section .iram1
+    # .section .iram1
 dl_tie728_s8_relu_11c:
     .align 4
     entry sp, 16
@@ -76,7 +76,7 @@ dl_tie728_s8_relu_11c:
     .text
     .global dl_tie728_s8_unaligned_relu_11c
     .type   dl_tie728_s8_unaligned_relu_11c, @function
-    .section .iram1
+    # .section .iram1
 dl_tie728_s8_unaligned_relu_11c:
     .align 4
     entry sp, 16
