@@ -189,6 +189,45 @@ inline-asm or high-arg-count call site):
    (no MaybeUninit pointer-cast writes) and pin every asm operand to an
    explicit register (`in("a10")`..`in("a13")`, `callx8 a13`).
 
+## Optimized ACCX kernels (Phase 14)
+
+The bespoke S8-ACCX kernels got a **fast path for `input_c == 64`** (`bench36`
+device report, ESP32-S3 @ 240 MHz, all checksums still bit-exact):
+
+| Operation (row) | kernel path | C PURE cycles | Rust s3 full cycles | Rust s3 (before) |
+|---|---|---|---|---|
+| conv1x1 64x1x1x64 | fast64 (input resident q0..q3, `loop a6`) | **996** | **9937 / 9939** | 12593 / 12595 |
+| conv3x3 32x32 64x3x3x64 VALID | fast64 (9 taps unrolled, 8 VLD + 4 VMULAS per tap) | **7353504** | **15009334 / 15009361** | 35743533 / 35743561 |
+| fc 256→64 | general path (in_c=256, 16 groups — no fast path) | 10334 | 20133 / 20159 | 20133 / 20159 |
+
+- `conv1x1` kernel PURE cost dropped **3.4x** (3422 → 996 cyc); full-API
+  (kernel + Rust requantize) went 12593 → **9939** cyc.
+- `conv3x3` full-API dropped **2.4x** (35743533 → **15009334** cyc). The PURE
+  kernel (7.35M cyc = 6.2M instructions over 900 px × 64 oc × 9 taps) is near
+  the issue-rate floor given the chip exposes only **8 TIE728 Q registers** —
+  the 36-vector 3×3 input window cannot stay resident, so each tap re-loads
+  4 input + 4 filter vectors per 4 MACs.
+- The two languages measure the **same kernel** (shared `.S` files); Rust full
+  is ~1.15–1.36x C full because the Rust `requantize_1x1` epilogue
+  (`#[inline(never)]`, i64 `multiply_by_quantized_multiplier`) is heavier than
+  the C scalar requantize — requantize is now the dominant full-API cost
+  (conv1x1: 9939 − 996 ≈ 8943 cyc).
+
+Engineering notes:
+
+1. **`include_str!` staleness**: cargo does not rebuild a crate when a file
+   pulled in via `include_str!` changes — `cargo clean -p hematite-s3` (or
+   touching the source) is required, otherwise the firmware silently links the
+   stale kernel.
+2. **`.Lfast64` label collision**: both `.S` files define `.Lfast64`, and
+   `global_asm!` concatenates both files into one assembly stream. Renamed the
+   conv3x3 labels (`.Lc3fast64`/`.Lc3f64done`).
+3. **Xtensa hardware `loop` under LLVM-MC**: the ~350-byte unrolled 9-tap body
+   exceeds the `loop` fixup range (`loop fixup value out of range`) and the
+   8-bit branch range (`bge` too far) — the conv3x3 fast path uses a
+   short-branch + long-jump pattern (`blt …; j …`) instead. GNU-as (ESP-IDF)
+   accepts both; LLVM-MC (Rust `global_asm!`) requires the branch version.
+
 ## Files
 
 | File | Role |
@@ -198,7 +237,9 @@ inline-asm or high-arg-count call site):
 | `main/CMakeLists.txt` | Registers `main.c` + **all 8** vendored asm files from `hematite-s3/src/asm/` (compiled with `-x assembler-with-cpp`) + the bespoke probes/kernels |
 | `main/main.c` | Harness: per-op fill_pattern + scalar refs, all `Tie728*Args` C structs, one SIMD wrapper + `run_bench` (1 warm-up + 10 timed, min+median) per op, sign-extending FNV-1a, UART report |
 | `main/probe_qacc.S` / `probe_s16.S` / `probe_s8accx.S` / `probe_accx.S` | On-device TIE728 primitive probes: QACC lane width, S16 QACC, S8-ACCX reduction, ACCX semantics |
-| `main/s8_accx_conv1x1.S` | Bespoke 16-wide S8-ACCX dot-product conv1x1 kernel (bit-exact, raw `[oc][ic]` weights) — proof-of-concept; the production copy lives in `hematite-s3/src/asm/` |
+| `main/s8_accx_conv1x1.S` | Bespoke 16-wide S8-ACCX dot-product conv1x1 kernel (bit-exact, raw `[oc][ic]` weights, fast64 path for `in_c==64`) — synced from `hematite-s3/src/asm/` |
+| `main/s8_accx_conv1x1_orig.S` | Original branchy conv1x1 kernel (A/B baseline) |
+| `main/s8_accx_conv3x3.S` | Bespoke S8-ACCX conv3x3 kernel (9-tap unrolled fast64, branch-loop) — synced from `hematite-s3/src/asm/` |
 | `.gitignore` | `build/`, `sdkconfig*`, `managed_components/`, `dependencies.lock` |
 
 ## Build + run on hardware

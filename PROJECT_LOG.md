@@ -478,6 +478,45 @@ per lane per input element rather than the QACC broadcast) but *correct*.
 Documented in `benchmarks/espdl-baseline/README.md` under "Bespoke ACCX
 kernels".
 
+### Phase 14 — Optimized ACCX kernels (fast64 paths)
+
+The bespoke S8-ACCX kernels got a **fast path for `input_c == 64`**,
+exploiting the chip's eight TIE728 Q registers:
+
+* **conv1x1 (`s8_accx_conv1x1.S`)** — `.Lfast64`: the 4 input vectors stay
+  resident in `q0..q3` (loaded once), per output channel a single-level
+  hardware `loop a6` does 4 filter `VLD.128.IP` into `q4..q7` + 4
+  `VMULAS.S8.ACCX`. The general (branch-based, nested-loop-free) path covers
+  any other `in_c%16==0`.
+* **conv3x3 (`s8_accx_conv3x3.S`)** — `.Lc3fast64`: the 9 taps are fully
+  unrolled via a `TAP_64` macro (4 filter + 4 input `VLD.128.IP`, 4
+  `VMULAS.S8.ACCX` per tap), with loads hoisted 2 instructions ahead to hide
+  VLD latency; `row_delta` bridges rows. Uses a short-branch + long-jump
+  loop (`blt a8,a6; j done`) instead of hardware `loop`, because the ~350-byte
+  unrolled body exceeds LLVM-MC's `loop` fixup range and the 8-bit `bge`
+  range. Label collision `.Lfast64` (both files concatenated by
+  `global_asm!`) fixed by renaming the conv3x3 labels.
+* **Shared-file note**: the kernels are `include_str!`'d by Rust, so the wins
+  carry into `hematite-s3` automatically — but cargo does NOT rebuild a crate
+  when an `include_str!` file changes (`cargo clean -p hematite-s3` required;
+  an early `bench35` silently linked the stale kernel).
+
+Device results (`bench36`, ESP32-S3 @ 240 MHz, all bit-exact unchanged):
+
+| Row | Rust s3 cycles (min/med) | before | Δ |
+|---|---|---|---|
+| conv1x1 64x1x1x64 | 9937 / 9939 | 12593 / 12595 | 1.27x faster |
+| conv3x3 32x32 VALID | 15009334 / 15009361 | 35743533 / 35743561 | 2.38x faster |
+| fc 256→64 | 20133 / 20159 | 20133 / 20159 | unchanged (general path, in_c=256) |
+
+Kernel PURE costs (C harness, cycles): conv1x1 **996** (was 3422, 3.4x),
+conv3x3 **7353504** (≈6.2M instructions ≈ 1.1 instr/cycle — near the issue
+floor given the 8-Q-register limit; the 36-vector 3×3 window cannot stay
+resident). The scalar requantize epilogue is now the dominant full-API cost
+(conv1x1: 9939 − 996 ≈ 8943 cyc), and Rust's `requantize_1x1` is heavier
+than the C harness's — why Rust full is ~1.15–1.36x C full for the same
+kernel.
+
 ---
 
 ## 3. Known divergences and open technical debt
@@ -560,10 +599,11 @@ kernels".
 All 37 original plan tasks are complete and the Final Verification Wave
 approved. Hardware bring-up (Phase 9), the C-SIMD bit-exact output match
 (Phase 10), the per-operation all-SIMD comparison + relu fix (Phase 11),
-the prepared-kernel fast path (Phase 12), and the bespoke GPR-accumulator
-(ACCX) kernels (Phase 13) are complete; Phases 9-11 are committed, Phases
-12-13 are uncommitted. Host test suite: 80 suites, 0 failures, maintained
-throughout every change in this log (31 tests in `hematite-benchmarks`).
+the prepared-kernel fast path (Phase 12), the bespoke GPR-accumulator
+(ACCX) kernels (Phase 13), and the optimized fast64 ACCX paths (Phase 14)
+are complete; Phases 9-13 are committed, Phase 14 is uncommitted. Host test
+suite: 80 suites, 0 failures, maintained throughout every change in this
+log (31 tests in `hematite-benchmarks`).
 
 On-device benchmark state: all **9 SIMD-capable operations** (conv1x1,
 conv3x3, fc, max/avg-pool, relu, add/sub/mul) run on the real hardware.
@@ -571,11 +611,11 @@ The **weighted ops (conv1x1/conv3x3/fc) now run the bespoke ACCX kernels and
 are bit-exact vs the scalar reference** (0x0bea8225 / 0x0a181085 /
 0x32e35185); relu/add/sub/mul are bit-exact vs scalar; max/avg-pool run the
 vendored asm and are bit-exact vs the independent ESP-IDF C harness
-(`benchmarks/espdl-baseline`). Raw ACCX cycle costs: conv1x1 12595, conv3x3
-35743534 (full 30×30 image), fc 20068, max-pool 1892, avg-pool 7342, relu
-357, add 411, sub 491, mul 774. Other SRAM rows are legitimately scalar
-(pad/input_c/out-channel gates); PSRAM-tier rows require a PSRAM-equipped
-board.
+(`benchmarks/espdl-baseline`). Raw ACCX cycle costs (bench36, after the
+fast64 paths): conv1x1 9939, conv3x3 15009334 (full 30×30 image), fc 20068,
+max-pool 1892, avg-pool 7342, relu 357, add 411, sub 491, mul 774. Other
+SRAM rows are legitimately scalar (pad/input_c/out-channel gates); PSRAM-tier
+rows require a PSRAM-equipped board.
 
 The **prepared-kernel fast path** (Phase 12) closes the Rust wrapper
 overhead to ~1.0–2.2x of C raw-asm (was 2.5–5.5x): the SIMD gate runs once
@@ -587,12 +627,16 @@ checksums are bit-exact equal to the public s3 checksums on all 12 rows.
 The **bespoke ACCX kernels** (Phase 13) make the weighted-op SIMD output
 bit-exact vs scalar — closing the correctness gap the vendored QACC asm
 could never close (8-bit/16-bit saturating lanes). conv1x1 went from 2627
-cycles (vendored, wrong output) to 12595 cycles (ACCX, bit-exact).
+cycles (vendored, wrong output) to 12595 cycles (ACCX, bit-exact). Phase 14
+then added the fast64 paths (input-resident, unrolled taps), cutting
+conv1x1 to 9939 and conv3x3 from 35743533 to 15009334 cycles while keeping
+every checksum bit-exact.
 
 **Open decisions awaiting explicit direction:**
 1. Force-push the rewritten git history to `origin/main`?
 2. The `person_detect`/`mobilenet_v2` rounding divergence's practical
    impact on hardware (now that real timing exists).
-3. ACCX performance headroom: the element-wise S8-ACCX reduction is ~2.5x
-   the raw QACC asm; a blocked/tiled accumulation or dual-accumulator
-   interleave could close part of that gap while staying bit-exact.
+3. ACCX performance headroom: the scalar per-channel requantize epilogue is
+   now the dominant full-API cost (~8943 of conv1x1's 9939 cycles); a
+   vectorized or simplified requantize could close most of the Rust-vs-C
+   full-API gap. An fc fast path for in_c=256 (16 groups) is also open.
