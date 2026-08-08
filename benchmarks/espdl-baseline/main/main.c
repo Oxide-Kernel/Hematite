@@ -136,6 +136,46 @@ extern void dl_tie728_s8_add_w1_16_w2_16(int8_t *output, const int8_t *in1, cons
 extern void dl_tie728_s8_sub_w1_16_w2_16(int8_t *output, const int8_t *in1, const int8_t *in2, AddSubAlignedArgs *args);
 extern void dl_tie728_s8_mul_w1_16_w2_16(int8_t *output, const int8_t *in1, const int8_t *in2, MulAlignedArgs *args);
 
+/* S16 QACC probe (probe_s16.S): establishes whether VSMULAS.S16.QACC
+ * accumulates into 32-bit lanes and reveals the full 40-byte QACC store
+ * layout + the SRCMB.S16 shift-4/20 halves. */
+extern void probe_s16_qacc(const int16_t *input, const int16_t *filter,
+                           int32_t *out_qacc, int16_t *out_srcmb4,
+                           int16_t *out_srcmb20, int32_t c_div_x_1);
+extern void probe_s16_perchan(const int16_t *input, const int16_t *filter,
+                              int16_t *out16, int32_t c_div_x_1);
+extern void probe_accx(const int16_t *filter, const int16_t *input,
+                       int32_t *accx_out);
+extern void probe_accx_load(const int32_t *pattern, int32_t *accx_out);
+extern void probe_accx_mac_sweep(const int16_t *filter, const int16_t *input,
+                                 int32_t *out64);
+extern void probe_s8accx(const int8_t *filter, const int8_t *input,
+                         int32_t *out3);
+extern void s8_accx_conv1x1(const int8_t *input, const int8_t *filter,
+                            int32_t *acc_out, int32_t in_c, int32_t out_c);
+
+/* Vendored S16 conv2d kernel (dl_tie728_s16_conv2d.S) — takes int16 buffers.
+ * args: filter@48, mac_shift@64, bias@68, output_channel_div_8@96,
+ *       c_div_x_1@100. */
+typedef struct {
+    uint8_t  _pad0[48];
+    int16_t *filter;
+    uint8_t  _pad1[12];
+    int32_t  mac_shift;
+    int32_t *bias;
+    uint8_t  _pad2[4];
+    int32_t  activation_alpha;
+    uint8_t  _pad3[4];
+    int32_t  activation_shift;
+    uint8_t  _pad4[8];
+    int32_t  output_channel_div_8;
+    int32_t  c_div_x_1;
+    int16_t *filter_channel_factor;
+} Tie728S16ConvArgs;
+
+extern void dl_tie728_s16_conv2d_11cn(int16_t *output, const int16_t *input,
+                                      Tie728S16ConvArgs *args);
+
 /* ---- conv1x1 64x1x1x64 ---- */
 #define IN_C   64
 #define OUT_C  64
@@ -169,6 +209,7 @@ extern void dl_tie728_s8_mul_w1_16_w2_16(int8_t *output, const int8_t *in1, cons
 
 static int8_t  s_input[IN_C] __attribute__((aligned(16)));
 static int8_t  s_weights[WEIGHTS_LEN] __attribute__((aligned(16)));
+static int8_t  s_tw[WEIGHTS_LEN] __attribute__((aligned(16)));  /* transformed [g][ic][lane] */
 static int32_t s_bias[OUT_C] __attribute__((aligned(16)));
 static int8_t  s_output[OUT_C] __attribute__((aligned(16)));
 
@@ -206,6 +247,24 @@ static void fill_pattern_conv1x1(void) {
     for (int i = 0; i < WEIGHTS_LEN; i++) s_weights[i]= (int8_t)((i * 13 + 11) & 0xFF);
     for (int i = 0; i < OUT_C; i++)       s_bias[i]   = (int32_t)(i * 17 - 8);
     for (int i = 0; i < OUT_C; i++)       s_output[i] = 0;
+}
+
+/* TIE728 11cn filter layout: [g][ic][lane], dst[g*(in_c*16)+ic*16+lane]
+ * = src[(g*16+lane)*in_c + ic]  (src is [oc][ic]). */
+static void transform_weights_11cn(void) {
+    for (int g = 0; g < OUT_C / 16; g++) {
+        for (int ic = 0; ic < IN_C; ic++) {
+            for (int lane = 0; lane < 16; lane++) {
+                s_tw[g * (IN_C * 16) + ic * 16 + lane] =
+                    s_weights[(g * 16 + lane) * IN_C + ic];
+            }
+        }
+    }
+}
+
+static void fill_pattern_conv1x1_tw(void) {
+    fill_pattern_conv1x1();
+    transform_weights_11cn();
 }
 
 static void fill_pattern_conv3x3(void) {
@@ -256,6 +315,174 @@ static uint32_t fnv1a(const int8_t *data, size_t len) {
         h *= 16777619u;
     }
     return h;
+}
+
+static void dump_bytes(const char *tag, const int8_t *p, size_t len) {
+    printf("  %s =", tag);
+    for (size_t i = 0; i < len; i++) printf(" %02x", (uint8_t)p[i]);
+    printf("\n");
+}
+
+/* ---- S16 QACC probe (probe_s16.S) ----
+ * input=[1]*8, filter=[1..8 repeated in a 16-element buffer], c_div_x_1=0:
+ *   QACC[lane] = sum over 8 input pos of input[pos] * filter[lane]
+ *              = 8 * filter[lane]  ->  lanes [8,16,24,32,40,48,56,64]
+ * then a saturation probe with input=weights=127 over 1..4 chunks. */
+static void probe_s16(void) {
+    static int16_t in[8] __attribute__((aligned(16)));
+    static int16_t filt[16] __attribute__((aligned(16)));
+    static int32_t qacc_store[10] __attribute__((aligned(16)));
+    static int16_t s4[8] __attribute__((aligned(16)));
+    static int16_t s20[8] __attribute__((aligned(16)));
+    static const int16_t ramp[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+
+    printf("-- S16 QACC probe (VSMULAS.S16.QACC) --\n");
+    for (int i = 0; i < 8; i++) in[i] = 1;
+    for (int i = 0; i < 8; i++) { filt[i] = ramp[i]; filt[i + 8] = ramp[i]; }
+    probe_s16_qacc(in, filt, qacc_store, s4, s20, 0);
+    printf("  QACC store (40 bytes):");
+    for (int i = 0; i < 10; i++) printf(" %08x", (unsigned)qacc_store[i]);
+    printf("\n");
+    printf("  srcmb@4  =");
+    for (int i = 0; i < 8; i++) printf(" %04x", (unsigned)(uint16_t)s4[i]);
+    printf("\n  srcmb@20 =");
+    for (int i = 0; i < 8; i++) printf(" %04x", (unsigned)(uint16_t)s20[i]);
+    printf("\n  expect lanes 8,16,...,64 (input=1 filter=1..8) if 32-bit exact\n");
+
+    for (int i = 0; i < 8; i++) { in[i] = 127; filt[i] = 127; filt[i + 8] = 127; }
+    for (int cdiv = 0; cdiv <= 3; cdiv++) {
+        probe_s16_qacc(in, filt, qacc_store, s4, s20, cdiv);
+        printf("  127s c_div_x_1=%d (%d MACs/lane): QACC store =",
+               cdiv, (cdiv + 1) * 8);
+        for (int i = 0; i < 10; i++) printf(" %08x", (unsigned)qacc_store[i]);
+        printf("\n");
+    }
+
+    /* DIRECT vendored S16 kernel call: mac_shift=0 = plain SRCMB.S16@shift0.
+     * With input=[1]*8, filter=[1..8], 8 MACs -> lanes should be 8,16,...,64
+     * if VSMULAS.S16.QACC accumulates correctly. With 127s, 8 MACs -> 129032
+     * (low16 0xf808); 16+ MACs saturate if lanes are 16-bit. */
+    printf("-- vendored dl_tie728_s16_conv2d_11cn direct --\n");
+    static int16_t s16_out[8] __attribute__((aligned(16)));
+    static int16_t s16_perchan[16] __attribute__((aligned(16)));
+    Tie728S16ConvArgs sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.mac_shift = 0;
+    sa.bias = NULL;
+    sa.activation_alpha = 0;
+    sa.activation_shift = -1;
+    sa.output_channel_div_8 = 1;
+    sa.filter_channel_factor = NULL;
+    for (int i = 0; i < 8; i++) in[i] = 1;
+    for (int i = 0; i < 8; i++) { filt[i] = ramp[i]; filt[i + 8] = ramp[i]; }
+    sa.filter = filt;
+    sa.c_div_x_1 = 0;
+    dl_tie728_s16_conv2d_11cn(s16_out, in, &sa);
+    printf("  ramp in=1 filt=1..8 8MACs mac_shift=0 out =");
+    for (int i = 0; i < 8; i++) printf(" %d", (int)s16_out[i]);
+    printf("\n  (expect 8 16 24 32 40 48 56 64)\n");
+
+    /* clean all-ones sweep: in=[1]*8 filt=[1]*16, c_div_x_1=0..3 -> 8,16,24,32 */
+    for (int i = 0; i < 8; i++) in[i] = 1;
+    for (int i = 0; i < 16; i++) filt[i] = 1;
+    for (int cdiv = 0; cdiv <= 3; cdiv++) {
+        sa.c_div_x_1 = cdiv;
+        dl_tie728_s16_conv2d_11cn(s16_out, in, &sa);
+        printf("  ones c_div_x_1=%d (%d MACs) out =", cdiv, (cdiv + 1) * 8);
+        for (int i = 0; i < 8; i++) printf(" %d", (int)s16_out[i]);
+        printf("\n");
+    }
+    for (int i = 0; i < 8; i++) { in[i] = 127; filt[i] = 127; filt[i + 8] = 127; }
+    for (int cdiv = 0; cdiv <= 3; cdiv++) {
+        sa.c_div_x_1 = cdiv;
+        dl_tie728_s16_conv2d_11cn(s16_out, in, &sa);
+        printf("  127s c_div_x_1=%d (%d MACs) out =", cdiv, (cdiv + 1) * 8);
+        for (int i = 0; i < 8; i++) printf(" %d", (int)s16_out[i]);
+        printf("\n");
+    }
+
+    /* FULL per-channel extraction: 16 halfwords out of q0+q1 after VZIP.16.
+     * ramp (in=1 filt=1..8, 8 MACs): true accs 8..64. If S16 lanes are 32-bit
+     * these should appear as the 16 halfwords (lo/hi pairs). */
+    for (int i = 0; i < 8; i++) in[i] = 1;
+    for (int i = 0; i < 8; i++) { filt[i] = ramp[i]; filt[i + 8] = ramp[i]; }
+    probe_s16_perchan(in, filt, s16_perchan, 0);
+    printf("  perchan ramp 8MACs 16 halfwords =");
+    for (int i = 0; i < 16; i++) printf(" %d", (int)s16_perchan[i]);
+    printf("\n  (true accs 8 16 24 32 40 48 56 64; hi halves 0)\n");
+    for (int i = 0; i < 8; i++) { in[i] = 127; filt[i] = 127; filt[i + 8] = 127; }
+    for (int cdiv = 0; cdiv <= 3; cdiv++) {
+        probe_s16_perchan(in, filt, s16_perchan, cdiv);
+        printf("  perchan 127s c_div_x_1=%d (%d MACs) 16 halfwords =", cdiv, (cdiv + 1) * 8);
+        for (int i = 0; i < 16; i++) printf(" %d", (int)s16_perchan[i]);
+        printf("\n");
+    }
+}
+
+/* ---- ACCX probe (probe_accx.S) ----
+ * EE.VMULAS.S16.ACCX F, I: element-wise MAC. ACCX is 256-bit. SRS.ACCX extracts
+ * with pos {0,1} (selects 128-bit half) + GPR shift. Sweep to map lane layout.
+ * Ramp filter=[1..8], input=[1]*8: element-wise lanes after ONE MAC = 1..8.
+ * 127s: lanes = 127*127 = 16129 each. */
+static void probe_accx_run(void) {
+    static int16_t in[8] __attribute__((aligned(16)));
+    static int16_t filt[8] __attribute__((aligned(16)));
+    static int32_t accx_out[8] __attribute__((aligned(16)));
+    static int32_t sweep[64] __attribute__((aligned(16)));
+    static const int16_t ramp[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    static int32_t pattern[8] = {0x00000000, 0x00000001, 0x0000FFFF, 0xFFFF0000,
+                                 0x7FFFFFFF, 0x80000000, 0x12345678, 0x89ABCDEF};
+
+    printf("-- ACCX probe (VMULAS.S16.ACCX element-wise, ONE MAC) --\n");
+
+    printf("  LOAD probe: LD.ACCX.IP 8xint32 pattern -> SRS.ACCX pos0/1 shift0..3 =");
+    probe_accx_load(pattern, accx_out);
+    for (int i = 0; i < 8; i++) printf(" %08x", (unsigned)accx_out[i]);
+    printf("\n");
+
+    for (int i = 0; i < 8; i++) { in[i] = 1; filt[i] = ramp[i]; }
+    probe_accx_mac_sweep(filt, in, sweep);
+    printf("  SWEEP ramp filt=1..8 in=1 (ONE MAC; lanes should be 1..8):\n");
+    printf("    pos0 shifts 0..31:");
+    for (int i = 0; i < 32; i++) printf(" %d", (int)sweep[i]);
+    printf("\n    pos1 shifts 0..31:");
+    for (int i = 32; i < 64; i++) printf(" %d", (int)sweep[i]);
+    printf("\n");
+
+    for (int i = 0; i < 8; i++) { in[i] = 127; filt[i] = 127; }
+    probe_accx_mac_sweep(filt, in, sweep);
+    printf("  SWEEP 127s (ONE MAC; lanes should be 16129):\n");
+    printf("    pos0 shifts 0..31:");
+    for (int i = 0; i < 32; i++) printf(" %d", (int)sweep[i]);
+    printf("\n    pos1 shifts 0..31:");
+    for (int i = 32; i < 64; i++) printf(" %d", (int)sweep[i]);
+    printf("\n");
+}
+
+/* ---- S8 ACCX probe (probe_s8accx.S) ----
+ * EE.VMULAS.S8.ACCX F, I: 16-wide element MAC. Two identical MACs accumulated.
+ * If S8 products are 16-bit and lanes 32-bit: ramp in=[1]*16 filt=1..16
+ *   -> sum per MAC = 136; two MACs = 272.
+ * If products 8-bit saturating: 127*127 -> 127 per element -> 16*127*2 = 4064.
+ * SRS.ACCX shift0 = exact accumulator. */
+static void probe_s8accx_run(void) {
+    static int8_t in[16] __attribute__((aligned(16)));
+    static int8_t filt[16] __attribute__((aligned(16)));
+    static int32_t out3[3] __attribute__((aligned(16)));
+
+    printf("-- S8 ACCX probe (VMULAS.S8.ACCX 16-wide, TWO MACs) --\n");
+
+    for (int i = 0; i < 16; i++) { in[i] = 1; filt[i] = (int8_t)(i + 1); }
+    probe_s8accx(filt, in, out3);
+    printf("  ramp filt=1..16 in=1: TWO MACs = %d %d %d\n",
+           (int)out3[0], (int)out3[1], (int)out3[2]);
+    printf("  (shift0: expect 272 = 2*136 if 16-bit products / 32-bit lanes)\n");
+
+    for (int i = 0; i < 16; i++) { in[i] = 127; filt[i] = 127; }
+    probe_s8accx(filt, in, out3);
+    printf("  127s: TWO MACs = %d %d %d\n",
+           (int)out3[0], (int)out3[1], (int)out3[2]);
+    printf("  (shift0: 2*16*16129 = 516128 if 16-bit products; 4064 if 8-bit saturating)\n");
 }
 
 /* ---- scalar refs (mirror hematite-ref exactly) ---- */
@@ -388,8 +615,8 @@ static void scalar_mul(int8_t *out, const int8_t *a, const int8_t *b) {
 static void conv1x1_simd_entry(void) {
     Tie728ConvArgs a;
     memset(&a, 0, sizeof(a));
-    a.filter = s_weights;
-    a.mac_shift = 0;
+    a.filter = s_tw;            /* transformed [g][ic][lane] weights */
+    a.mac_shift = 1;            /* = 1 - output_shift(0), matches Rust bench12 */
     a.bias = s_bias;
     a.activation_alpha = 0;
     a.activation_shift = -1;
@@ -489,6 +716,81 @@ static void mul_simd_entry(void) {
     dl_tie728_s8_mul_w1_16_w2_16(s_e_out, s_e1, s_e2, &a);
 }
 
+/* ---- QACC extraction probe (debugging only) ----
+ * With input=0 and weights=0, QACC = bias after 128b_vector_bias, so the
+ * output bytes reveal how int32 bias values land in QACC lanes and how
+ * SRCMB.S8 + vector_round_result transform them. */
+static void probe_qacc(void) {
+    static const int32_t biasv[16] = {
+        0x00000000, 0x00000001, 0x0000FFFF, 0xFFFF0000,
+        0x7FFFFFFF, 0x80000000, 0x12345678, 0x89ABCDEF,
+        0x0000007F, 0x00000080, 0x0000FF00, 0x00FF0000,
+        0xFFFFFFFF, 0x00010001, 0x00000100, 0x01000000,
+    };
+    static int8_t probe_out[16] __attribute__((aligned(16)));
+    Tie728ConvArgs a;
+    for (int i = 0; i < IN_C; i++) s_input[i] = 0;
+    for (int i = 0; i < WEIGHTS_LEN; i++) s_weights[i] = 0;
+    for (int i = 0; i < 16; i++) s_bias[i] = biasv[i];
+    for (int shift = 0; shift < 4; shift++) {
+        memset(&a, 0, sizeof(a));
+        a.filter = s_weights;
+        a.mac_shift = shift;
+        a.bias = s_bias;
+        a.activation_alpha = 0;
+        a.activation_shift = -1;
+        a.output_channel_div_8 = 1;   /* one group of 16 */
+        a.c_div_x_1 = 0;              /* one input chunk */
+        a.filter_channel_factor = NULL;
+        dl_tie728_s8_conv2d_11cn(probe_out, s_input, &a);
+        dump_bytes("qacc", probe_out, 16);
+        printf("  ^ mac_shift=%d\n", shift);
+    }
+    /* input=1, weights=1, bias=0 -> lane value = number of MACs (=64) if lanes
+     * accumulate without saturation. */
+    for (int i = 0; i < IN_C; i++) s_input[i] = 1;
+    for (int i = 0; i < WEIGHTS_LEN; i++) s_weights[i] = 1;
+    for (int i = 0; i < 16; i++) s_bias[i] = 0;
+    for (int shift = 0; shift < 3; shift++) {
+        memset(&a, 0, sizeof(a));
+        a.filter = s_weights;
+        a.mac_shift = shift;
+        a.bias = s_bias;
+        a.activation_alpha = 0;
+        a.activation_shift = -1;
+        a.output_channel_div_8 = 1;
+        a.c_div_x_1 = IN_C / 16 - 1;  /* 3 chunks of 16 */
+        a.filter_channel_factor = NULL;
+        dl_tie728_s8_conv2d_11cn(probe_out, s_input, &a);
+        dump_bytes("qacc1s", probe_out, 16);
+        printf("  ^ mac_shift=%d input=1 weights=1 (64 MACs)\n", shift);
+    }
+
+    /* SATURATION-POINT PROBE: input=weights=127, bias=0, mac_shift=0, vary the
+     * number of 16-byte input chunks (c_div_x_1 = 0..4 -> 1..5 chunks = 16..80
+     * MACs per lane). 127*127 = 16129 per chunk.
+     *   16-bit lanes: exact up to 2 chunks (32258 < 32767), saturates/wraps at 3+.
+     *   32-bit lanes: exact for all (up to 129032). */
+    for (int i = 0; i < IN_C; i++) s_input[i] = 127;
+    for (int i = 0; i < WEIGHTS_LEN; i++) s_weights[i] = 127;
+    for (int i = 0; i < 16; i++) s_bias[i] = 0;
+    for (int cdiv = 0; cdiv <= 4; cdiv++) {
+        memset(&a, 0, sizeof(a));
+        a.filter = s_weights;
+        a.mac_shift = 0;
+        a.bias = s_bias;
+        a.activation_alpha = 0;
+        a.activation_shift = -1;
+        a.output_channel_div_8 = 1;
+        a.c_div_x_1 = cdiv;
+        a.filter_channel_factor = NULL;
+        dl_tie728_s8_conv2d_11cn(probe_out, s_input, &a);
+        dump_bytes("qacc127", probe_out, 16);
+        printf("  ^ c_div_x_1=%d (%d MACs/lane, expect %d if 16-bit ok, %d if 32-bit)\n",
+               cdiv, (cdiv + 1) * 16, (cdiv + 1) * 16 * 127 * 127, (cdiv + 1) * 16 * 127 * 127);
+    }
+}
+
 /* ---- generic bench harness ---- */
 typedef void (*bench_fn)(void);
 
@@ -525,15 +827,52 @@ void app_main(void) {
     printf("LABEL: real hardware (ESP32-S3 @ 240MHz), ESP-IDF v5.5.1, vendored dl_tie728 asm\n");
 
     init_quant_consts();
+
+    probe_qacc();
+    probe_s16();
+    probe_accx_run();
+    probe_s8accx_run();
     static int8_t s_ref[C3_OUT_LEN] __attribute__((aligned(16)));
     static int8_t s_ref64[FC_OUT_DIM] __attribute__((aligned(16)));
 
     /* conv1x1 64x1x1x64 */
     run_bench("conv1x1_s8 64x1x1x64 TIE728-SIMD (dl_tie728_s8_conv2d_11cn)",
-              fill_pattern_conv1x1, conv1x1_simd_entry, s_output, OUT_C);
+              fill_pattern_conv1x1_tw, conv1x1_simd_entry, s_output, OUT_C);
     scalar_conv1x1(s_ref64, s_input, s_weights, s_bias);
     printf("  scalar-ref fnv1a=0x%08x  (Rust bench10: ref=0x0bea8225 s3=0x5eee898e)\n",
            (unsigned)fnv1a((const int8_t *)s_ref64, OUT_C));
+    fill_pattern_conv1x1_tw();
+    conv1x1_simd_entry();
+    dump_bytes("s3 out", s_output, OUT_C);
+    dump_bytes("ref out", s_ref64, OUT_C);
+    printf("  s3 fnv1a=0x%08x (bench12 device s3=0x61f7a941, ref=0x0bea8225)\n",
+           (unsigned)fnv1a((const int8_t *)s_output, OUT_C));
+
+    /* --- BESPOKE ACCX conv1x1 (s8_accx_conv1x1.S): bit-exact GPR-accumulator --- */
+    {
+        static int32_t s_accx[OUT_C] __attribute__((aligned(16)));
+        static int8_t s_accx_out[OUT_C] __attribute__((aligned(16)));
+        fill_pattern_conv1x1_tw(); /* fills s_input + s_weights (raw) */
+        uint32_t t0 = read_ccount();
+        s8_accx_conv1x1(s_input, s_weights, s_accx, IN_C, OUT_C);
+        uint32_t t1 = read_ccount();
+        for (int oc = 0; oc < OUT_C; oc++)
+            s_accx_out[oc] = sat_cast(req(s_accx[oc] + s_bias[oc], 1 << 30, 0));
+        printf("== conv1x1_s8 64x1x1x64 BESPOKE-ACCX (s8_accx_conv1x1) ==\n");
+        printf("  cycles=%u | out_checksum(fnv1a)=0x%08x (ref=0x0bea8225)\n",
+               (unsigned)(t1 - t0),
+               (unsigned)fnv1a((const int8_t *)s_accx_out, OUT_C));
+        printf("  accx[0..7]=%d %d %d %d %d %d %d %d\n",
+               (int)s_accx[0], (int)s_accx[1], (int)s_accx[2], (int)s_accx[3],
+               (int)s_accx[4], (int)s_accx[5], (int)s_accx[6], (int)s_accx[7]);
+        printf("  out[0..7]=%d %d %d %d %d %d %d %d (ref=%d %d %d %d %d %d %d %d)\n",
+               (int)s_accx_out[0], (int)s_accx_out[1], (int)s_accx_out[2],
+               (int)s_accx_out[3], (int)s_accx_out[4], (int)s_accx_out[5],
+               (int)s_accx_out[6], (int)s_accx_out[7],
+               (int)s_ref64[0], (int)s_ref64[1], (int)s_ref64[2],
+               (int)s_ref64[3], (int)s_ref64[4], (int)s_ref64[5],
+               (int)s_ref64[6], (int)s_ref64[7]);
+    }
 
     /* conv3x3 32x32 64x3x3x64 */
     run_bench("conv3x3_s8 32x32,64x3x3x64 VALID TIE728-SIMD (dl_tie728_s8_conv2d_33cn)",
@@ -548,6 +887,33 @@ void app_main(void) {
     scalar_fc(s_ref64, s_fc_in, s_fc_w, s_fc_b);
     printf("  scalar-ref fnv1a=0x%08x  (Rust bench10: ref=0x32e35185 s3=0x16542aba)\n",
            (unsigned)fnv1a((const int8_t *)s_ref64, FC_OUT_DIM));
+
+    /* --- BESPOKE ACCX fc256 (s8_accx_conv1x1.S): bit-exact GPR-accumulator --- */
+    {
+        static int32_t s_fc_accx[FC_OUT_DIM] __attribute__((aligned(16)));
+        static int8_t s_fc_accx_out[FC_OUT_DIM] __attribute__((aligned(16)));
+        fill_pattern_fc(); /* fills s_fc_in + s_fc_w (raw) */
+        uint32_t t0 = read_ccount();
+        s8_accx_conv1x1(s_fc_in, s_fc_w, s_fc_accx, FC_IN_DIM, FC_OUT_DIM);
+        uint32_t t1 = read_ccount();
+        for (int oc = 0; oc < FC_OUT_DIM; oc++)
+            s_fc_accx_out[oc] = sat_cast(req(s_fc_accx[oc] + s_fc_b[oc], 1 << 30, 0));
+        printf("== fc_s8 256row,64out BESPOKE-ACCX (s8_accx_conv1x1) ==\n");
+        printf("  cycles=%u | out_checksum(fnv1a)=0x%08x (ref=0x32e35185)\n",
+               (unsigned)(t1 - t0),
+               (unsigned)fnv1a((const int8_t *)s_fc_accx_out, FC_OUT_DIM));
+        printf("  accx[0..7]=%d %d %d %d %d %d %d %d\n",
+               (int)s_fc_accx[0], (int)s_fc_accx[1], (int)s_fc_accx[2],
+               (int)s_fc_accx[3], (int)s_fc_accx[4], (int)s_fc_accx[5],
+               (int)s_fc_accx[6], (int)s_fc_accx[7]);
+        printf("  out[0..7]=%d %d %d %d %d %d %d %d (ref=%d %d %d %d %d %d %d %d)\n",
+               (int)s_fc_accx_out[0], (int)s_fc_accx_out[1], (int)s_fc_accx_out[2],
+               (int)s_fc_accx_out[3], (int)s_fc_accx_out[4], (int)s_fc_accx_out[5],
+               (int)s_fc_accx_out[6], (int)s_fc_accx_out[7],
+               (int)s_ref64[0], (int)s_ref64[1], (int)s_ref64[2],
+               (int)s_ref64[3], (int)s_ref64[4], (int)s_ref64[5],
+               (int)s_ref64[6], (int)s_ref64[7]);
+    }
 
     /* max pool 2x2x16 */
     run_bench("max_pool_s8 2x2x16 TIE728-SIMD (dl_tie728_s8_max_pool2d_22c1)",

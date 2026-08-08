@@ -640,6 +640,13 @@ pub struct SpecLayout {
     pub weights_len: usize,
     pub bias_len: usize,
     pub output_len: usize,
+    /// Byte length of the TIE728-layout weight transform region — equal to
+    /// `weights_len` for the SIMD-capable weighted ops (1×1/3×3 conv, fc),
+    /// 0 otherwise. The prepared/SIMD path needs weights in the asm's
+    /// `[g][ic][lane]` / `[g][tap][ic][lane]` layout, which is produced by
+    /// `transform_bufs` once per spec (a model-build-time op, kept outside the
+    /// timed window).
+    pub transform_len: usize,
 }
 
 fn shape_product(shape: &[i32; 4]) -> usize {
@@ -654,30 +661,35 @@ pub fn layout(spec: &KernelSpec) -> SpecLayout {
             weights_len: shape_product(&p.filter_shape),
             bias_len: p.filter_shape[0] as usize,
             output_len: shape_product(&p.output_shape),
+            transform_len: shape_product(&p.filter_shape),
         },
         KernelParams::Depthwise(p) => SpecLayout {
             input_len: shape_product(&p.input_shape),
             weights_len: shape_product(&p.filter_shape),
             bias_len: p.output_shape[3] as usize,
             output_len: shape_product(&p.output_shape),
+            transform_len: 0,
         },
         KernelParams::Fc(p) => SpecLayout {
             input_len: p.input_dim as usize,
             weights_len: p.input_dim as usize * p.output_dim as usize,
             bias_len: p.output_dim as usize,
             output_len: p.output_dim as usize,
+            transform_len: p.input_dim as usize * p.output_dim as usize,
         },
         KernelParams::Softmax(p) => SpecLayout {
             input_len: p.num_rows as usize * p.row_size as usize,
             weights_len: 0,
             bias_len: 0,
             output_len: p.num_rows as usize * p.row_size as usize,
+            transform_len: 0,
         },
         KernelParams::Pool(p) => SpecLayout {
             input_len: shape_product(&p.input_shape),
             weights_len: 0,
             bias_len: 0,
             output_len: shape_product(&p.output_shape),
+            transform_len: 0,
         },
         // Relu acts on a single flat int8 tensor: input_len == output_len,
         // no weights or bias. The element count is carried in the spec name
@@ -692,6 +704,7 @@ pub fn layout(spec: &KernelSpec) -> SpecLayout {
                 weights_len: 0,
                 bias_len: 0,
                 output_len: n,
+                transform_len: 0,
             }
         }
         // Elementwise ops consume input1=input slice, input2=weights slice
@@ -701,6 +714,7 @@ pub fn layout(spec: &KernelSpec) -> SpecLayout {
             weights_len: p.num_elements as usize,
             bias_len: 0,
             output_len: p.num_elements as usize,
+            transform_len: 0,
         },
     }
 }
@@ -711,6 +725,9 @@ pub struct SpecBufs<'a> {
     pub weights: &'a mut [i8],
     pub bias: &'a mut [i32],
     pub output: &'a mut [i8],
+    /// TIE728-layout transformed weights (see `SpecLayout::transform_len`).
+    /// Empty when the op needs no transform.
+    pub transformed: &'a mut [i8],
 }
 
 /// Reinterpret a byte slice as an int8 slice.
@@ -729,7 +746,8 @@ unsafe fn cast_i8(s: &mut [u8]) -> &mut [i8] {
 /// SIMD path requires 16-byte alignment for `EE.VLD.128` / `EE.VST.128`) and
 /// the bias on a 16-byte boundary too (the TIE728 SIMD kernels gate on a
 /// 16-aligned bias pointer — `conv1x1.rs`/`conv3x3.rs` check `b_ptr % 16 == 0`).
-/// The layout is `[input][pad][weights][pad][bias][pad][output]`.  Returns
+/// The layout is `[input][pad][weights][pad][bias][pad][output][pad][transformed]`.
+/// Returns
 /// [`KernelError::ScratchTooSmall`] when the arena cannot hold the working
 /// set.
 ///
@@ -748,13 +766,16 @@ pub fn carve_into<'a>(arena: &'a mut [u8], lay: &SpecLayout) -> Result<SpecBufs<
     let b_end = b_start + lay.bias_len * 4;
     let o_start = align16(b_end);
     let o_end = o_start + lay.output_len;
+    let t_start = align16(o_end);
+    let t_end = t_start + lay.transform_len;
 
-    if o_end > arena.len() {
+    if t_end > arena.len() {
         return Err(KernelError::ScratchTooSmall);
     }
 
     // Sequential disjoint splits: input, then weights, then bias region, then
-    // output.  The bias region is re-cast to `&mut [i32]`.
+    // output, then the transformed-weights region.  The bias region is
+    // re-cast to `&mut [i32]`.
     let (input_region, rest) = arena.split_at_mut(w_start);
     let input = unsafe { cast_i8(&mut input_region[in_start..in_end]) };
 
@@ -770,14 +791,18 @@ pub fn carve_into<'a>(arena: &'a mut [u8], lay: &SpecLayout) -> Result<SpecBufs<
         core::slice::from_raw_parts_mut(bias_region.as_mut_ptr() as *mut i32, lay.bias_len)
     };
 
-    let (output_region, _after) = rest.split_at_mut(lay.output_len);
+    let (output_region, rest) = rest.split_at_mut(lay.output_len);
     let output = unsafe { cast_i8(&mut output_region[..]) };
+
+    let (transform_region, _after) = rest.split_at_mut(lay.transform_len);
+    let transformed = unsafe { cast_i8(&mut transform_region[..]) };
 
     Ok(SpecBufs {
         input,
         weights,
         bias,
         output,
+        transformed,
     })
 }
 
@@ -796,6 +821,49 @@ pub fn fill_pattern(bufs: &mut SpecBufs<'_>) {
     }
     for v in bufs.output.iter_mut() {
         *v = 0;
+    }
+}
+
+/// Transform `bufs.weights` into the TIE728 SIMD layout in `bufs.transformed`
+/// for the SIMD-capable weighted ops (1×1/3×3 conv, fc); no-op otherwise.
+///
+/// This is the **model-build-time** weight permutation that makes the SIMD
+/// output bit-identical to the scalar reference (the vendored asm consumes the
+/// filter in `[g][ic][lane]` / `[g][tap][ic][lane]` order, not the caller's
+/// `[oc][ic]` / `[oc][fh][fw][ic]` OHWI order). It is kept OUTSIDE the timed
+/// benchmark window so the measured prepared/SIMD cost is pure kernel cost.
+/// Host-compilable and unit-tested.
+pub fn transform_bufs(spec: &KernelSpec, bufs: &mut SpecBufs<'_>) -> Result<(), KernelError> {
+    if bufs.transformed.is_empty() {
+        return Ok(());
+    }
+    match &spec.params {
+        KernelParams::Conv(p) => {
+            let input_c = p.filter_shape[3] as usize;
+            let out_channels = p.filter_shape[0] as usize;
+            if p.filter_shape[1] == 1 && p.filter_shape[2] == 1 {
+                hematite_s3::conv1x1::transform_weights_11cn(
+                    input_c,
+                    out_channels,
+                    bufs.weights,
+                    bufs.transformed,
+                )
+            } else {
+                hematite_s3::conv3x3::transform_weights_33cn(
+                    input_c,
+                    out_channels,
+                    bufs.weights,
+                    bufs.transformed,
+                )
+            }
+        }
+        KernelParams::Fc(p) => hematite_s3::conv1x1::transform_weights_11cn(
+            p.input_dim as usize,
+            p.output_dim as usize,
+            bufs.weights,
+            bufs.transformed,
+        ),
+        _ => Ok(()),
     }
 }
 
@@ -884,6 +952,25 @@ pub enum PreparedKernel {
 }
 
 impl PreparedKernel {
+    /// Whether this handle will dispatch to a TIE728 SIMD entry on this
+    /// target (device-only; always `false` on host, where SIMD is compiled
+    /// out). Used by the firmware to decide whether to pre-transform weights
+    /// into the SIMD layout before the timed window.
+    pub fn is_simd(&self) -> bool {
+        match self {
+            PreparedKernel::Conv1x1(h) => h.is_simd(),
+            PreparedKernel::Conv3x3(h) => h.is_simd(),
+            PreparedKernel::Fc(h) => h.is_simd(),
+            PreparedKernel::MaxPool(h) => h.is_simd(),
+            PreparedKernel::AvgPool(h) => h.is_simd(),
+            PreparedKernel::Relu(h) => h.is_simd(),
+            PreparedKernel::Add(h) => h.is_simd(),
+            PreparedKernel::Mul(h) => h.is_simd(),
+            PreparedKernel::Sub(h) => h.is_simd(),
+            PreparedKernel::Scalar => false,
+        }
+    }
+
     /// Run the prepared kernel. `spec` is only consulted for the `Scalar`
     /// fallback (depthwise/softmax); the handle variants dispatch directly.
     pub fn run(
@@ -1370,6 +1457,7 @@ mod tests {
             let mut weights = vec![0i8; lay.weights_len];
             let mut bias = vec![0i32; lay.bias_len];
             let mut output = vec![0i8; lay.output_len];
+            let mut transformed = vec![0i8; lay.transform_len];
             let mut scratch = vec![0u8; 0];
             {
                 let mut bufs = SpecBufs {
@@ -1377,6 +1465,7 @@ mod tests {
                     weights: &mut weights,
                     bias: &mut bias,
                     output: &mut output,
+                    transformed: &mut transformed,
                 };
                 fill_pattern(&mut bufs);
                 let s3_out = run_s3(spec, &mut bufs, &mut scratch)
@@ -1401,6 +1490,7 @@ mod tests {
             let mut weights = vec![0i8; lay.weights_len];
             let mut bias = vec![0i32; lay.bias_len];
             let mut output = vec![0i8; lay.output_len];
+            let mut transformed = vec![0i8; lay.transform_len];
             let mut scratch = vec![0u8; 0];
             {
                 let mut bufs = SpecBufs {
@@ -1408,6 +1498,7 @@ mod tests {
                     weights: &mut weights,
                     bias: &mut bias,
                     output: &mut output,
+                    transformed: &mut transformed,
                 };
                 let prepared = prepare_kernel(spec)
                     .unwrap_or_else(|e| panic!("{}: prepare_kernel failed: {e:?}", spec.name));
@@ -1422,6 +1513,140 @@ mod tests {
                 assert_eq!(
                     prepared_out, ref_out,
                     "{}: prepared output must be bit-identical to hematite-ref",
+                    spec.name
+                );
+            }
+        }
+    }
+
+    /// Emulate the bespoke ACCX SIMD reduction in Rust for the SIMD-eligible
+    /// conv/fc rows and assert the result is bit-identical to the scalar ref.
+    ///
+    /// This is the host-side proof that the ACCX kernels (raw `[oc][ic]` /
+    /// `[oc][fh][fw][ic]` weights, element-wise 16-wide reduction into a 32-bit
+    /// accumulator) plus the bit-exact requantize epilogue make the SIMD output
+    /// equal the scalar reference — no device needed. The emulation mirrors the
+    /// asm exactly: `acc[oc] = bias[oc] + Σ filter[oc*stride*in_c + k]·input[k]`
+    /// (1×1/FC) or the 9-tap 3×3 form, then per-channel requantize + clamp.
+    #[test]
+    fn accx_emulation_matches_ref_bit_exact() {
+        use hematite_int8::{multiply_by_quantized_multiplier, saturating_cast};
+        for spec in kernel_specs() {
+            let lay = layout(spec);
+            let mut input = vec![0i8; lay.input_len];
+            let mut weights = vec![0i8; lay.weights_len];
+            let mut bias = vec![0i32; lay.bias_len];
+            let mut output = vec![0i8; lay.output_len];
+            let mut transformed = vec![0i8; lay.transform_len];
+            let mut scratch = vec![0u8; 0];
+            {
+                let mut bufs = SpecBufs {
+                    input: &mut input,
+                    weights: &mut weights,
+                    bias: &mut bias,
+                    output: &mut output,
+                    transformed: &mut transformed,
+                };
+                fill_pattern(&mut bufs);
+                let ref_out = run_ref(spec, &mut bufs, &mut scratch)
+                    .unwrap_or_else(|e| panic!("{}: ref kernel rejected: {e}", spec.name));
+
+                // Only rows the ACCX gate accepts are SIMD-eligible weighted
+                // ops; the emulation must mirror the asm for exactly those.
+                let (in_c, out_c, taps) = match &spec.params {
+                    KernelParams::Conv(p) if p.filter_shape[1] == 1 && p.filter_shape[2] == 1 => {
+                        (p.filter_shape[3] as usize, p.filter_shape[0] as usize, 1)
+                    }
+                    KernelParams::Conv(p) => {
+                        (p.filter_shape[3] as usize, p.filter_shape[0] as usize, 9)
+                    }
+                    KernelParams::Fc(p) => {
+                        (p.input_dim as usize, p.output_dim as usize, 1)
+                    }
+                    _ => continue,
+                };
+                if !(in_c >= 16 && in_c % 16 == 0 && out_c >= 1) {
+                    continue;
+                }
+                let mut emu = vec![0i8; lay.output_len];
+                match &spec.params {
+                    KernelParams::Conv(p) => {
+                        let in_h = p.input_shape[1] as usize;
+                        let in_w = p.input_shape[2] as usize;
+                        let out_h = p.output_shape[1] as usize;
+                        let out_w = p.output_shape[2] as usize;
+                        let stride_h = p.stride_height as usize;
+                        let stride_w = p.stride_width as usize;
+                        let dil_h = p.dilation_height_factor as usize;
+                        let dil_w = p.dilation_width_factor as usize;
+                        for oh in 0..out_h {
+                            for ow in 0..out_w {
+                                for oc in 0..out_c {
+                                    let mut acc: i64 = 0;
+                                    for tap in 0..taps {
+                                        let (kh, kw) = if taps == 9 {
+                                            (tap / 3, tap % 3)
+                                        } else {
+                                            (0, 0)
+                                        };
+                                        let ih = oh * stride_h + kh * dil_h;
+                                        let iw = ow * stride_w + kw * dil_w;
+                                        if ih >= in_h || iw >= in_w {
+                                            continue;
+                                        }
+                                        for ic in 0..in_c {
+                                            let in_idx = (ih * in_w + iw) * in_c + ic;
+                                            // RAW [oc][tap][ic] — asm filter[(oc*taps+tap)*in_c+ic]
+                                            let w_idx = (oc * taps + tap) * in_c + ic;
+                                            acc += bufs.weights[w_idx] as i64
+                                                * bufs.input[in_idx] as i64;
+                                        }
+                                    }
+                                    let acc32 = (bufs.bias[oc] as i64 + acc).clamp(
+                                        i32::MIN as i64,
+                                        i32::MAX as i64,
+                                    ) as i32;
+                                    let scaled = multiply_by_quantized_multiplier(
+                                        acc32,
+                                        p.output_multiplier_per_channel[oc],
+                                        p.output_shift_per_channel[oc],
+                                    );
+                                    let clamped = (scaled + p.output_offset).clamp(
+                                        p.quantized_activation_min,
+                                        p.quantized_activation_max,
+                                    );
+                                    emu[(oh * out_w + ow) * out_c + oc] = saturating_cast(clamped);
+                                }
+                            }
+                        }
+                    }
+                    KernelParams::Fc(p) => {
+                        for oc in 0..out_c {
+                            let mut acc: i64 = 0;
+                            for ic in 0..in_c {
+                                // RAW [oc][ic] — asm filter[oc*in_c+ic]
+                                acc += bufs.weights[oc * in_c + ic] as i64 * bufs.input[ic] as i64;
+                            }
+                            let acc32 =
+                                (bufs.bias[oc] as i64 + acc).clamp(i32::MIN as i64, i32::MAX as i64)
+                                    as i32;
+                            let scaled = multiply_by_quantized_multiplier(
+                                acc32,
+                                p.output_multiplier_per_channel[oc],
+                                p.output_shift_per_channel[oc],
+                            );
+                            let clamped = (scaled + p.output_offset).clamp(
+                                p.quantized_activation_min,
+                                p.quantized_activation_max,
+                            );
+                            emu[oc] = saturating_cast(clamped);
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    emu, ref_out,
+                    "{}: ACCX SIMD emulation must equal scalar ref bit-exact",
                     spec.name
                 );
             }
@@ -1479,6 +1704,7 @@ mod tests {
             weights_len: 0,
             bias_len: 0,
             output_len: 0,
+            transform_len: 0,
         };
         assert!(matches!(
             carve_into(&mut small, &lay),
@@ -1494,6 +1720,7 @@ mod tests {
             weights_len: 11,
             bias_len: 3,
             output_len: 5,
+            transform_len: 2,
         };
         let bufs = carve_into(&mut arena, &lay).expect("fits");
         let (io, wo, oo) = (

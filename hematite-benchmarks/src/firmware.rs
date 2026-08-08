@@ -401,8 +401,21 @@ fn bench_kernel(spec: &KernelSpec, clock: &mut RealClock, canary: &mut StackCana
         Ok(b) => b,
         Err(_) => panic!("arena too small for spec '{}'", spec.name),
     };
-    let mut scratch = [0u8; 0];
+    // The ACCX kernels write raw int32 accumulators (out_c * 4 bytes) to the
+    // scratch buffer before Rust requantizes. 16-byte aligned so the scratch
+    // can back the kernel's aligned acc_out (and stays valid for any bench row).
+    #[repr(align(16))]
+    struct AlignedScratch([u8; 4096]);
+    let mut scratch = AlignedScratch([0u8; 4096]);
     let cfg = BenchmarkConfig::default();
+
+    // Prepared path: the SIMD gate runs ONCE here (outside the timed window);
+    // the timed closure only re-checks pointer alignment + dispatches. This
+    // isolates wrapper overhead the public-API path pays on every call.
+    let prepared = match crate::spec::prepare_kernel(spec) {
+        Ok(p) => p,
+        Err(_) => panic!("prepared '{}': prepare_kernel failed", spec.name),
+    };
 
     // Column 1 baseline: the same shape through the hematite-ref scalar
     // kernel on device (never a pre-filled number).
@@ -410,7 +423,7 @@ fn bench_kernel(spec: &KernelSpec, clock: &mut RealClock, canary: &mut StackCana
     let ref_log = run_repeated(
         clock,
         &mut || {
-            let _ = run_ref_kernel(spec, &mut bufs, &mut scratch);
+            let _ = run_ref_kernel(spec, &mut bufs, &mut scratch.0[..]);
         },
         &cfg,
     );
@@ -420,10 +433,13 @@ fn bench_kernel(spec: &KernelSpec, clock: &mut RealClock, canary: &mut StackCana
 
     // The s3 kernel (SIMD on device, scalar fallback where no SIMD path).
     fill_pattern(&mut bufs);
+    // NOTE: the bespoke ACCX kernels accumulate via an element-wise reduction
+    // (F[lane]·I[lane]) so the RAW [oc][ic] weight layout works directly —
+    // no weight transform is needed. The fill_pattern above is the raw layout.
     let s3_log = run_repeated(
         clock,
         &mut || {
-            let _ = run_kernel(spec, &mut bufs, &mut scratch);
+            let _ = run_kernel(spec, &mut bufs, &mut scratch.0[..]);
         },
         &cfg,
     );
@@ -431,18 +447,13 @@ fn bench_kernel(spec: &KernelSpec, clock: &mut RealClock, canary: &mut StackCana
     // the C-SIMD harness calling the identical TIE728 entry point.
     let s3_fnv = fnv1a(bufs.output);
 
-    // Prepared path: the SIMD gate runs ONCE here (outside the timed window);
-    // the timed closure only re-checks pointer alignment + dispatches. This
-    // isolates wrapper overhead the public-API path pays on every call.
-    let prepared = match crate::spec::prepare_kernel(spec) {
-        Ok(p) => p,
-        Err(_) => panic!("prepared '{}': prepare_kernel failed", spec.name),
-    };
-    fill_pattern(&mut bufs);
+    // Prepared path runs on the SAME (raw) weights and input — the s3 run
+    // writes only `output`, never input/weights/bias, so no refill is needed
+    // (a fill_pattern here would clobber the buffers the prepared path reads).
     let prepared_log = run_repeated(
         clock,
         &mut || {
-            let _ = prepared.run(spec, &mut bufs, &mut scratch);
+            let _ = prepared.run(spec, &mut bufs, &mut scratch.0[..]);
         },
         &cfg,
     );
