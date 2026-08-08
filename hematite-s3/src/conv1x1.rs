@@ -216,6 +216,10 @@ fn conv1x1_accx_dispatch(ctx: &mut Conv1x1AccxCtx<'_>) -> Result<bool, KernelErr
     let act_min = params.quantized_activation_min;
     let act_max = params.quantized_activation_max;
     let out_offset = params.output_offset;
+    let (uniform_mult, uniform_shift) = match crate::accx::uniform_scale(multipliers, shifts) {
+        Some((m, s)) => (m, s),
+        None => (0, i32::MIN),
+    };
 
     for oh in 0..out_h {
         for ow in 0..out_w {
@@ -241,6 +245,8 @@ fn conv1x1_accx_dispatch(ctx: &mut Conv1x1AccxCtx<'_>) -> Result<bool, KernelErr
                 act_max,
                 out_base: px_out,
                 output: ctx.output,
+                uniform_mult,
+                uniform_shift,
             });
         }
     }

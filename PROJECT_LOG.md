@@ -517,6 +517,45 @@ resident). The scalar requantize epilogue is now the dominant full-API cost
 than the C harness's — why Rust full is ~1.15–1.36x C full for the same
 kernel.
 
+### Phase 15 — Requantize fast paths (uniform-scale detection)
+
+The scalar per-channel requantize epilogue (`requantize_1x1`, ~140
+cyc/channel) had become the dominant full-API cost: four slice bounds
+checks per channel plus an i64 `multiply_by_quantized_multiplier` per
+iteration. `hematite-s3/src/accx.rs` now:
+
+* **`uniform_scale(mult, shift)`** — scans the per-channel arrays once
+  (in the dispatcher, *outside* the pixel loop for conv3x3) and returns
+  `Some((m, s))` when every channel shares the same scale.
+* **`ReqCtx` gains `uniform_mult`/`uniform_shift`** (with
+  `uniform_shift == i32::MIN` meaning "per-channel"). The dispatchers
+  (conv1x1 / fc / conv3x3) populate them from `uniform_scale`.
+* **`requantize_1x1` fast paths**, bit-identical to the i64 reference:
+  * `mult == 1<<30, shift == 1` — **identity**: `scaled == acc` (no
+    fixed-point multiply at all).
+  * `mult == 1<<30, shift == 0` — `(acc + 1) >> 1`, the common
+    identity-mult bench scale.
+  * any other uniform pair — the scale is **hoisted** (round/total_shift
+    and mult live in registers; same i64 arithmetic).
+  * per-channel (mixed) — the general path, now with **one upfront length
+    assert + unchecked indexing** instead of four per-iteration bounds
+    checks.
+
+Device results (`bench37`, ESP32-S3 @ 240 MHz, all checksums still
+bit-exact — conv1x1 `0x0bea8225`, conv3x3 `0x0a181085`, fc `0x32e35185`):
+
+| Row | bench36 | bench37 | Δ |
+|---|---|---|---|
+| conv1x1 64x1x1x64 | 9939 / 9939 | **5041 / 5041** | 1.97x |
+| conv3x3 32x32 VALID | 15009334 / 15009361 | **9511784 / 9511785** | 1.58x |
+| fc 256→64 | 20133 / 20159 | **15293 / 15294** | 1.32x |
+
+Host tests: two new unit tests in `accx.rs`
+(`requantize_fast_paths_match_reference` — the fast paths equal the i64
+reference across uniform and per-channel cases, boundary/saturation
+values included; `uniform_scale_detects_uniformity`). Suite: 31
+`hematite-benchmarks` + 2 `hematite-s3` tests, all green.
+
 ---
 
 ## 3. Known divergences and open technical debt
@@ -600,10 +639,11 @@ All 37 original plan tasks are complete and the Final Verification Wave
 approved. Hardware bring-up (Phase 9), the C-SIMD bit-exact output match
 (Phase 10), the per-operation all-SIMD comparison + relu fix (Phase 11),
 the prepared-kernel fast path (Phase 12), the bespoke GPR-accumulator
-(ACCX) kernels (Phase 13), and the optimized fast64 ACCX paths (Phase 14)
-are complete; Phases 9-13 are committed, Phase 14 is uncommitted. Host test
-suite: 80 suites, 0 failures, maintained throughout every change in this
-log (31 tests in `hematite-benchmarks`).
+(ACCX) kernels (Phase 13), the optimized fast64 ACCX paths (Phase 14), and
+the requantize fast paths (Phase 15) are complete; Phases 9-14 are
+committed, Phase 15 is uncommitted. Host test suite: 80 suites, 0
+failures, maintained throughout every change in this log (31 tests in
+`hematite-benchmarks` + 2 in `hematite-s3`).
 
 On-device benchmark state: all **9 SIMD-capable operations** (conv1x1,
 conv3x3, fc, max/avg-pool, relu, add/sub/mul) run on the real hardware.
@@ -611,11 +651,12 @@ The **weighted ops (conv1x1/conv3x3/fc) now run the bespoke ACCX kernels and
 are bit-exact vs the scalar reference** (0x0bea8225 / 0x0a181085 /
 0x32e35185); relu/add/sub/mul are bit-exact vs scalar; max/avg-pool run the
 vendored asm and are bit-exact vs the independent ESP-IDF C harness
-(`benchmarks/espdl-baseline`). Raw ACCX cycle costs (bench36, after the
-fast64 paths): conv1x1 9939, conv3x3 15009334 (full 30×30 image), fc 20068,
-max-pool 1892, avg-pool 7342, relu 357, add 411, sub 491, mul 774. Other
-SRAM rows are legitimately scalar (pad/input_c/out-channel gates); PSRAM-tier
-rows require a PSRAM-equipped board.
+(`benchmarks/espdl-baseline`). Raw ACCX cycle costs (bench37, after the
+fast64 paths + requantize fast paths): conv1x1 5041, conv3x3 9511784 (full
+30×30 image), fc 15293, max-pool 1892, avg-pool 7342, relu 357, add 411,
+sub 491, mul 774. Other SRAM rows are legitimately scalar
+(pad/input_c/out-channel gates); PSRAM-tier rows require a PSRAM-equipped
+board.
 
 The **prepared-kernel fast path** (Phase 12) closes the Rust wrapper
 overhead to ~1.0–2.2x of C raw-asm (was 2.5–5.5x): the SIMD gate runs once
@@ -630,13 +671,15 @@ could never close (8-bit/16-bit saturating lanes). conv1x1 went from 2627
 cycles (vendored, wrong output) to 12595 cycles (ACCX, bit-exact). Phase 14
 then added the fast64 paths (input-resident, unrolled taps), cutting
 conv1x1 to 9939 and conv3x3 from 35743533 to 15009334 cycles while keeping
-every checksum bit-exact.
+every checksum bit-exact. Phase 15 added the requantize fast paths
+(uniform-scale detection + unchecked indexing), cutting conv1x1 to 5041,
+conv3x3 to 9511784 and fc to 15293 cycles — full-API now lands ~1.3–2x of
+the raw C kernel numbers.
 
 **Open decisions awaiting explicit direction:**
 1. Force-push the rewritten git history to `origin/main`?
 2. The `person_detect`/`mobilenet_v2` rounding divergence's practical
    impact on hardware (now that real timing exists).
-3. ACCX performance headroom: the scalar per-channel requantize epilogue is
-   now the dominant full-API cost (~8943 of conv1x1's 9939 cycles); a
-   vectorized or simplified requantize could close most of the Rust-vs-C
-   full-API gap. An fc fast path for in_c=256 (16 groups) is also open.
+3. ACCX performance headroom: an fc fast path for in_c=256 (16 groups)
+   is the remaining open kernel-side lever; the requantize is no longer
+   the dominant cost.

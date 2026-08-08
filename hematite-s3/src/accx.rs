@@ -76,6 +76,12 @@ pub(crate) fn accx_eligible_3x3(input_c: usize, out_c: usize) -> bool {
 /// Bundled into a single struct passed by `&mut` because the Xtensa LLVM
 /// backend miscompiles the multi-arg (9-slot) call site on device — the same
 /// class of bug as the `dispatch_fc` inline regression. A 1-arg call is safe.
+///
+/// `uniform_mult`/`uniform_shift` are the fast-path hint computed once by the
+/// dispatcher: when all channels share the same `mult`/`shift`, `requantize_1x1`
+/// hoists the fixed-point scale out of the loop (and even skips it entirely for
+/// the identity pair). `uniform_shift == i32::MIN` means "per-channel" (the
+/// general path).
 #[repr(C)]
 pub(crate) struct ReqCtx<'a> {
     pub accs: &'a [i32],
@@ -87,6 +93,35 @@ pub(crate) struct ReqCtx<'a> {
     pub act_max: i32,
     pub out_base: usize,
     pub output: &'a mut [i8],
+    /// Uniform (mult, shift) shared by every channel, or `(0, i32::MIN)` for
+    /// the general per-channel path.
+    pub uniform_mult: i32,
+    pub uniform_shift: i32,
+}
+
+/// Returns `Some((mult, shift))` when every channel shares the same scale.
+///
+/// `None` (empty or mixed) means the per-channel general path.
+#[inline]
+pub(crate) fn uniform_scale(multipliers: &[i32], shifts: &[i32]) -> Option<(i32, i32)> {
+    let m = *multipliers.first()?;
+    let s = *shifts.first()?;
+    if multipliers.iter().all(|&x| x == m) && shifts.iter().all(|&x| x == s) {
+        Some((m, s))
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn clamp(v: i32, lo: i32, hi: i32) -> i32 {
+    if v > hi {
+        hi
+    } else if v < lo {
+        lo
+    } else {
+        v
+    }
 }
 
 /// Shared per-channel requantize epilogue (bit-exact TFLite semantics).
@@ -95,24 +130,101 @@ pub(crate) struct ReqCtx<'a> {
 /// `output_offset`, activation clamp and saturating cast — the exact scalar
 /// reference arithmetic.
 ///
+/// Fast paths (selected via `uniform_mult`/`uniform_shift`):
+/// * `mult == 1<<30, shift == 1` — identity scale: `scaled == acc`.
+/// * `mult == 1<<30, shift == 0` — `(acc + 1) >> 1`, the common identity-mult
+///   bench scale (verified bit-identical to
+///   `multiply_by_quantized_multiplier(acc, 1<<30, 0)` for all i32 `acc`).
+/// * any other uniform pair — the fixed-point scale is hoisted (same i64
+///   arithmetic, but `round`/`total_shift` and `mult` live in registers).
+///
+/// Lengths are validated ONCE up front; the hot loops index unchecked. This
+/// removes the four per-iteration slice bounds checks the original loop paid.
+///
 /// `#[inline(never)]`: when inlined, the Xtensa LLVM backend miscompiles the
 /// `accs.iter()` loop bound (the write index runs one past `output.len()`,
 /// panicking `index out of bounds`) — same class of bug as the earlier
 /// `dispatch_fc` inline regression. Keeping this call separate is required.
 #[inline(never)]
 pub(crate) fn requantize_1x1(ctx: &mut ReqCtx<'_>) {
-    for (oc, &raw) in ctx.accs.iter().enumerate() {
-        let acc = raw + ctx.bias[oc];
-        let scaled = multiply_by_quantized_multiplier(acc, ctx.multipliers[oc], ctx.shifts[oc]);
-        let with_offset = scaled + ctx.output_offset;
-        let clamped = if with_offset > ctx.act_max {
-            ctx.act_max
-        } else if with_offset < ctx.act_min {
-            ctx.act_min
+    let n = ctx.accs.len();
+    assert!(
+        n <= ctx.bias.len() && n <= ctx.multipliers.len() && n <= ctx.shifts.len(),
+        "requantize: out_c {n} exceeds bias/mult/shift len ({}/{}/{})",
+        ctx.bias.len(),
+        ctx.multipliers.len(),
+        ctx.shifts.len()
+    );
+    assert!(
+        ctx.out_base + n <= ctx.output.len(),
+        "requantize: out_base {} + {n} > output.len {}",
+        ctx.out_base,
+        ctx.output.len()
+    );
+
+    let out_offset = ctx.output_offset;
+    let act_min = ctx.act_min;
+    let act_max = ctx.act_max;
+    let out_base = ctx.out_base;
+
+    if ctx.uniform_shift != i32::MIN {
+        let mult = ctx.uniform_mult;
+        let shift = ctx.uniform_shift;
+        if mult == 1 << 30 && shift == 1 {
+            // Identity scale: scaled == acc (no fixed-point multiply).
+            for (oc, &raw) in ctx.accs.iter().enumerate() {
+                let acc = raw + unsafe { *ctx.bias.get_unchecked(oc) };
+                let c = clamp(acc + out_offset, act_min, act_max);
+                unsafe {
+                    *ctx.output.get_unchecked_mut(out_base + oc) = saturating_cast(c);
+                }
+            }
+        } else if mult == 1 << 30 && shift == 0 {
+            // (acc + 1) >> 1 — exact for all i32 acc (see doc comment).
+            for (oc, &raw) in ctx.accs.iter().enumerate() {
+                let acc = raw + unsafe { *ctx.bias.get_unchecked(oc) };
+                let scaled = ((acc as i64 + 1) >> 1) as i32;
+                let c = clamp(scaled + out_offset, act_min, act_max);
+                unsafe {
+                    *ctx.output.get_unchecked_mut(out_base + oc) = saturating_cast(c);
+                }
+            }
         } else {
-            with_offset
-        };
-        ctx.output[ctx.out_base + oc] = saturating_cast(clamped);
+            // General uniform scale — hoisted round/total_shift, same i64
+            // arithmetic as multiply_by_quantized_multiplier.
+            let total_shift = 31i64 - i64::from(shift);
+            let round = 1i64 << (total_shift - 1);
+            for (oc, &raw) in ctx.accs.iter().enumerate() {
+                let acc = raw + unsafe { *ctx.bias.get_unchecked(oc) };
+                let result = i64::from(acc) * i64::from(mult) + round;
+                let result = result >> total_shift;
+                let scaled = if result > i64::from(i32::MAX) {
+                    i32::MAX
+                } else if result < i64::from(i32::MIN) {
+                    i32::MIN
+                } else {
+                    result as i32
+                };
+                let c = clamp(scaled + out_offset, act_min, act_max);
+                unsafe {
+                    *ctx.output.get_unchecked_mut(out_base + oc) = saturating_cast(c);
+                }
+            }
+        }
+    } else {
+        // Per-channel mult/shift — the general path.
+        for (oc, &raw) in ctx.accs.iter().enumerate() {
+            let acc = raw + unsafe { *ctx.bias.get_unchecked(oc) };
+            let scaled = multiply_by_quantized_multiplier(
+                acc,
+                unsafe { *ctx.multipliers.get_unchecked(oc) },
+                unsafe { *ctx.shifts.get_unchecked(oc) },
+            );
+            let c = clamp(scaled + out_offset, act_min, act_max);
+            unsafe {
+                *ctx.output.get_unchecked_mut(out_base + oc) = saturating_cast(c);
+            }
+        }
     }
 }
 
@@ -183,3 +295,117 @@ mod device {
 
 #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
 pub(crate) use device::*;
+
+#[cfg(test)]
+mod tests {
+    extern crate alloc;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use super::*;
+
+    /// Reference requantize exactly as the scalar kernels compute it.
+    fn ref_requantize(
+        raw: i32,
+        bias: i32,
+        mult: i32,
+        shift: i32,
+        out_offset: i32,
+        act_min: i32,
+        act_max: i32,
+    ) -> i8 {
+        let acc = raw + bias;
+        let scaled = multiply_by_quantized_multiplier(acc, mult, shift);
+        let c = clamp(scaled + out_offset, act_min, act_max);
+        saturating_cast(c)
+    }
+
+    fn run_fast_path(
+        accs: &[i32],
+        bias: &[i32],
+        multipliers: &[i32],
+        shifts: &[i32],
+        out_offset: i32,
+        act_min: i32,
+        act_max: i32,
+        uniform: Option<(i32, i32)>,
+    ) -> Vec<i8> {
+        let n = accs.len();
+        let mut out = vec![0i8; n];
+        let (uniform_mult, uniform_shift) = match uniform {
+            Some((m, s)) => (m, s),
+            None => (0, i32::MIN),
+        };
+        requantize_1x1(&mut ReqCtx {
+            accs,
+            bias,
+            multipliers,
+            shifts,
+            output_offset: out_offset,
+            act_min,
+            act_max,
+            out_base: 0,
+            output: &mut out,
+            uniform_mult,
+            uniform_shift,
+        });
+        out
+    }
+
+    #[test]
+    fn requantize_fast_paths_match_reference() {
+        // Deterministic pseudo-random-ish accumulators spanning negative,
+        // positive, saturating, and near-boundary values.
+        let accs: Vec<i32> = (0..64)
+            .map(|i| {
+                let x = (i as i64 * 2654435761) % (1 << 20) - (1 << 19); // ~±512k
+                x as i32
+            })
+            .collect();
+        let bias: Vec<i32> = (0..64).map(|i| (i as i32) * 7919 - 100_000).collect();
+        let (min, max) = (-128, 127);
+
+        let cases: Vec<(i32, i32)> = vec![
+            (1 << 30, 0), // half-round fast path
+            (1 << 30, 1), // identity fast path
+            (1 << 30, 2), // hoisted uniform
+            (1 << 29, 1), // general uniform
+            (1 << 30, -1),
+            (1 << 28, 3),
+        ];
+
+        for (mult, shift) in cases {
+            let muls = vec![mult; 64];
+            let shifts = vec![shift; 64];
+            let got = run_fast_path(&accs, &bias, &muls, &shifts, 0, min, max, Some((mult, shift)));
+            for (oc, &g) in got.iter().enumerate() {
+                let want = ref_requantize(accs[oc], bias[oc], mult, shift, 0, min, max);
+                assert_eq!(
+                    g, want,
+                    "uniform ({mult},{shift}) channel {oc}: fast {g} != ref {want}"
+                );
+            }
+        }
+
+        // Per-channel (general) path with mixed multipliers/shifts.
+        let muls: Vec<i32> = (0..64).map(|i| (1 << 30) - i * 7919).collect();
+        let shifts: Vec<i32> = (0..64).map(|i| if i % 2 == 0 { 0 } else { 1 }).collect();
+        let got = run_fast_path(&accs, &bias, &muls, &shifts, 7, -100, 100, None);
+        for (oc, &g) in got.iter().enumerate() {
+            let want = ref_requantize(accs[oc], bias[oc], muls[oc], shifts[oc], 7, -100, 100);
+            assert_eq!(g, want, "per-channel channel {oc}: fast {g} != ref {want}");
+        }
+    }
+
+    #[test]
+    fn uniform_scale_detects_uniformity() {
+        assert_eq!(uniform_scale(&[1 << 30; 64], &[0; 64]), Some((1 << 30, 0)));
+        assert_eq!(uniform_scale(&[1 << 30; 64], &[1; 64]), Some((1 << 30, 1)));
+        assert_eq!(uniform_scale(&[], &[]), None);
+        let mut m = [1 << 30; 64];
+        m[7] = 123;
+        assert_eq!(uniform_scale(&m, &[0; 64]), None);
+        let mut s = [0; 64];
+        s[3] = 2;
+        assert_eq!(uniform_scale(&[1 << 30; 64], &s), None);
+    }
+}

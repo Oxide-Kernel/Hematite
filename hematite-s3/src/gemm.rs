@@ -135,11 +135,14 @@ fn fc_accx_dispatch(ctx: &mut FcAccxCtx<'_>) -> Result<bool, KernelError> {
     let act_min = params.quantized_activation_min;
     let act_max = params.quantized_activation_max;
     let out_offset = params.output_offset;
+    let (uniform_mult, uniform_shift) = match crate::accx::uniform_scale(multipliers, shifts) {
+        Some((m, s)) => (m, s),
+        None => (0, i32::MIN),
+    };
 
     unsafe {
         crate::accx::accx_conv1x1(in_ptr, w_ptr, accs, input_dim, output_dim);
     }
-    // TEMP-DEBUG: requantize re-enabled for call-site diffing.
     let acc_slice = unsafe { core::slice::from_raw_parts_mut(accs, output_dim) };
     crate::accx::requantize_1x1(&mut crate::accx::ReqCtx {
         accs: acc_slice,
@@ -151,6 +154,8 @@ fn fc_accx_dispatch(ctx: &mut FcAccxCtx<'_>) -> Result<bool, KernelError> {
         act_max,
         out_base: 0,
         output: ctx.output,
+        uniform_mult,
+        uniform_shift,
     });
     Ok(true)
 }

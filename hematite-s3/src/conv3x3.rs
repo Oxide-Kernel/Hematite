@@ -226,6 +226,10 @@ fn conv3x3_accx_dispatch(ctx: &mut Conv3x3AccxCtx<'_>) -> Result<bool, KernelErr
     let act_min = params.quantized_activation_min;
     let act_max = params.quantized_activation_max;
     let out_offset = params.output_offset;
+    let (uniform_mult, uniform_shift) = match crate::accx::uniform_scale(multipliers, shifts) {
+        Some((m, s)) => (m, s),
+        None => (0, i32::MIN),
+    };
     let stride_h = params.stride_height as usize;
     let stride_w = params.stride_width as usize;
     let row_delta = if in_w >= 3 { (in_w - 3) * input_c } else { 0 };
@@ -248,6 +252,8 @@ fn conv3x3_accx_dispatch(ctx: &mut Conv3x3AccxCtx<'_>) -> Result<bool, KernelErr
                 act_max,
                 out_base: po,
                 output: ctx.output,
+                uniform_mult,
+                uniform_shift,
             });
         }
     }

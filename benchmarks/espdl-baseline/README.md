@@ -189,29 +189,37 @@ inline-asm or high-arg-count call site):
    (no MaybeUninit pointer-cast writes) and pin every asm operand to an
    explicit register (`in("a10")`..`in("a13")`, `callx8 a13`).
 
-## Optimized ACCX kernels (Phase 14)
+## Optimized ACCX kernels (Phase 14 + 15)
 
 The bespoke S8-ACCX kernels got a **fast path for `input_c == 64`** (`bench36`
-device report, ESP32-S3 @ 240 MHz, all checksums still bit-exact):
+device report, ESP32-S3 @ 240 MHz, all checksums still bit-exact), and the
+Rust requantize epilogue got **uniform-scale fast paths** (`bench37`):
 
-| Operation (row) | kernel path | C PURE cycles | Rust s3 full cycles | Rust s3 (before) |
+| Operation (row) | kernel path | C PURE cycles | Rust s3 full (bench36) | Rust s3 full (bench37) |
 |---|---|---|---|---|
-| conv1x1 64x1x1x64 | fast64 (input resident q0..q3, `loop a6`) | **996** | **9937 / 9939** | 12593 / 12595 |
-| conv3x3 32x32 64x3x3x64 VALID | fast64 (9 taps unrolled, 8 VLD + 4 VMULAS per tap) | **7353504** | **15009334 / 15009361** | 35743533 / 35743561 |
-| fc 256→64 | general path (in_c=256, 16 groups — no fast path) | 10334 | 20133 / 20159 | 20133 / 20159 |
+| conv1x1 64x1x1x64 | fast64 (input resident q0..q3, `loop a6`) | **996** | 9937 / 9939 | **5041 / 5041** |
+| conv3x3 32x32 64x3x3x64 VALID | fast64 (9 taps unrolled, 8 VLD + 4 VMULAS per tap) | **7353504** | 15009334 / 15009361 | **9511784 / 9511785** |
+| fc 256→64 | general path (in_c=256, 16 groups — no fast path) | 10334 | 20133 / 20159 | **15293 / 15294** |
 
 - `conv1x1` kernel PURE cost dropped **3.4x** (3422 → 996 cyc); full-API
-  (kernel + Rust requantize) went 12593 → **9939** cyc.
-- `conv3x3` full-API dropped **2.4x** (35743533 → **15009334** cyc). The PURE
-  kernel (7.35M cyc = 6.2M instructions over 900 px × 64 oc × 9 taps) is near
-  the issue-rate floor given the chip exposes only **8 TIE728 Q registers** —
-  the 36-vector 3×3 input window cannot stay resident, so each tap re-loads
-  4 input + 4 filter vectors per 4 MACs.
-- The two languages measure the **same kernel** (shared `.S` files); Rust full
-  is ~1.15–1.36x C full because the Rust `requantize_1x1` epilogue
-  (`#[inline(never)]`, i64 `multiply_by_quantized_multiplier`) is heavier than
-  the C scalar requantize — requantize is now the dominant full-API cost
-  (conv1x1: 9939 − 996 ≈ 8943 cyc).
+  (kernel + Rust requantize) went 12593 → 9939 (bench36) → **5041** (bench37).
+- `conv3x3` full-API dropped **2.4x** (35743533 → **15009334** cyc) with the
+  fast64 path, then a further **1.58x** (→ **9511784** cyc) from the requantize
+  fast paths. The PURE kernel (7.35M cyc = 6.2M instructions over 900 px × 64
+  oc × 9 taps) is near the issue-rate floor given the chip exposes only **8
+  TIE728 Q registers** — the 36-vector 3×3 input window cannot stay resident,
+  so each tap re-loads 4 input + 4 filter vectors per 4 MACs.
+- Phase 15 (`hematite-s3/src/accx.rs`): `uniform_scale()` scans the per-channel
+  arrays once (outside the pixel loop), and `requantize_1x1` takes
+  `uniform_mult`/`uniform_shift` hints — identity `(1<<30,1)`, half-round
+  `(1<<30,0)` → `(acc+1)>>1`, hoisted general-uniform, or per-channel with one
+  upfront length assert + unchecked indexing instead of four per-iteration
+  bounds checks. All fast paths verified bit-identical to the i64 reference
+  (unit tests `requantize_fast_paths_match_reference`,
+  `uniform_scale_detects_uniformity`).
+- The two languages measure the **same kernel** (shared `.S` files); the
+  remaining Rust-vs-C full gap is the Rust dispatch + the (now much lighter)
+  requantize epilogue.
 
 Engineering notes:
 
