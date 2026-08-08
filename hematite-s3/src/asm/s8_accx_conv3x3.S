@@ -15,13 +15,15 @@
 # input row stride is row_delta + 3*in_c.
 #
 # Optimization (this revision):
-#   * Fast path for in_c == 64: 9 taps fully unrolled. This TIE exposes only
-#     8 Q registers (q0..q7), so the 3x3 window (36 vectors) cannot be kept
-#     resident. Per tap we software-pipeline 4 filter vectors (q0..q3) against
-#     4 input vectors (q4..q7), interleaving loads and MACs to hide VLD
-#     latency. The 3 columns of a row are loaded contiguously (VLD.IP), and
-#     `row_delta` bridges rows. Single-level hardware `loop` over output
-#     channels (nested hardware loops are unreliable on this TIE/LLVM combo).
+#   * Fast paths for in_c == 16 / 32 / 64: 9 taps fully unrolled. This TIE
+#     exposes only 8 Q registers (q0..q7), so the 3x3 window (36 vectors)
+#     cannot be kept resident. Per tap we software-pipeline the 16-byte
+#     chunks: in_c==16 -> 1 filter vec (q0) x 1 input vec (q1); in_c==32 ->
+#     2+2 (q0,q1 x q2,q3); in_c==64 -> 4+4 (q0..q3 x q4..q7). Loads are
+#     hoisted so each VMULAS uses a vector loaded 2 instr earlier. The 3
+#     columns of a row are loaded contiguously (VLD.IP), and `row_delta`
+#     bridges rows. Single-level hardware `loop` over output channels
+#     (nested hardware loops are unreliable on this TIE/LLVM combo).
 #   * General path for any other in_c: the proven branch-based loop structure.
 #
 # ABI (windowed, 6 args — caller a10..a15 = callee a2..a7):
@@ -53,12 +55,41 @@
     EE.VMULAS.S8.ACCX q3, q7
     .endm
 
+    # One tap block (in_c == 32 fast path): q0,q1 = filter, q2,q3 = input.
+    .macro TAP_32 fin, qin
+    EE.VLD.128.IP q0, a9, 16
+    EE.VLD.128.IP q1, a9, 16
+    EE.VLD.128.IP q2, \fin, 16
+    EE.VLD.128.IP q3, \fin, 16
+    EE.VMULAS.S8.ACCX q0, q2
+    EE.VMULAS.S8.ACCX q1, q3
+    .endm
+
+    # One tap block (in_c == 16 fast path): q0 = filter, q1 = input.
+    .macro TAP_16 fin, qin
+    EE.VLD.128.IP q0, a9, 16
+    EE.VLD.128.IP q1, \fin, 16
+    EE.VMULAS.S8.ACCX q0, q1
+    .endm
+
 s8_accx_conv3x3:
     entry a1, 64
 
-    beqi a5, 64, .Lc3fast64       # in_c == 64: unrolled fast path
+    # Short-branch to trampolines: the fast blocks live far below, beyond
+    # the beqi/bnei 8-bit fixup range (LLVM MC).
+    beqi a5, 64, .Lc3f64jmp
+    beqi a5, 32, .Lc3f32jmp
+    beqi a5, 16, .Lc3f16jmp
+    j .Lc3general
+.Lc3f64jmp:
+    j .Lc3fast64
+.Lc3f32jmp:
+    j .Lc3fast32
+.Lc3f16jmp:
+    j .Lc3fast16
 
     # ---- General path (any in_c % 16 == 0) ----
+.Lc3general:
     movi a10, 0                 # oc index
 .Loc3:
     bge a10, a6, .Ldone3
@@ -133,4 +164,71 @@ s8_accx_conv3x3:
     addi a8, a8, 1
     j .Lc3f64loop
 .Lc3f64done:
+    retw
+
+    # ---- Fast path: in_c == 32. 9 taps unrolled, single loop over oc. ----
+    # Same window-walking as fast64 (row_delta bridges rows); filter row
+    # advances 9*32 = 288 bytes per oc.
+.Lc3fast32:
+    movi a8, 0                  # oc index (branch loop, LLVM MC fixup ranges)
+.Lc3f32loop:
+    blt a8, a6, .Lc3f32body
+    j .Lc3f32done
+.Lc3f32body:
+    EE.ZERO.ACCX
+    mov a13, a3                 # a13 = running filter row ptr
+    mov a9, a13
+    mov a10, a2                 # window base (row0 col0)
+    TAP_32 a10, 0               # tap 0: row0 col0
+    TAP_32 a10, 0               # tap 1: row0 col1
+    TAP_32 a10, 0               # tap 2: row0 col2
+    add a10, a10, a7            # + row_delta -> row1 col0 (a10 already +96)
+    TAP_32 a10, 0               # tap 3: row1 col0
+    TAP_32 a10, 0               # tap 4: row1 col1
+    TAP_32 a10, 0               # tap 5: row1 col2
+    add a10, a10, a7            # + row_delta -> row2 col0
+    TAP_32 a10, 0               # tap 6: row2 col0
+    TAP_32 a10, 0               # tap 7: row2 col1
+    TAP_32 a10, 0               # tap 8: row2 col2
+    movi a12, 0
+    EE.SRS.ACCX a15, a12, 0
+    s32i a15, a4, 0
+    addi a4, a4, 4
+    addi a3, a3, 288            # next filter row: 9*in_c = 288
+    addi a8, a8, 1
+    j .Lc3f32loop
+.Lc3f32done:
+    retw
+
+    # ---- Fast path: in_c == 16. 9 taps unrolled, single loop over oc. ----
+    # Window walking identical; filter row advances 9*16 = 144 bytes per oc.
+.Lc3fast16:
+    movi a8, 0                  # oc index
+.Lc3f16loop:
+    blt a8, a6, .Lc3f16body
+    j .Lc3f16done
+.Lc3f16body:
+    EE.ZERO.ACCX
+    mov a13, a3                 # a13 = running filter row ptr
+    mov a9, a13
+    mov a10, a2                 # window base (row0 col0)
+    TAP_16 a10, 0               # tap 0: row0 col0
+    TAP_16 a10, 0               # tap 1: row0 col1
+    TAP_16 a10, 0               # tap 2: row0 col2
+    add a10, a10, a7            # + row_delta -> row1 col0 (a10 already +48)
+    TAP_16 a10, 0               # tap 3: row1 col0
+    TAP_16 a10, 0               # tap 4: row1 col1
+    TAP_16 a10, 0               # tap 5: row1 col2
+    add a10, a10, a7            # + row_delta -> row2 col0
+    TAP_16 a10, 0               # tap 6: row2 col0
+    TAP_16 a10, 0               # tap 7: row2 col1
+    TAP_16 a10, 0               # tap 8: row2 col2
+    movi a12, 0
+    EE.SRS.ACCX a15, a12, 0
+    s32i a15, a4, 0
+    addi a4, a4, 4
+    addi a3, a3, 144            # next filter row: 9*in_c = 144
+    addi a8, a8, 1
+    j .Lc3f16loop
+.Lc3f16done:
     retw

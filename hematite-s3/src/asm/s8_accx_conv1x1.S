@@ -35,6 +35,9 @@ s8_accx_conv1x1:
     beqi a8, 4, .Lfast64        # in_c == 64: input-resident fast path
 
     # ---- General path (any in_c % 16 == 0) ----
+    # Hardware `loop` inner (single loop; outer oc loop stays branch-based —
+    # nested hardware loops are unreliable on this TIE/LLVM combo). groups>=1
+    # always (in_c>=16), so `loop` runs the body exactly a8 times.
     movi a7, 0                  # oc index
     mov a9, a3                  # a9 = running filter row ptr
 .Loc:
@@ -42,15 +45,12 @@ s8_accx_conv1x1:
     EE.ZERO.ACCX
     mov a10, a2                 # a10 = running input ptr
     mov a11, a9                 # a11 = running filter ptr
-    mov a12, a8                 # a12 = groups counter
-.Lic:
-    beqz a12, .Lextract
-    EE.VLD.128.IP q0, a11, 16
-    EE.VLD.128.IP q1, a10, 16
-    EE.VMULAS.S8.ACCX q0, q1
-    addi a12, a12, -1
-    j .Lic
-.Lextract:
+    mov a12, a8                 # a12 = groups counter (hardware loop)
+    loop a12, .Lic_end
+        EE.VLD.128.IP q0, a11, 16
+        EE.VLD.128.IP q1, a10, 16
+        EE.VMULAS.S8.ACCX q0, q1
+    .Lic_end:
     movi a13, 0
     EE.SRS.ACCX a14, a13, 0
     s32i a14, a4, 0

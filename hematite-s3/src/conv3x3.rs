@@ -177,6 +177,7 @@ fn conv3x3_accx_dispatch(ctx: &mut Conv3x3AccxCtx<'_>) -> Result<bool, KernelErr
     let params = ctx.params;
     let input_c = params.input_shape[3] as usize;
     let out_c = params.output_shape[3] as usize;
+    let in_h = params.input_shape[1] as usize;
     let in_w = params.input_shape[2] as usize;
     let out_h = params.output_shape[1] as usize;
     let out_w = params.output_shape[2] as usize;
@@ -204,7 +205,23 @@ fn conv3x3_accx_dispatch(ctx: &mut Conv3x3AccxCtx<'_>) -> Result<bool, KernelErr
         return Ok(false);
     }
 
-    let need = out_c * 4;
+    // Phase 3 — first-conv zero-padding: the ACCX kernel VLDs 16-channel
+    // vectors, so `input_c` must be a multiple of 16. When it isn't (e.g. a
+    // 3-channel RGB first conv), pad the input AND the weights up to the next
+    // multiple of 16 in scratch. Padded channels are all-zero in both, so the
+    // dot products are bit-identical to the scalar conv (which skips them).
+    let padded_c = ((input_c + 15) / 16) * 16;
+    let pad = padded_c != input_c;
+
+    // Scratch layout when padding:
+    //   [padded_input: in_h*in_w*padded_c][padded_weights: out_c*9*padded_c][accs: out_c*4]
+    let pad_input_len = in_h * in_w * padded_c;
+    let pad_weights_len = out_c * 9 * padded_c;
+    let need = if pad {
+        pad_input_len + pad_weights_len + out_c * 4
+    } else {
+        out_c * 4
+    };
     if ctx.scratch.len() < need {
         return Ok(false);
     }
@@ -212,13 +229,64 @@ fn conv3x3_accx_dispatch(ctx: &mut Conv3x3AccxCtx<'_>) -> Result<bool, KernelErr
     let in_ptr = ctx.input.as_ptr();
     let w_ptr = ctx.weights.as_ptr();
     let out_ptr = ctx.output.as_mut_ptr();
-    let accs = ctx.scratch.as_mut_ptr() as *mut i32;
-    if (in_ptr as usize) % 16 != 0
-        || (w_ptr as usize) % 16 != 0
-        || (out_ptr as usize) % 16 != 0
-        || (accs as usize) % 4 != 0
-    {
-        return Ok(false);
+    let scratch_ptr = ctx.scratch.as_mut_ptr();
+    let scratch_u = scratch_ptr as usize;
+
+    let (k_in_ptr, k_w_ptr, accs, k_in_c, k_row_delta);
+    if pad {
+        // Padded buffers — carve from scratch at 16-byte boundaries so the
+        // kernel's VLD.128 stays aligned.
+        let in_off = (scratch_u + 15) & !15;
+        let w_off = in_off + pad_input_len;
+        let accs_off = (w_off + pad_weights_len + 15) & !15;
+        let p_in: *const i8 = unsafe { scratch_ptr.add(in_off - scratch_u) }.cast::<i8>();
+        let p_w: *const i8 = unsafe { scratch_ptr.add(w_off - scratch_u) }.cast::<i8>();
+        let p_accs = unsafe { scratch_ptr.add(accs_off - scratch_u) } as *mut i32;
+        if (accs_off - scratch_u) % 4 != 0 {
+            return Ok(false);
+        }
+
+        // Zero-fill the padded input, then copy the real channels of each
+        // pixel into the padded channel slots.
+        unsafe { core::ptr::write_bytes(p_in as *mut i8, 0, pad_input_len) };
+        for h in 0..in_h {
+            for w in 0..in_w {
+                let src = unsafe { in_ptr.add((h * in_w + w) * input_c) };
+                let dst = unsafe { p_in.add((h * in_w + w) * padded_c) as *mut i8 };
+                unsafe { core::ptr::copy_nonoverlapping(src, dst, input_c) };
+            }
+        }
+
+        // Zero-fill the padded weights [oc][tap][padded_c], copy real channels.
+        unsafe { core::ptr::write_bytes(p_w as *mut i8, 0, pad_weights_len) };
+        for oc in 0..out_c {
+            for tap in 0..9 {
+                let src = unsafe { w_ptr.add((oc * 9 + tap) * input_c) };
+                let dst = unsafe { p_w.add((oc * 9 + tap) * padded_c) as *mut i8 };
+                unsafe { core::ptr::copy_nonoverlapping(src, dst, input_c) };
+            }
+        }
+
+        k_in_ptr = p_in;
+        k_w_ptr = p_w;
+        accs = p_accs;
+        k_in_c = padded_c;
+        k_row_delta = if in_w >= 3 { (in_w - 3) * padded_c } else { 0 };
+    } else {
+        if (in_ptr as usize) % 16 != 0
+            || (w_ptr as usize) % 16 != 0
+            || (out_ptr as usize) % 16 != 0
+        {
+            return Ok(false);
+        }
+        k_in_ptr = in_ptr;
+        k_w_ptr = w_ptr;
+        accs = scratch_ptr as *mut i32;
+        if (accs as usize) % 4 != 0 {
+            return Ok(false);
+        }
+        k_in_c = input_c;
+        k_row_delta = if in_w >= 3 { (in_w - 3) * input_c } else { 0 };
     }
 
     let multipliers = params.output_multiplier_per_channel;
@@ -232,14 +300,20 @@ fn conv3x3_accx_dispatch(ctx: &mut Conv3x3AccxCtx<'_>) -> Result<bool, KernelErr
     };
     let stride_h = params.stride_height as usize;
     let stride_w = params.stride_width as usize;
-    let row_delta = if in_w >= 3 { (in_w - 3) * input_c } else { 0 };
 
     for oh in 0..out_h {
         for ow in 0..out_w {
-            let px = (oh * stride_h * in_w + ow * stride_w) * input_c;
+            let px = (oh * stride_h * in_w + ow * stride_w) * k_in_c;
             let po = (oh * out_w + ow) * out_c;
             unsafe {
-                crate::accx::accx_conv3x3(in_ptr.add(px), w_ptr, accs, input_c, out_c, row_delta);
+                crate::accx::accx_conv3x3(
+                    k_in_ptr.add(px),
+                    k_w_ptr,
+                    accs,
+                    k_in_c,
+                    out_c,
+                    k_row_delta,
+                );
             }
             let acc_slice = unsafe { core::slice::from_raw_parts_mut(accs, out_c) };
             crate::accx::requantize_1x1(&mut crate::accx::ReqCtx {

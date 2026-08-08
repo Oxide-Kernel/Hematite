@@ -66,9 +66,24 @@ pub(crate) fn accx_eligible_1x1(input_c: usize, out_c: usize) -> bool {
 }
 
 /// Host-compilable eligibility for the ACCX 3×3 kernel.
+///
+/// Any `input_c >= 1` is accepted: when `input_c % 16 != 0` (e.g. a 3-channel
+/// first conv) the dispatch zero-pads input and weights in scratch up to the
+/// next multiple of 16 and runs the kernel on the padded buffers, so the
+/// `% 16` requirement is lifted here.
 #[inline]
 pub(crate) fn accx_eligible_3x3(input_c: usize, out_c: usize) -> bool {
-    input_c >= 16 && input_c % 16 == 0 && out_c >= 1
+    input_c >= 1 && out_c >= 1
+}
+
+/// Host-compilable eligibility for the bespoke QACC depthwise kernel.
+///
+/// The depthwise kernel accumulates PER-LANE into QACC and writes 16 int32
+/// lanes per 16-channel group, so both `in_c` and `out_c` must be multiples of
+/// 16 with `out_c >= 16` (the kernel loops `out_c / 16` groups).
+#[inline]
+pub(crate) fn accx_eligible_depthwise(input_c: usize, out_c: usize) -> bool {
+    input_c >= 16 && input_c % 16 == 0 && out_c >= 16 && out_c % 16 == 0
 }
 
 /// Context for the per-channel requantize epilogue.
@@ -170,6 +185,14 @@ pub(crate) fn requantize_1x1(ctx: &mut ReqCtx<'_>) {
     if ctx.uniform_shift != i32::MIN {
         let mult = ctx.uniform_mult;
         let shift = ctx.uniform_shift;
+        // Bespoke asm epilogue for the two bench-critical uniform scales. The
+        // asm is bit-identical to the Rust branches below (incl. the
+        // overflow-free `(acc+1)>>1`), so swapping it in is safe.
+        #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+        if mult == 1 << 30 && (shift == 0 || shift == 1) {
+            unsafe { crate::accx::requantize_uniform_asm(ctx) };
+            return;
+        }
         if mult == 1 << 30 && shift == 1 {
             // Identity scale: scaled == acc (no fixed-point multiply).
             for (oc, &raw) in ctx.accs.iter().enumerate() {
@@ -238,6 +261,8 @@ mod device {
 
     global_asm!(include_str!("asm/s8_accx_conv1x1.S"));
     global_asm!(include_str!("asm/s8_accx_conv3x3.S"));
+    global_asm!(include_str!("asm/s8_requantize.S"));
+    global_asm!(include_str!("asm/s8_accx_depthwise.S"));
 
     /// One input vector → `out_c` raw int32 accumulators.
     ///
@@ -282,6 +307,61 @@ mod device {
     ) {
         asm!(
             "call8 s8_accx_conv3x3",
+            in("a10") input,
+            in("a11") filter,
+            inout("a12") acc_out => _,
+            in("a13") in_c,
+            in("a14") out_c,
+            in("a15") row_delta,
+            clobber_abi("C"),
+        );
+    }
+
+    /// Bespoke asm requantize for the uniform fast path (`mult == 1<<30`,
+    /// `shift` 0 or 1). Bit-identical to the Rust loop — the `(acc+1)>>1`
+    /// overflow-free form (`srai(acc,1) + (acc&1)`) matches
+    /// `((acc as i64 + 1) >> 1) as i32` for every i32 `acc`.
+    ///
+    /// # Safety
+    /// `ctx` must be a valid `&mut ReqCtx` whose `uniform_mult == 1<<30` and
+    /// `uniform_shift` is 0 or 1.
+    pub unsafe fn requantize_uniform_asm(ctx: *mut super::ReqCtx<'_>) {
+        asm!(
+            "call8 s8_requantize_uniform",
+            in("a10") ctx,
+            out("a11") _,
+            out("a12") _,
+            out("a13") _,
+            out("a14") _,
+            out("a15") _,
+            clobber_abi("C"),
+        );
+    }
+
+    /// One 3×3 depthwise window (9 taps, depth-multiplier 1) → `out_c` raw
+    /// int32 accumulators.
+    ///
+    /// Depthwise uses the per-lane `EE.VMULAS.S8.QACC` primitive (NOT the ACCX
+    /// dot-product reduction, which is wrong for depthwise). Accumulators are
+    /// recovered via the QACC two-pass read-back (probe-verified) and written
+    /// as 16 int32 lanes per 16-channel group.
+    ///
+    /// `row_delta` = `(in_w - 3) * in_c` bytes — the offset between 3×3 rows.
+    ///
+    /// # Safety
+    /// `input` (window top-left tap)/`filter` 16-byte aligned, `acc_out`
+    /// 4-byte aligned, `in_c % 16 == 0`, `in_c >= 16`, `out_c % 16 == 0`,
+    /// `out_c >= 16`, buffers sized.
+    pub unsafe fn accx_depthwise(
+        input: *const i8,
+        filter: *const i8,
+        acc_out: *mut i32,
+        in_c: usize,
+        out_c: usize,
+        row_delta: usize,
+    ) {
+        asm!(
+            "call8 s8_accx_depthwise",
             in("a10") input,
             in("a11") filter,
             inout("a12") acc_out => _,
@@ -407,5 +487,33 @@ mod tests {
         let mut s = [0; 64];
         s[3] = 2;
         assert_eq!(uniform_scale(&[1 << 30; 64], &s), None);
+    }
+
+    /// The bespoke asm `s8_requantize_uniform` computes `(acc+1)>>1` as
+    /// `srai(acc,1) + (acc&1)` — an overflow-free form (a naive add-then-srai
+    /// wraps at `i32::MAX`). Prove it is bit-identical to the Rust
+    /// `((acc as i64 + 1) >> 1) as i32` for every `i32` accumulator the kernel
+    /// can produce, including the exact boundary values.
+    #[test]
+    fn half_round_overflow_free_form_matches_i64_reference() {
+        let mut accs = vec![i32::MIN, i32::MIN + 1, -2, -1, 0, 1, 2, i32::MAX - 1, i32::MAX];
+        // LCG sweep over the full i32 space — every lane value a real conv can
+        // emit, plus bias arithmetic in i32 (which can wrap).
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        for _ in 0..100_000 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let v = ((state >> 33) as u32) as i32;
+            let b = ((state >> 1) as u32) as i32;
+            let acc = v.wrapping_add(b); // = raw + bias in i32
+            accs.push(acc);
+        }
+
+        for acc in accs {
+            // The asm: srai(acc,1) + (acc&1)
+            let asm_form = (acc >> 1).wrapping_add(acc & 1);
+            // The Rust reference fast path: ((acc as i64 + 1) >> 1) as i32
+            let ref_form = ((acc as i64 + 1) >> 1) as i32;
+            assert_eq!(asm_form, ref_form, "overflow-free (acc+1)>>1 diverges for acc={acc}");
+        }
     }
 }
