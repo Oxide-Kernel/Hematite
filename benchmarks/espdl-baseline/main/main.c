@@ -153,6 +153,11 @@ extern void probe_s8accx(const int8_t *filter, const int8_t *input,
                          int32_t *out3);
 extern void s8_accx_conv1x1(const int8_t *input, const int8_t *filter,
                             int32_t *acc_out, int32_t in_c, int32_t out_c);
+extern void s8_accx_conv1x1_orig(const int8_t *input, const int8_t *filter,
+                                 int32_t *acc_out, int32_t in_c, int32_t out_c);
+extern void s8_accx_conv3x3(const int8_t *input, const int8_t *filter,
+                            int32_t *acc_out, int32_t in_c, int32_t out_c,
+                            int32_t row_delta);
 
 /* Vendored S16 conv2d kernel (dl_tie728_s16_conv2d.S) — takes int16 buffers.
  * args: filter@48, mac_shift@64, bias@68, output_channel_div_8@96,
@@ -794,6 +799,69 @@ static void probe_qacc(void) {
 /* ---- generic bench harness ---- */
 typedef void (*bench_fn)(void);
 
+static int32_t s_accx[OUT_C] __attribute__((aligned(16)));
+static int8_t s_accx_out[OUT_C] __attribute__((aligned(16)));
+static int32_t s_fc_accx[FC_OUT_DIM] __attribute__((aligned(16)));
+static int8_t s_fc_accx_out[FC_OUT_DIM] __attribute__((aligned(16)));
+
+static void kern_conv1x1_new(void) {
+    s8_accx_conv1x1(s_input, s_weights, s_accx, IN_C, OUT_C);
+    for (int oc = 0; oc < OUT_C; oc++)
+        s_accx_out[oc] = sat_cast(req(s_accx[oc] + s_bias[oc], 1 << 30, 0));
+}
+static void kern_conv1x1_new_pure(void) {
+    s8_accx_conv1x1(s_input, s_weights, s_accx, IN_C, OUT_C);
+}
+static void kern_conv1x1_orig(void) {
+    s8_accx_conv1x1_orig(s_input, s_weights, s_accx, IN_C, OUT_C);
+    for (int oc = 0; oc < OUT_C; oc++)
+        s_accx_out[oc] = sat_cast(req(s_accx[oc] + s_bias[oc], 1 << 30, 0));
+}
+static void kern_conv1x1_orig_pure(void) {
+    s8_accx_conv1x1_orig(s_input, s_weights, s_accx, IN_C, OUT_C);
+}
+static void kern_fc_new(void) {
+    s8_accx_conv1x1(s_fc_in, s_fc_w, s_fc_accx, FC_IN_DIM, FC_OUT_DIM);
+    for (int oc = 0; oc < FC_OUT_DIM; oc++)
+        s_fc_accx_out[oc] = sat_cast(req(s_fc_accx[oc] + s_fc_b[oc], 1 << 30, 0));
+}
+static void kern_fc_new_pure(void) {
+    s8_accx_conv1x1(s_fc_in, s_fc_w, s_fc_accx, FC_IN_DIM, FC_OUT_DIM);
+}
+static void kern_fc_orig(void) {
+    s8_accx_conv1x1_orig(s_fc_in, s_fc_w, s_fc_accx, FC_IN_DIM, FC_OUT_DIM);
+    for (int oc = 0; oc < FC_OUT_DIM; oc++)
+        s_fc_accx_out[oc] = sat_cast(req(s_fc_accx[oc] + s_fc_b[oc], 1 << 30, 0));
+}
+static void kern_fc_orig_pure(void) {
+    s8_accx_conv1x1_orig(s_fc_in, s_fc_w, s_fc_accx, FC_IN_DIM, FC_OUT_DIM);
+}
+
+static int32_t s_c3_accx[C3_OUT_C] __attribute__((aligned(16)));
+static int8_t s_ref[C3_OUT_LEN] __attribute__((aligned(16)));
+static int8_t s_ref64[FC_OUT_DIM] __attribute__((aligned(16)));
+
+static void conv3x3_accx_full(const int8_t *filter) {
+    const int row_delta = (C3_IN_W - 3) * C3_IN_C;
+    for (int oh = 0; oh < C3_OUT_H; oh++) {
+        for (int ow = 0; ow < C3_OUT_W; ow++) {
+            const int px = (oh * C3_IN_W + ow) * C3_IN_C;
+            const int po = (oh * C3_OUT_W + ow) * C3_OUT_C;
+            s8_accx_conv3x3(s_c3_in + px, filter, s_c3_accx, C3_IN_C, C3_OUT_C, row_delta);
+            for (int oc = 0; oc < C3_OUT_C; oc++)
+                s_ref[po + oc] = sat_cast(req(s_c3_accx[oc] + s_c3_b[oc], 1 << 30, 0));
+        }
+    }
+}
+static void kern_c3_new(void) { conv3x3_accx_full(s_c3_w); }
+static void kern_c3_new_pure(void) {
+    const int row_delta = (C3_IN_W - 3) * C3_IN_C;
+    for (int oh = 0; oh < C3_OUT_H; oh++)
+        for (int ow = 0; ow < C3_OUT_W; ow++)
+            s8_accx_conv3x3(s_c3_in + (oh * C3_IN_W + ow) * C3_IN_C, s_c3_w,
+                            s_c3_accx, C3_IN_C, C3_OUT_C, row_delta);
+}
+
 static void run_bench(const char *label, bench_fn fill, bench_fn kern,
                       const int8_t *outbuf, size_t outlen) {
     const int WARMUP = 1, TIMED = 10;
@@ -832,8 +900,6 @@ void app_main(void) {
     probe_s16();
     probe_accx_run();
     probe_s8accx_run();
-    static int8_t s_ref[C3_OUT_LEN] __attribute__((aligned(16)));
-    static int8_t s_ref64[FC_OUT_DIM] __attribute__((aligned(16)));
 
     /* conv1x1 64x1x1x64 */
     run_bench("conv1x1_s8 64x1x1x64 TIE728-SIMD (dl_tie728_s8_conv2d_11cn)",
@@ -849,30 +915,20 @@ void app_main(void) {
            (unsigned)fnv1a((const int8_t *)s_output, OUT_C));
 
     /* --- BESPOKE ACCX conv1x1 (s8_accx_conv1x1.S): bit-exact GPR-accumulator --- */
-    {
-        static int32_t s_accx[OUT_C] __attribute__((aligned(16)));
-        static int8_t s_accx_out[OUT_C] __attribute__((aligned(16)));
-        fill_pattern_conv1x1_tw(); /* fills s_input + s_weights (raw) */
-        uint32_t t0 = read_ccount();
-        s8_accx_conv1x1(s_input, s_weights, s_accx, IN_C, OUT_C);
-        uint32_t t1 = read_ccount();
-        for (int oc = 0; oc < OUT_C; oc++)
-            s_accx_out[oc] = sat_cast(req(s_accx[oc] + s_bias[oc], 1 << 30, 0));
-        printf("== conv1x1_s8 64x1x1x64 BESPOKE-ACCX (s8_accx_conv1x1) ==\n");
-        printf("  cycles=%u | out_checksum(fnv1a)=0x%08x (ref=0x0bea8225)\n",
-               (unsigned)(t1 - t0),
-               (unsigned)fnv1a((const int8_t *)s_accx_out, OUT_C));
-        printf("  accx[0..7]=%d %d %d %d %d %d %d %d\n",
-               (int)s_accx[0], (int)s_accx[1], (int)s_accx[2], (int)s_accx[3],
-               (int)s_accx[4], (int)s_accx[5], (int)s_accx[6], (int)s_accx[7]);
-        printf("  out[0..7]=%d %d %d %d %d %d %d %d (ref=%d %d %d %d %d %d %d %d)\n",
-               (int)s_accx_out[0], (int)s_accx_out[1], (int)s_accx_out[2],
-               (int)s_accx_out[3], (int)s_accx_out[4], (int)s_accx_out[5],
-               (int)s_accx_out[6], (int)s_accx_out[7],
-               (int)s_ref64[0], (int)s_ref64[1], (int)s_ref64[2],
-               (int)s_ref64[3], (int)s_ref64[4], (int)s_ref64[5],
-               (int)s_ref64[6], (int)s_ref64[7]);
-    }
+    printf("== conv1x1_s8 64x1x1x64 BESPOKE-ACCX new (s8_accx_conv1x1) ==\n");
+    run_bench("conv1x1_s8 64x1x1x64 BESPOKE-ACCX new", fill_pattern_conv1x1_tw,
+              kern_conv1x1_new, s_accx_out, OUT_C);
+    printf("  ref=0x0bea8225\n");
+    printf("== conv1x1_s8 64x1x1x64 BESPOKE-ACCX orig (branchy) ==\n");
+    run_bench("conv1x1_s8 64x1x1x64 BESPOKE-ACCX orig", fill_pattern_conv1x1_tw,
+              kern_conv1x1_orig, s_accx_out, OUT_C);
+    printf("  ref=0x0bea8225\n");
+    printf("== conv1x1_s8 64x1x1x64 BESPOKE-ACCX new PURE (no requantize) ==\n");
+    run_bench("conv1x1_s8 64x1x1x64 BESPOKE-ACCX new PURE", fill_pattern_conv1x1_tw,
+              kern_conv1x1_new_pure, (const int8_t *)s_accx, OUT_C * 4);
+    printf("== conv1x1_s8 64x1x1x64 BESPOKE-ACCX orig PURE ==\n");
+    run_bench("conv1x1_s8 64x1x1x64 BESPOKE-ACCX orig PURE", fill_pattern_conv1x1_tw,
+              kern_conv1x1_orig_pure, (const int8_t *)s_accx, OUT_C * 4);
 
     /* conv3x3 32x32 64x3x3x64 */
     run_bench("conv3x3_s8 32x32,64x3x3x64 VALID TIE728-SIMD (dl_tie728_s8_conv2d_33cn)",
@@ -880,6 +936,13 @@ void app_main(void) {
     scalar_conv3x3(s_ref, s_c3_in, s_c3_w, s_c3_b);
     printf("  scalar-ref fnv1a=0x%08x  (Rust bench10: ref=0x0a181085 s3=0xd1a9b601)\n",
            (unsigned)fnv1a((const int8_t *)s_ref, C3_OUT_LEN));
+    printf("== conv3x3_s8 32x32,64x3x3x64 BESPOKE-ACCX new ==\n");
+    run_bench("conv3x3_s8 32x32,64x3x3x64 BESPOKE-ACCX new", fill_pattern_conv3x3,
+              kern_c3_new, s_ref, C3_OUT_LEN);
+    printf("  ref=0x0a181085\n");
+    printf("== conv3x3_s8 32x32,64x3x3x64 BESPOKE-ACCX new PURE ==\n");
+    run_bench("conv3x3_s8 32x32,64x3x3x64 BESPOKE-ACCX new PURE", fill_pattern_conv3x3,
+              kern_c3_new_pure, (const int8_t *)s_c3_accx, C3_OUT_C * 4);
 
     /* fc 256 -> 64 */
     run_bench("fc_s8 256row,64out TIE728-SIMD (dl_tie728_s8_conv2d_11cn)",
@@ -889,31 +952,20 @@ void app_main(void) {
            (unsigned)fnv1a((const int8_t *)s_ref64, FC_OUT_DIM));
 
     /* --- BESPOKE ACCX fc256 (s8_accx_conv1x1.S): bit-exact GPR-accumulator --- */
-    {
-        static int32_t s_fc_accx[FC_OUT_DIM] __attribute__((aligned(16)));
-        static int8_t s_fc_accx_out[FC_OUT_DIM] __attribute__((aligned(16)));
-        fill_pattern_fc(); /* fills s_fc_in + s_fc_w (raw) */
-        uint32_t t0 = read_ccount();
-        s8_accx_conv1x1(s_fc_in, s_fc_w, s_fc_accx, FC_IN_DIM, FC_OUT_DIM);
-        uint32_t t1 = read_ccount();
-        for (int oc = 0; oc < FC_OUT_DIM; oc++)
-            s_fc_accx_out[oc] = sat_cast(req(s_fc_accx[oc] + s_fc_b[oc], 1 << 30, 0));
-        printf("== fc_s8 256row,64out BESPOKE-ACCX (s8_accx_conv1x1) ==\n");
-        printf("  cycles=%u | out_checksum(fnv1a)=0x%08x (ref=0x32e35185)\n",
-               (unsigned)(t1 - t0),
-               (unsigned)fnv1a((const int8_t *)s_fc_accx_out, FC_OUT_DIM));
-        printf("  accx[0..7]=%d %d %d %d %d %d %d %d\n",
-               (int)s_fc_accx[0], (int)s_fc_accx[1], (int)s_fc_accx[2],
-               (int)s_fc_accx[3], (int)s_fc_accx[4], (int)s_fc_accx[5],
-               (int)s_fc_accx[6], (int)s_fc_accx[7]);
-        printf("  out[0..7]=%d %d %d %d %d %d %d %d (ref=%d %d %d %d %d %d %d %d)\n",
-               (int)s_fc_accx_out[0], (int)s_fc_accx_out[1], (int)s_fc_accx_out[2],
-               (int)s_fc_accx_out[3], (int)s_fc_accx_out[4], (int)s_fc_accx_out[5],
-               (int)s_fc_accx_out[6], (int)s_fc_accx_out[7],
-               (int)s_ref64[0], (int)s_ref64[1], (int)s_ref64[2],
-               (int)s_ref64[3], (int)s_ref64[4], (int)s_ref64[5],
-               (int)s_ref64[6], (int)s_ref64[7]);
-    }
+    printf("== fc_s8 256row,64out BESPOKE-ACCX new ==\n");
+    run_bench("fc_s8 256row,64out BESPOKE-ACCX new", fill_pattern_fc,
+              kern_fc_new, s_fc_accx_out, FC_OUT_DIM);
+    printf("  ref=0x32e35185\n");
+    printf("== fc_s8 256row,64out BESPOKE-ACCX orig ==\n");
+    run_bench("fc_s8 256row,64out BESPOKE-ACCX orig", fill_pattern_fc,
+              kern_fc_orig, s_fc_accx_out, FC_OUT_DIM);
+    printf("  ref=0x32e35185\n");
+    printf("== fc_s8 256row,64out BESPOKE-ACCX new PURE ==\n");
+    run_bench("fc_s8 256row,64out BESPOKE-ACCX new PURE", fill_pattern_fc,
+              kern_fc_new_pure, (const int8_t *)s_fc_accx, FC_OUT_DIM * 4);
+    printf("== fc_s8 256row,64out BESPOKE-ACCX orig PURE ==\n");
+    run_bench("fc_s8 256row,64out BESPOKE-ACCX orig PURE", fill_pattern_fc,
+              kern_fc_orig_pure, (const int8_t *)s_fc_accx, FC_OUT_DIM * 4);
 
     /* max pool 2x2x16 */
     run_bench("max_pool_s8 2x2x16 TIE728-SIMD (dl_tie728_s8_max_pool2d_22c1)",
