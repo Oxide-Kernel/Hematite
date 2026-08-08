@@ -151,6 +151,15 @@ extern void probe_accx_mac_sweep(const int16_t *filter, const int16_t *input,
                                  int32_t *out64);
 extern void probe_s8accx(const int8_t *filter, const int8_t *input,
                          int32_t *out3);
+extern void probe_qacc_layout(const int8_t *filter, const int8_t *input,
+                              int32_t *out40, int32_t macs, int32_t reverse);
+extern void probe_qacc_s16(const int8_t *filter, const int8_t *input,
+                            int32_t *out_low, int32_t *out_high, int32_t macs);
+extern void probe_qacc_perchan(const int8_t *filter, const int8_t *input,
+                               int32_t *out16, int32_t *out_low,
+                               int32_t *out_high, int32_t macs);
+extern void probe_qacc_esplike(const int8_t *filter, const int8_t *input,
+                               int32_t *out32, int32_t macs);
 extern void s8_accx_conv1x1(const int8_t *input, const int8_t *filter,
                             int32_t *acc_out, int32_t in_c, int32_t out_c);
 extern void s8_accx_conv1x1_orig(const int8_t *input, const int8_t *filter,
@@ -158,6 +167,9 @@ extern void s8_accx_conv1x1_orig(const int8_t *input, const int8_t *filter,
 extern void s8_accx_conv3x3(const int8_t *input, const int8_t *filter,
                             int32_t *acc_out, int32_t in_c, int32_t out_c,
                             int32_t row_delta);
+extern void s8_accx_depthwise(const int8_t *input, const int8_t *filter,
+                              int32_t *acc_out, int32_t in_c, int32_t out_c,
+                              int32_t row_delta);
 
 /* Vendored S16 conv2d kernel (dl_tie728_s16_conv2d.S) — takes int16 buffers.
  * args: filter@48, mac_shift@64, bias@68, output_channel_div_8@96,
@@ -240,6 +252,23 @@ static int8_t  s_e_out[N256] __attribute__((aligned(16)));
 
 static int32_t s_mult[OUT_C] __attribute__((aligned(16)));   /* = 1<<30 */
 static int32_t s_shift[OUT_C] __attribute__((aligned(16)));  /* = 0 */
+
+/* Depthwise 3x3 stride1 pad0 dm1 test (mirrors mv2mini L3/L5 shape family):
+ * input 7x7x32 -> output 5x5x32, filter 3x3x32 HWCN dm=1. */
+#define DW_IN_H 7
+#define DW_IN_W 7
+#define DW_C 32
+#define DW_OUT_H 5
+#define DW_OUT_W 5
+#define DW_IN_LEN (DW_IN_H * DW_IN_W * DW_C)
+#define DW_W_LEN (9 * DW_C)
+#define DW_OUT_LEN (DW_OUT_H * DW_OUT_W * DW_C)
+static int8_t  s_dw_in[DW_IN_LEN] __attribute__((aligned(16)));
+static int8_t  s_dw_w[DW_W_LEN] __attribute__((aligned(16)));
+static int32_t s_dw_b[DW_C] __attribute__((aligned(16)));
+static int32_t s_dw_accx[DW_C] __attribute__((aligned(16)));
+static int8_t  s_dw_out[DW_OUT_LEN] __attribute__((aligned(16)));
+static int8_t  s_dw_ref[DW_OUT_LEN] __attribute__((aligned(16)));
 
 static inline uint32_t read_ccount(void) {
     uint32_t c;
@@ -488,6 +517,163 @@ static void probe_s8accx_run(void) {
     printf("  127s: TWO MACs = %d %d %d\n",
            (int)out3[0], (int)out3[1], (int)out3[2]);
     printf("  (shift0: 2*16*16129 = 516128 if 16-bit products; 4064 if 8-bit saturating)\n");
+}
+
+/* ---- QACC layout probe (probe_qacc.S) ----
+ * VMULAS.S8.QACC = per-lane element-wise accumulate (depthwise primitive).
+ * The 40-byte store (QACC_L.L.128/H.32 + QACC_H.L.128/H.32) is the read-back.
+ * Probe 1: filter=1, input=1..16, 1 MAC -> lane i = i+1 (distinct small),
+ *          dump all 40 bytes to see WHERE each lane lives.
+ * Probe 2: same, 9 MACs -> lane i = 9*(i+1) (accumulation check).
+ * Probe 3: all-127, 1 MAC -> 16129 if lanes >=16-bit wide, 127 if 8-bit sat.
+ * Probe 4: single-lane sweep -> for each lane k set input[k]=1 only, 1 MAC,
+ *          find which bytes hold the '1' (exact lane->byte mapping). */
+static void probe_qacc_layout_run(void) {
+    static int8_t in[16] __attribute__((aligned(16)));
+    static int8_t filt[16] __attribute__((aligned(16)));
+    static int32_t out40[10] __attribute__((aligned(16)));
+    static int32_t pcout[16] __attribute__((aligned(16))); /* 32B zip + low + high */
+
+    printf("-- QACC layout probe (VMULAS.S8.QACC per-lane, 40-byte store) --\n");
+
+    for (int i = 0; i < 16; i++) { in[i] = (int8_t)(i + 1); filt[i] = 1; }
+    probe_qacc_layout(filt, in, out40, 1, 0);
+    printf("  filter=1 in=1..16, 1 MAC (lane i should hold i+1=1..16):\n  ");
+    for (int b = 0; b < 40; b++) printf("%02x ", (unsigned)((unsigned char *)out40)[b]);
+    printf("\n");
+
+    probe_qacc_layout(filt, in, out40, 9, 0);
+    printf("  filter=1 in=1..16, 9 MACs (lane i = 9*(i+1)=9..144):\n  ");
+    for (int b = 0; b < 40; b++) printf("%02x ", (unsigned)((unsigned char *)out40)[b]);
+    printf("\n");
+
+    for (int i = 0; i < 16; i++) { in[i] = 127; filt[i] = 127; }
+    probe_qacc_layout(filt, in, out40, 1, 0);
+    printf("  127*127 1 MAC (expect 16129=0x3f01 in wide lanes, 0x7f if 8-bit sat):\n  ");
+    for (int b = 0; b < 40; b++) printf("%02x ", (unsigned)((unsigned char *)out40)[b]);
+    printf("\n");
+
+    probe_qacc_layout(filt, in, out40, 9, 0);
+    printf("  127*127 9 MACs (expect 9*16129=145161=0x23709 if wide):\n  ");
+    for (int b = 0; b < 40; b++) printf("%02x ", (unsigned)((unsigned char *)out40)[b]);
+    printf("\n");
+
+    printf("  single-lane sweep (lane k: input[k]=1 only, 1 MAC; bytes holding 01):\n");
+    for (int k = 0; k < 16; k++) {
+        for (int i = 0; i < 16; i++) { in[i] = (i == k) ? 1 : 0; filt[i] = 1; }
+        probe_qacc_layout(filt, in, out40, 1, 0);
+        printf("  lane %2d: ", k);
+        for (int b = 0; b < 40; b++) printf("%02x", (unsigned)((unsigned char *)out40)[b]);
+        printf("\n");
+    }
+    printf("  REVERSED single-lane sweep (q0=input, q1=filter):\n");
+    for (int k = 0; k < 16; k++) {
+        for (int i = 0; i < 16; i++) { in[i] = (i == k) ? 1 : 0; filt[i] = 1; }
+        probe_qacc_layout(filt, in, out40, 1, 1);
+        printf("  lane %2d: ", k);
+        for (int b = 0; b < 40; b++) printf("%02x", (unsigned)((unsigned char *)out40)[b]);
+        printf("\n");
+    }
+
+    printf("  bit-sweep (all lanes=1, macs=1<<j so lane value = 2^j; traces bit j):\n");
+    for (int i = 0; i < 16; i++) { in[i] = 1; filt[i] = 1; }
+    for (int j = 0; j < 16; j++) {
+        probe_qacc_layout(filt, in, out40, 1 << j, 0);
+        printf("  bit%2d: ", j);
+        for (int b = 0; b < 40; b++) printf("%02x", (unsigned)((unsigned char *)out40)[b]);
+        printf("\n");
+    }
+
+    printf("  lane-sweep macs=3 (in[k]=1 only, 3 MACs -> lane=3; odd-lane high bits):\n");
+    for (int k = 0; k < 16; k++) {
+        for (int i = 0; i < 16; i++) { in[i] = (i == k) ? 1 : 0; filt[i] = 1; }
+        probe_qacc_layout(filt, in, out40, 3, 0);
+        printf("  lane %2d: ", k);
+        for (int b = 0; b < 40; b++) printf("%02x", (unsigned)((unsigned char *)out40)[b]);
+        printf("\n");
+    }
+
+    printf("  S16 extraction sweep (SRCMB.S16 shift4=low out_low, shift20=even out_high):\n");
+    for (int k = 0; k < 16; k++) {
+        for (int i = 0; i < 16; i++) { in[i] = (i == k) ? 1 : 0; filt[i] = 1; }
+        probe_qacc_s16(filt, in, out40, &out40[4], 1);
+        printf("  lane %2d low :", k);
+        for (int h = 0; h < 8; h++) printf(" %04x", (unsigned short)(((unsigned short *)out40)[h]));
+        printf("  high:");
+        for (int h = 0; h < 8; h++) printf(" %04x", (unsigned short)(((unsigned short *)out40)[h + 8]));
+        printf("\n");
+    }
+
+    printf("  S16 value-sweep (lane 1: in[1]=V, filter=1, 1 MAC -> acc=V):\n");
+    for (int i = 0; i < 16; i++) { in[i] = 0; filt[i] = 1; }
+    for (int v = 1; v < 32; v = (v << 1)) {
+        in[1] = (int8_t)v;
+        probe_qacc_s16(filt, in, out40, &out40[4], 1);
+        printf("  V=%3d low[0]=%04x low[1]=%04x\n", v,
+               (unsigned short)(((unsigned short *)out40)[0]),
+               (unsigned short)(((unsigned short *)out40)[1]));
+    }
+    in[1] = 127;
+    probe_qacc_s16(filt, in, out40, &out40[4], 1);
+    printf("  V=127 low[0]=%04x\n", (unsigned short)(((unsigned short *)out40)[0]));
+    in[1] = -1;
+    probe_qacc_s16(filt, in, out40, &out40[4], 1);
+    printf("  V=-1  low[0]=%04x\n", (unsigned short)(((unsigned short *)out40)[0]));
+
+    printf("  PER-CHANNEL full extraction (gapped store + l16si + SRCMB4/20 + VZIP.16):\n");
+    {
+        int32_t *out16 = pcout;       /* 32 bytes: zip16[0..16) + zip16[16..32) */
+        int32_t *out_low = &pcout[8]; /* 16 bytes */
+        int32_t *out_high = &pcout[12]; /* 16 bytes */
+        for (int k = 0; k < 16; k++) {
+            for (int i = 0; i < 16; i++) { in[i] = (i == k) ? 5 : 0; filt[i] = 2; }
+            /* lane k acc = 5*2 = 10 (1 MAC); dump post-VZIP halves */
+            probe_qacc_perchan(filt, in, out16, out_low, out_high, 1);
+            printf("  lane %2d V10 zip16:", k);
+            for (int h = 0; h < 8; h++) printf(" %04x", (unsigned short)(((unsigned short *)out16)[h]));
+            printf("  | low4:");
+            for (int h = 0; h < 8; h++) printf(" %04x", (unsigned short)(((unsigned short *)out_low)[h]));
+            printf("  | high20:");
+            for (int h = 0; h < 8; h++) printf(" %04x", (unsigned short)(((unsigned short *)out_high)[h]));
+            printf("\n");
+        }
+        /* all-16-lanes distinct values, 1 MAC: lane k = (k+1)*2 */
+        for (int i = 0; i < 16; i++) { in[i] = (int8_t)(i + 1); filt[i] = 2; }
+        probe_qacc_perchan(filt, in, out16, out_low, out_high, 1);
+        printf("  all16 V=(k+1)*2 zip16:");
+        for (int h = 0; h < 8; h++) printf(" %04x", (unsigned short)(((unsigned short *)out16)[h]));
+        printf("  |");
+        for (int h = 0; h < 8; h++) printf(" %04x", (unsigned short)(((unsigned short *)out16)[h + 8]));
+        printf("\n");
+
+        /* RAW 40-byte contiguous store for all-16 distinct values (the key
+         * calibration picture: shows the full diagonal at once) */
+        probe_qacc_layout(filt, in, out40, 1, 0);
+        printf("  all16 RAW40:");
+        for (int b = 0; b < 40; b++) printf("%02x", (unsigned)((unsigned char *)out40)[b]);
+        printf("\n");
+        /* same with 2 MACs (acc = 2*(k+1)*2) to see carry into upper bits */
+        probe_qacc_layout(filt, in, out40, 2, 0);
+        printf("  all16 RAW40 macs2:");
+        for (int b = 0; b < 40; b++) printf("%02x", (unsigned)((unsigned char *)out40)[b]);
+        printf("\n");
+    }
+
+    printf("  ESP-LIKE 16x i32 readback (esp-nn verbatim two-pass bit-slice):\n");
+    {
+        static int32_t esq[16] __attribute__((aligned(16)));
+        /* all16 V=(k+1)*2, 1 MAC -> expect lane k = (k+1)*2 */
+        for (int i = 0; i < 16; i++) { in[i] = (int8_t)(i + 1); filt[i] = 2; }
+        probe_qacc_esplike(filt, in, esq, 1);
+        printf("  esplike 1MAC:");
+        for (int h = 0; h < 16; h++) printf(" %d", (int)esq[h]);
+        printf("\n");
+        /* all16 V=(k+1)*2, 2 MACs -> expect lane k = 2*(k+1)*2 = (k+1)*4 */
+        probe_qacc_esplike(filt, in, esq, 2);
+        printf("  esplike 2MAC:");
+        for (int h = 0; h < 16; h++) printf(" %d", (int)esq[h]);
+        printf("\n");
+    }
 }
 
 /* ---- scalar refs (mirror hematite-ref exactly) ---- */
@@ -862,6 +1048,56 @@ static void kern_c3_new_pure(void) {
                             s_c3_accx, C3_IN_C, C3_OUT_C, row_delta);
 }
 
+/* ---- bespoke depthwise (s8_accx_depthwise.S): QACC per-lane ---- */
+
+static void fill_depthwise(void) {
+    for (int i = 0; i < DW_IN_LEN; i++) s_dw_in[i] = (int8_t)((i * 7 + 3) & 0xFF);
+    for (int i = 0; i < DW_W_LEN; i++) s_dw_w[i] = (int8_t)((i * 13 + 11) & 0xFF);
+    for (int i = 0; i < DW_C; i++) s_dw_b[i] = i * 17 - 8;
+}
+
+/* scalar depthwise 3x3 stride1 pad0 dm1, HWCN layout filter[(tap)*out_c + ch] */
+static void scalar_depthwise(void) {
+    const int row_stride = DW_IN_W * DW_C;
+    for (int oh = 0; oh < DW_OUT_H; oh++) {
+        for (int ow = 0; ow < DW_OUT_W; ow++) {
+            for (int oc = 0; oc < DW_C; oc++) {
+                int32_t acc = s_dw_b[oc];
+                for (int fy = 0; fy < 3; fy++) {
+                    for (int fx = 0; fx < 3; fx++) {
+                        const int tap = fy * 3 + fx;
+                        const int in_idx = (oh + fy) * row_stride + (ow + fx) * DW_C + oc;
+                        const int w_idx = tap * DW_C + oc;
+                        acc += (int32_t)s_dw_in[in_idx] * (int32_t)s_dw_w[w_idx];
+                    }
+                }
+                s_dw_ref[(oh * DW_OUT_W + ow) * DW_C + oc] =
+                    sat_cast(req(acc, 1 << 30, 0));
+            }
+        }
+    }
+}
+
+static void kern_depthwise(void) {
+    const int row_delta = (DW_IN_W - 3) * DW_C;
+    for (int oh = 0; oh < DW_OUT_H; oh++) {
+        for (int ow = 0; ow < DW_OUT_W; ow++) {
+            const int px = (oh * DW_IN_W + ow) * DW_C;
+            const int po = (oh * DW_OUT_W + ow) * DW_C;
+            s8_accx_depthwise(s_dw_in + px, s_dw_w, s_dw_accx, DW_C, DW_C, row_delta);
+            for (int oc = 0; oc < DW_C; oc++)
+                s_dw_out[po + oc] = sat_cast(req(s_dw_accx[oc] + s_dw_b[oc], 1 << 30, 0));
+        }
+    }
+}
+static void kern_depthwise_pure(void) {
+    const int row_delta = (DW_IN_W - 3) * DW_C;
+    for (int oh = 0; oh < DW_OUT_H; oh++)
+        for (int ow = 0; ow < DW_OUT_W; ow++)
+            s8_accx_depthwise(s_dw_in + (oh * DW_IN_W + ow) * DW_C, s_dw_w,
+                              s_dw_accx, DW_C, DW_C, row_delta);
+}
+
 static void run_bench(const char *label, bench_fn fill, bench_fn kern,
                       const int8_t *outbuf, size_t outlen) {
     const int WARMUP = 1, TIMED = 10;
@@ -900,6 +1136,7 @@ void app_main(void) {
     probe_s16();
     probe_accx_run();
     probe_s8accx_run();
+    probe_qacc_layout_run();
 
     /* conv1x1 64x1x1x64 */
     run_bench("conv1x1_s8 64x1x1x64 TIE728-SIMD (dl_tie728_s8_conv2d_11cn)",
@@ -943,6 +1180,19 @@ void app_main(void) {
     printf("== conv3x3_s8 32x32,64x3x3x64 BESPOKE-ACCX new PURE ==\n");
     run_bench("conv3x3_s8 32x32,64x3x3x64 BESPOKE-ACCX new PURE", fill_pattern_conv3x3,
               kern_c3_new_pure, (const int8_t *)s_c3_accx, C3_OUT_C * 4);
+
+    /* --- BESPOKE depthwise (s8_accx_depthwise.S): QACC per-lane --- */
+    fill_depthwise();
+    scalar_depthwise();
+    printf("== depthwise_s8 7x7,32x3x3x32 BESPOKE-QACC (s8_accx_depthwise) ==\n");
+    run_bench("depthwise_s8 7x7,32x3x3x32 BESPOKE-QACC", fill_depthwise,
+              kern_depthwise, s_dw_out, DW_OUT_LEN);
+    printf("  ref fnv1a=0x%08x\n",
+           (unsigned)fnv1a((const int8_t *)s_dw_ref, DW_OUT_LEN));
+    printf("  kernel out fnv1a=0x%08x\n",
+           (unsigned)fnv1a((const int8_t *)s_dw_out, DW_OUT_LEN));
+    run_bench("depthwise_s8 7x7,32x3x3x32 BESPOKE-QACC PURE", fill_depthwise,
+              kern_depthwise_pure, (const int8_t *)s_dw_accx, DW_C * 4);
 
     /* fc 256 -> 64 */
     run_bench("fc_s8 256row,64out TIE728-SIMD (dl_tie728_s8_conv2d_11cn)",
