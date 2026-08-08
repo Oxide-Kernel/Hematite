@@ -941,13 +941,14 @@ pub enum PreparedKernel {
     Conv1x1(hematite_s3::conv1x1::PreparedConv1x1),
     Conv3x3(hematite_s3::conv3x3::PreparedConv3x3),
     Fc(hematite_s3::gemm::PreparedFc),
+    Depthwise(hematite_s3::depthwise::PreparedDepthwise),
     MaxPool(hematite_s3::pool::PreparedMaxPool),
     AvgPool(hematite_s3::pool::PreparedAvgPool),
     Relu(hematite_s3::activations::PreparedRelu),
     Add(hematite_s3::elementwise::PreparedAdd),
     Mul(hematite_s3::elementwise::PreparedMul),
     Sub(hematite_s3::elementwise::PreparedSub),
-    /// Ops with no SIMD path (depthwise, softmax): just run the public API.
+    /// Ops with no SIMD path (softmax): just run the public API.
     Scalar,
 }
 
@@ -961,6 +962,7 @@ impl PreparedKernel {
             PreparedKernel::Conv1x1(h) => h.is_simd(),
             PreparedKernel::Conv3x3(h) => h.is_simd(),
             PreparedKernel::Fc(h) => h.is_simd(),
+            PreparedKernel::Depthwise(h) => h.is_simd(),
             PreparedKernel::MaxPool(h) => h.is_simd(),
             PreparedKernel::AvgPool(h) => h.is_simd(),
             PreparedKernel::Relu(h) => h.is_simd(),
@@ -987,6 +989,9 @@ impl PreparedKernel {
                 h.run(bufs.input, bufs.weights, bufs.bias, bufs.output, scratch)
             }
             PreparedKernel::Fc(h) => {
+                h.run(bufs.input, bufs.weights, bufs.bias, bufs.output, scratch)
+            }
+            PreparedKernel::Depthwise(h) => {
                 h.run(bufs.input, bufs.weights, bufs.bias, bufs.output, scratch)
             }
             PreparedKernel::MaxPool(h) => h.run(bufs.input, bufs.output, scratch),
@@ -1155,7 +1160,13 @@ pub fn prepare_kernel(spec: &KernelSpec) -> Result<PreparedKernel, KernelError> 
             )),
             _ => Err(KernelError::Unsupported),
         },
-        OpKind::DepthwiseConv2d | OpKind::Softmax => Ok(PreparedKernel::Scalar),
+        OpKind::DepthwiseConv2d => match spec.params {
+            KernelParams::Depthwise(p) => Ok(PreparedKernel::Depthwise(
+                hematite_s3::depthwise::PreparedDepthwise::new(p)?,
+            )),
+            _ => Err(KernelError::Unsupported),
+        },
+        OpKind::Softmax => Ok(PreparedKernel::Scalar),
     }
 }
 

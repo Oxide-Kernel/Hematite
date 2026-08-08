@@ -505,15 +505,203 @@ fn bench_kernel(spec: &KernelSpec, clock: &mut RealClock, canary: &mut StackCana
 /// FNV-1a 32-bit checksum over raw output bytes (seed 2166136261, prime
 /// 16777619) — mirrors the C baseline's `out_checksum` so the Rust s3 kernel
 /// output can be matched bit-exactly against the C-SIMD harness.
-fn fnv1a(data: &[i8]) -> u32 {
-    let mut h: u32 = 2_166_136_261;
-    for &b in data {
-        h ^= b as u32;
-        h = h.wrapping_mul(16_777_619);
+ fn fnv1a(data: &[i8]) -> u32 {
+     let mut h: u32 = 2_166_136_261;
+     for &b in data {
+         h ^= b as u32;
+         h = h.wrapping_mul(16_777_619);
+     }
+     h
+ }
+ 
+/// End-to-end benchmark of the 4-layer CNN model — the SAME graph the
+/// standard-ESP-NN baseline runs (`benchmarks/espnn-baseline`). Both the
+/// `hematite-ref` scalar model and the `hematite-s3` model (ACCX kernels on
+/// device) are timed end-to-end; the s3 output FNV-1a is matched against the
+/// ESP-NN baseline's device-verified checksum `0x75eb32f5`.
+fn bench_cnn_model(clock: &mut RealClock, canary: &mut StackCanary) {
+    // SAFETY: carve_cnn_into returns the only live borrow of the arena for
+    // the duration of this benchmark; the arena is re-carved per benchmark.
+    let arena = unsafe { &mut SRAM_ARENA.0[..] };
+    let mut bufs = match crate::model_cnn::carve_cnn_into(arena) {
+        Ok(b) => b,
+        Err(_) => panic!("arena too small for CNN model benchmark"),
+    };
+    // The ACCX kernels write raw int32 accumulators (out_c * 4 bytes) to the
+    // scratch buffer before Rust requantizes.
+    #[repr(align(16))]
+    struct AlignedScratch([u8; 4096]);
+    let mut scratch = AlignedScratch([0u8; 4096]);
+    let cfg = BenchmarkConfig::default();
+
+    // Scalar-ref model (hematite-ref) — column-1 baseline, measured on device.
+    crate::model_cnn::fill_pattern_cnn(
+        bufs.input, bufs.l1w, bufs.l1b, bufs.l3w, bufs.l3b, bufs.l4w, bufs.l4b,
+    );
+    let ref_log = run_repeated(
+        clock,
+        &mut || {
+            let _ = crate::model_cnn::run_cnn_ref(&mut bufs, &mut scratch.0[..]);
+        },
+        &cfg,
+    );
+    let ref_fnv = crate::model_cnn::fnv1a(bufs.out);
+    let ref_layers = crate::model_cnn::layer_checksums(&bufs);
+
+    // s3 model (ACCX SIMD on device).
+    crate::model_cnn::fill_pattern_cnn(
+        bufs.input, bufs.l1w, bufs.l1b, bufs.l3w, bufs.l3b, bufs.l4w, bufs.l4b,
+    );
+    let s3_log = run_repeated(
+        clock,
+        &mut || {
+            let _ = crate::model_cnn::run_cnn_s3(&mut bufs, &mut scratch.0[..]);
+        },
+        &cfg,
+    );
+    let s3_fnv = crate::model_cnn::fnv1a(bufs.out);
+    let s3_layers = crate::model_cnn::layer_checksums(&bufs);
+
+    let ref_sum = match summarize(&ref_log) {
+        Some(s) => s,
+        None => return, // unreachable: run_repeated floors at 10
+    };
+    let s3_sum = match summarize(&s3_log) {
+        Some(s) => s,
+        None => return, // unreachable: run_repeated floors at 10
+    };
+
+    let col1 = crate::report::speedup_x100(ref_sum.median_cycles, s3_sum.median_cycles);
+
+    firmware_log!(
+        "| cnn_model 4-layer (conv3x3 32x32x16 + maxpool + conv1x1 + fc) | SRAM | {}/{} | {}/{} | col1={} | out_fnv(ref/s3)=0x{:08x}/0x{:08x} |",
+        s3_sum.min_cycles,
+        s3_sum.median_cycles,
+        crate::timing::cycles_to_us(s3_sum.min_cycles, CPU_HZ_240MHZ),
+        crate::timing::cycles_to_us(s3_sum.median_cycles, CPU_HZ_240MHZ),
+        col1,
+        ref_fnv,
+        s3_fnv,
+    );
+    firmware_log!(
+        "  cnn_model layers: ref L1=0x{:08x} L2=0x{:08x} L3=0x{:08x} out=0x{:08x} | s3 L1=0x{:08x} L2=0x{:08x} L3=0x{:08x} out=0x{:08x} | ref_min={} ref_median={}",
+        ref_layers.l1,
+        ref_layers.l2,
+        ref_layers.l3,
+        ref_fnv,
+        s3_layers.l1,
+        s3_layers.l2,
+        s3_layers.l3,
+        s3_layers.out,
+        ref_sum.min_cycles,
+        ref_sum.median_cycles,
+    );
+
+    if let Err(e) = canary.verify() {
+        panic!("cnn model: {}", e.describe());
     }
-    h
 }
 
+/// End-to-end MobileNetV2-style model benchmark (model B, "mv2mini").
+///
+/// The SAME 7-layer graph the standard-ESP-NN baseline runs
+/// (`benchmarks/espnn-baseline`): conv3x3 16x16x3→14x14x32 (relu 0..127) →
+/// maxpool 2x2 → depthwise 3x3 32→32 → conv1x1 32→64 → depthwise 3x3 64→64 →
+/// conv1x1 64→128 → fc 1152→16. Both the scalar-ref (hematite-ref) and the
+/// s3 (hematite-s3, ACCX SIMD where eligible) runs are timed end-to-end; the
+/// s3 output FNV-1a is matched against the ESP-NN baseline's device-verified
+/// checksum `0x7f23eb05`.
+fn bench_mv2_model(clock: &mut RealClock, canary: &mut StackCanary) {
+    // SAFETY: carve_mv2_into returns the only live borrow of the arena for
+    // the duration of this benchmark; the arena is re-carved per benchmark.
+    let arena = unsafe { &mut SRAM_ARENA.0[..] };
+    let mut bufs = match crate::model_mv2::carve_mv2_into(arena) {
+        Ok(b) => b,
+        Err(_) => panic!("arena too small for MV2 model benchmark"),
+    };
+    // The ACCX kernels write raw int32 accumulators (out_c * 4 bytes) to the
+    // scratch buffer before Rust requantizes.
+    #[repr(align(16))]
+    struct AlignedScratch([u8; 16384]);
+    let mut scratch = AlignedScratch([0u8; 16384]);
+    let cfg = BenchmarkConfig::default();
+
+    // Scalar-ref model (hematite-ref) — column-1 baseline, measured on device.
+    crate::model_mv2::fill_pattern_mv2(
+        bufs.input, bufs.l1w, bufs.l1b, bufs.l3w, bufs.l3b, bufs.l4w, bufs.l4b, bufs.l5w, bufs.l5b,
+        bufs.l6w, bufs.l6b, bufs.l7w, bufs.l7b,
+    );
+    let ref_log = run_repeated(
+        clock,
+        &mut || {
+            let _ = crate::model_mv2::run_mv2_ref(&mut bufs, &mut scratch.0[..]);
+        },
+        &cfg,
+    );
+    let ref_fnv = crate::model_mv2::fnv1a(bufs.out);
+    let ref_layers = crate::model_mv2::layer_checksums_mv2(&bufs);
+
+    // s3 model (ACCX SIMD on device).
+    crate::model_mv2::fill_pattern_mv2(
+        bufs.input, bufs.l1w, bufs.l1b, bufs.l3w, bufs.l3b, bufs.l4w, bufs.l4b, bufs.l5w, bufs.l5b,
+        bufs.l6w, bufs.l6b, bufs.l7w, bufs.l7b,
+    );
+    let s3_log = run_repeated(
+        clock,
+        &mut || {
+            let _ = crate::model_mv2::run_mv2_s3(&mut bufs, &mut scratch.0[..]);
+        },
+        &cfg,
+    );
+    let s3_fnv = crate::model_mv2::fnv1a(bufs.out);
+    let s3_layers = crate::model_mv2::layer_checksums_mv2(&bufs);
+
+    let ref_sum = match summarize(&ref_log) {
+        Some(s) => s,
+        None => return, // unreachable: run_repeated floors at 10
+    };
+    let s3_sum = match summarize(&s3_log) {
+        Some(s) => s,
+        None => return, // unreachable: run_repeated floors at 10
+    };
+
+    let col1 = crate::report::speedup_x100(ref_sum.median_cycles, s3_sum.median_cycles);
+
+    firmware_log!(
+        "| mv2mini 7-layer (conv3x3 16x16x3 + maxpool + dw + conv1x1 + dw + conv1x1 + fc) | SRAM | {}/{} | {}/{} | col1={} | out_fnv(ref/s3)=0x{:08x}/0x{:08x} |",
+        s3_sum.min_cycles,
+        s3_sum.median_cycles,
+        crate::timing::cycles_to_us(s3_sum.min_cycles, CPU_HZ_240MHZ),
+        crate::timing::cycles_to_us(s3_sum.median_cycles, CPU_HZ_240MHZ),
+        col1,
+        ref_fnv,
+        s3_fnv,
+    );
+    firmware_log!(
+        "  mv2mini layers: ref L1=0x{:08x} L2=0x{:08x} L3=0x{:08x} L4=0x{:08x} L5=0x{:08x} L6=0x{:08x} out=0x{:08x} | s3 L1=0x{:08x} L2=0x{:08x} L3=0x{:08x} L4=0x{:08x} L5=0x{:08x} L6=0x{:08x} out=0x{:08x} | ref_min={} ref_median={}",
+        ref_layers.l1,
+        ref_layers.l2,
+        ref_layers.l3,
+        ref_layers.l4,
+        ref_layers.l5,
+        ref_layers.l6,
+        ref_fnv,
+        s3_layers.l1,
+        s3_layers.l2,
+        s3_layers.l3,
+        s3_layers.l4,
+        s3_layers.l5,
+        s3_layers.l6,
+        s3_layers.out,
+        ref_sum.min_cycles,
+        ref_sum.median_cycles,
+    );
+
+    if let Err(e) = canary.verify() {
+        panic!("mv2 model: {}", e.describe());
+    }
+}
+ 
 /// Emit a report row (defmt/RTT on hardware, UART0 under `qemu`).
 ///
 /// Columns 2 and 3 stay `None` (rendered as `None`) until the competitor
@@ -626,10 +814,14 @@ pub fn run_benchmarks() -> ! {
     // 5. Per-kernel benchmarks.
     let mut clock = RealClock;
     firmware_log!("{}", crate::report::HEADER);
+    // The end-to-end 4-layer CNN model benchmark runs BEFORE the per-kernel
+    // rows because the kernel loop terminates in the expected no-PSRAM panic
+    // on this board (the PSRAM-tier MobileNetV2 row's "arena too small").
+    bench_cnn_model(&mut clock, &mut canary);
+    bench_mv2_model(&mut clock, &mut canary);
     for spec in kernel_specs() {
         bench_kernel(spec, &mut clock, &mut canary);
     }
-
     // 6. Model-level registry.
     for spec in model_bench_specs() {
         emit_model_row(spec);
