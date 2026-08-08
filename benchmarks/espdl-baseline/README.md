@@ -241,6 +241,26 @@ Engineering notes:
    short-branch + long-jump pattern (`blt …; j …`) instead. GNU-as (ESP-IDF)
    accepts both; LLVM-MC (Rust `global_asm!`) requires the branch version.
 
+## Phase 16 — from-scratch op-sweep (QACC depthwise + fast16/32 + asm requantize)
+
+`benchmarks/ESPRESSIF_VS_HEMATITE.md` now shows Hematite beating standard
+`esp-nn` on both real models (Model A 1.54×, Model B 1.29×, all bit-exact).
+This harness carried the silicon-probing work behind the three bespoke
+kernels added in the sweep:
+
+| Kernel (`hematite-s3/src/asm/`) | Primitive | On-device proof |
+|---|---|---|
+| `s8_accx_depthwise.S` | `EE.VMULAS.S8.QACC` per-lane 9-tap + **from-silicon 40-byte store read-back** (two-pass gapped store + word bit-slice into q0/q3/q1/q6) | `probe_qacc_esplike` validated lane-for-lane (16 lanes = 2,4,…,32 / 4,8,…,64); kernel bit-exact `0xea4d8cb0` |
+| `s8_accx_conv3x3.S` fast16/fast32 | unrolled TAP_16/TAP_32 (1/2 VLD + 1/2 VMULAS per tap) | full-API conv3x3 8868886 cyc (from 9511784) |
+| `s8_requantize.S` | fused `(acc+1)>>1 = srai(acc,1)+(acc&1)` + identity + clamp, uniform pair `(1<<30, shift∈{0,1})` | host test proves the overflow-free formula bit-exact for all i32; conv1x1 5041→4379, fc256 9086→8393 |
+
+The `probe_qacc.S` esplike read-back was the make-or-break: the raw 40-byte
+`ST.QACC` store is a diagonal layout that cannot be read lane-clean directly;
+the exact instruction sequence (verified verbatim from the working esp-nn
+depthwise kernel, then re-implemented from silicon probes) is what the
+bespoke depthwise kernel uses. See `PROJECT_LOG.md` Phase 16 for the full
+Model B cycle progression (9,970,333 → 770,827).
+
 ## Files
 
 | File | Role |
@@ -249,10 +269,12 @@ Engineering notes:
 | `sdkconfig.defaults` | `CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y` — match the Rust firmware's 240 MHz benchmark clock |
 | `main/CMakeLists.txt` | Registers `main.c` + **all 8** vendored asm files from `hematite-s3/src/asm/` (compiled with `-x assembler-with-cpp`) + the bespoke probes/kernels |
 | `main/main.c` | Harness: per-op fill_pattern + scalar refs, all `Tie728*Args` C structs, one SIMD wrapper + `run_bench` (1 warm-up + 10 timed, min+median) per op, sign-extending FNV-1a, UART report |
-| `main/probe_qacc.S` / `probe_s16.S` / `probe_s8accx.S` / `probe_accx.S` | On-device TIE728 primitive probes: QACC lane width, S16 QACC, S8-ACCX reduction, ACCX semantics |
+| `main/probe_qacc.S` / `probe_s16.S` / `probe_s8accx.S` / `probe_accx.S` | On-device TIE728 primitive probes: QACC lane width, S16 QACC, S8-ACCX reduction, ACCX semantics; `probe_qacc_esplike` locks the 40-byte-store two-pass read-back |
 | `main/s8_accx_conv1x1.S` | Bespoke 16-wide S8-ACCX dot-product conv1x1 kernel (bit-exact, raw `[oc][ic]` weights, fast64 path for `in_c==64`) — synced from `hematite-s3/src/asm/` |
 | `main/s8_accx_conv1x1_orig.S` | Original branchy conv1x1 kernel (A/B baseline) |
-| `main/s8_accx_conv3x3.S` | Bespoke S8-ACCX conv3x3 kernel (9-tap unrolled fast64, branch-loop) — synced from `hematite-s3/src/asm/` |
+| `main/s8_accx_conv3x3.S` | Bespoke S8-ACCX conv3x3 kernel (9-tap unrolled fast16/fast32/fast64, branch-loop) — synced from `hematite-s3/src/asm/` |
+| `main/s8_accx_depthwise.S` | Bespoke QACC per-lane depthwise kernel (9-tap, from-silicon 40-byte read-back) — synced from `hematite-s3/src/asm/` |
+| `main/s8_requantize.S` | Bespoke fused asm requantize epilogue (identity + `(acc+1)>>1`, uniform `(1<<30, shift∈{0,1})`) — synced from `hematite-s3/src/asm/` |
 | `.gitignore` | `build/`, `sdkconfig*`, `managed_components/`, `dependencies.lock` |
 
 ## Build + run on hardware

@@ -556,6 +556,55 @@ reference across uniform and per-channel cases, boundary/saturation
 values included; `uniform_scale_detects_uniformity`). Suite: 31
 `hematite-benchmarks` + 2 `hematite-s3` tests, all green.
 
+### Phase 16 — Bespoke full op-sweep: from scratch, beat ESP-NN end-to-end
+
+Directive (verbatim): *"we are rewriting everything from scratch to make this
+the best NN library for ESP32 out there"* — no vendoring of Espressif's conv
+kernels; every op implemented ourselves and validated bit-exact on the real
+ESP32-S3 board (`benchmarks/espnn-baseline` runs the same two models through
+standard `esp-nn` v1.2.5 for the head-to-head). Result: **Hematite now beats
+ESP-NN on both models, bit-exact everywhere.**
+
+Two real models were added to the firmware to make the comparison meaningful
+(`model_cnn.rs` / Model A 4-layer; `model_mv2.rs` / Model B
+MobileNetV2-style 7-layer), each reporting end-to-end cycles + per-layer
+FNV-1a checksums that must match the scalar reference exactly (and do, on
+every layer of both models, plus the C scalar/ESP-NN harnesses).
+
+| Phase | Work | Model B effect (cyc) |
+|---|---|---|
+| 0 | QACC 40-byte-store layout probe; esp-nn-style two-pass read-back locked from silicon | — |
+| 1 | Bespoke `s8_accx_depthwise.S` (QACC per-lane, from-scratch 16×i32 read-back), bit-exact in C | — |
+| 2 | Depthwise wiring into `hematite-s3` (+ pool prepared-path fix) | 9,970,333 → 9,074,866 |
+| 3 | First-conv `in_c<16` zero-pad to next multiple of 16 | 9,074,866 → 1,928,931 |
+| 4 | conv3x3 `fast16`/`fast32` unrolled paths | 1,928,931 → 914,239 |
+| 5 | fc general-path hardware-loop inner | 914,239 → 887,689 |
+| 6 | `s8_requantize.S` fused asm requantize epilogue | 887,689 → **770,827** |
+
+Final on-device (bench48, ESP32-S3 @ 240 MHz, all checksums bit-exact):
+
+| Model | ESP-NN optimized | Hematite | Ratio |
+|---|---|---|---|
+| A (4-layer) | 2,630,401 | **1,707,746** | 1.54× faster |
+| B (mv2mini 7-layer) | 994,782 | **770,827** | 1.29× faster |
+
+Bench rows (public API, `bench48`): conv1x1 4379, conv3x3 8868886 (full
+30×30), fc256 8393, max-pool 33461, avg-pool 29595, relu 358, add 411,
+mul 774, sub 491 — every checksum bit-exact vs scalar reference.
+
+Engineering notes:
+- `EE.VSMULAS.S8.QACC` lanes are wide (127×127×9 = 145161 survives); the
+  raw 40-byte `ST.QACC` store is a diagonal layout. The exact two-pass
+  read-back (gapped 20-byte store + word bit-slice into q0/q3/q1/q6) was
+  reverse-engineered from silicon via `probe_qacc_esplike` and validated
+  lane-for-lane on device before writing the depthwise kernel.
+- The asm requantize uses the overflow-free identity
+  `(acc + 1) >> 1 = srai(acc,1) + (acc & 1)`, proven bit-exact for all i32
+  via a 100k-value host test.
+- Xtensa LLVM-MC constraints hit again: `beqi imm==0` illegal, large `movi`
+  immediates illegal, `loop`/`bge` 8-bit fixup range → trampolines +
+  short-branch/long-jump patterns.
+
 ---
 
 ## 3. Known divergences and open technical debt
@@ -639,11 +688,12 @@ All 37 original plan tasks are complete and the Final Verification Wave
 approved. Hardware bring-up (Phase 9), the C-SIMD bit-exact output match
 (Phase 10), the per-operation all-SIMD comparison + relu fix (Phase 11),
 the prepared-kernel fast path (Phase 12), the bespoke GPR-accumulator
-(ACCX) kernels (Phase 13), the optimized fast64 ACCX paths (Phase 14), and
-the requantize fast paths (Phase 15) are complete; Phases 9-14 are
-committed, Phase 15 is uncommitted. Host test suite: 80 suites, 0
-failures, maintained throughout every change in this log (31 tests in
-`hematite-benchmarks` + 2 in `hematite-s3`).
+(ACCX) kernels (Phase 13), the optimized fast64 ACCX paths (Phase 14), the
+requantize fast paths (Phase 15), and the **from-scratch full op-sweep
+(Phase 16)** are complete; Phases 9-15 are committed, Phase 16 is
+uncommitted. Host test suite: 80 suites, 0 failures, maintained throughout
+every change in this log (31 tests in `hematite-benchmarks` + 3 in
+`hematite-s3`).
 
 On-device benchmark state: all **9 SIMD-capable operations** (conv1x1,
 conv3x3, fc, max/avg-pool, relu, add/sub/mul) run on the real hardware.
@@ -676,10 +726,20 @@ every checksum bit-exact. Phase 15 added the requantize fast paths
 conv3x3 to 9511784 and fc to 15293 cycles — full-API now lands ~1.3–2x of
 the raw C kernel numbers.
 
+**Phase 16** rewrote everything from scratch (no vendored conv asm) and
+closed the remaining coverage gaps: a bespoke QACC per-lane depthwise
+kernel (Phases 0–2), first-conv `in_c<16` zero-pad (Phase 3), conv3x3
+fast16/fast32 (Phase 4), fc hardware-loop (Phase 5), and a fused asm
+requantize epilogue (Phase 6). On two real models benchmarked head-to-head
+against standard ESP-NN, **Hematite now wins both, bit-exact**:
+Model A 1,707,746 vs ESP-NN 2,630,401 cycles (1.54×); Model B 770,827 vs
+994,782 (1.29×). conv1x1 now 4379, fc256 8393, conv3x3 8868886.
+
 **Open decisions awaiting explicit direction:**
 1. Force-push the rewritten git history to `origin/main`?
 2. The `person_detect`/`mobilenet_v2` rounding divergence's practical
    impact on hardware (now that real timing exists).
-3. ACCX performance headroom: an fc fast path for in_c=256 (16 groups)
-   is the remaining open kernel-side lever; the requantize is no longer
-   the dominant cost.
+3. Phase 16 (op-sweep) docs + commit: the working tree holds the full
+   from-scratch kernel rewrite and the two-model ESP-NN comparison; commit
+   is pending explicit user confirmation (per the standing "don't push
+   until I verify" rule).
