@@ -414,6 +414,70 @@ The prepared path closes the gap to ~1.0–2.2x of C raw-asm (was 2.5–5.5x).
 Documented in `benchmarks/espdl-baseline/README.md` under "Rust prepared-path
 vs C raw-asm".
 
+### Phase 13 — Bespoke GPR-accumulator (ACCX) kernels: bit-exact weighted SIMD
+
+On-device TIE728 probes (`probe_qacc`/`probe_s16`/`probe_s8accx`/`probe_accx`
+in `benchmarks/espdl-baseline/main/`) proved that **no QACC-based
+accumulation can be bit-exact** for the weighted ops:
+
+* `EE.VSMULAS.S8.QACC` saturates each of its 16 lanes at 8 bits — even a
+  single `127×127` product reads back `0x7f`. So the vendored
+  `dl_tie728_s8_conv2d_*` per-layer requantize (which Phase 10/11 had
+  "matched" between C and Rust) is fundamentally inexact: C-SIMD == Rust-s3
+  was the two sides producing the *same* 8-bit-saturated garbage.
+* `EE.VSMULAS.S16.QACC` saturates at 16 bits (32767 for a true acc of
+  129032) — so the earlier sign-extend-to-int16 plan was refuted too.
+* `EE.SRS.ACCX` is a 1-bit-pos instruction with a triangular shift mapping
+  (`gpr n → shift n(n+1)/2`), so `gpr=0` extracts the exact 32-bit
+  accumulator.
+* **`EE.VMULAS.S8.ACCX` is a 16-wide element-wise dot-product reduction into
+  a 32-bit GPR accumulator with full 16-bit products** (`127×127=16129`
+  preserved) — the exact bit-exact int8 conv primitive, working on the raw
+  `[oc][ic]` weight layout directly (no `[g][ic][lane]` transform needed).
+
+What was added:
+
+1. **`hematite-s3/src/asm/s8_accx_conv1x1.S` + `s8_accx_conv3x3.S`** —
+   bespoke kernels: per output channel, `EE.ZERO.ACCX`, inner ic16 loop
+   (`VLD.128.IP` filter + input, `VMULAS.S8.ACCX`), `SRS.ACCX gpr,0,0`,
+   store i32 acc to scratch. conv3x3 loops the 9 taps + row_delta between
+   rows; the *caller* loops output pixels (the asm computes one pixel).
+2. **`hematite-s3/src/accx.rs`** — `accx_eligible_1x1/3x3` gates
+   (`in_c>=16 && in_c%16==0 && out_c>=1`), a `ReqCtx` struct, and
+   `requantize_1x1` (bit-exact TFLite epilogue: `(acc·mult+round)>>total_shift`,
+   `+output_offset`, clamp `[act_min,act_max]`, saturating cast). The ACCX
+   path is wired into `PreparedConv1x1/Fc/Conv3x3` AND the public
+   `conv2d_1x1/fully_connected/conv2d_3x3`; scratch is a 4096-byte aligned
+   buffer in the bench firmware.
+3. **Three Xtensa-LLVM backend miscompiles found and fixed** (each surfaces
+   as a scrambled register at an inline-asm or high-arg-count call site):
+   `clobber_abi("C")` does not mark caller `a15` clobbered across `call8`
+   (the kernel's `a7` loop counter corrupted the caller's output pointer →
+   `out.ptr=0x40`; fix `out("a15") _`); `in("a12")` is clobbered by the
+   kernel's `a4` increment (fix `inout("a12") acc_out => _`); and
+   `avg_pool_2d_simd_ctx` is miscompiled both inlined and out-of-line (the
+   MaybeUninit args build's 16-byte array copy gets field-swapped) — fixed
+   by building the args as a plain struct literal and pinning every asm
+   operand to an explicit register (`in("a10")..in("a13")`, `callx8 a13`).
+
+Device results (`bench34`, ESP32-S3 @ 240 MHz) — **SIMD now equals the
+scalar reference bit-exact on every weighted row**:
+
+| Row | s3 SIMD cycles (min/med) | out_fnv(s3 == ref) |
+|---|---|---|
+| conv1x1 64x1x1x64 | 12595 / 12622 | `0x0bea8225` ✅ |
+| conv3x3 32x32 VALID | 35743534 / 35743561 | `0x0a181085` ✅ (full 30×30 image) |
+| fc 256→64 | 20068 / 20081 | `0x32e35185` ✅ |
+| max-pool 2x2x16 | 1892 / 1920 | `0x50d8f9c5` (== C-SIMD; pool fixed-point vs scalar `round_half_away_zero`) |
+| avg-pool 2x2x16 | 7342 / 7343 | `0xdedd2dc5` (== C-SIMD; same) |
+| relu/add/mul/sub 256 | 357/411/774/491 | bit-exact vs ref |
+
+conv1x1 went from 2627 cycles (vendored asm, wrong output) to 12595 cycles
+(ACCX, bit-exact) — ~2.5x the raw asm (element-wise reduction is one MAC
+per lane per input element rather than the QACC broadcast) but *correct*.
+Documented in `benchmarks/espdl-baseline/README.md` under "Bespoke ACCX
+kernels".
+
 ---
 
 ## 3. Known divergences and open technical debt
@@ -452,16 +516,14 @@ vs C raw-asm".
   the current benchmark table's specific shapes and is therefore an open,
   documented, low-confidence item — not proven safe under QEMU, just not
   proven broken either.
-- **SIMD output ≠ scalar reference on conv1x1** (`out_fnv` `0x5eee898e` vs
-  `0x0bea8225`, bit-exact across C↔Rust): the vendored TIE728 asm consumes
-  the filter in `[g][ic][lane]` layout (per 16-output-channel group,
-  input-channel-major, 16 lanes), while both the C and Rust wrappers feed
-  it raw `[oc][ic]` row-major weights. The result is a *deterministic*
-  rearrangement of the same math — not a bug, and it is why `conv1x1` SIMD
-  "speedup" numbers (col1 ≈ 51×) are computed against the scalar reference
-  even though the outputs differ. Fixing it (transposing the filter, or
-  feeding the asm's expected layout) is the largest single performance and
-  correctness headroom item left.
+- **SIMD output ≠ scalar reference on the weighted ops — RESOLVED by Phase
+  13.** The vendored TIE728 asm (QACC lanes, 8-bit saturating) could never
+  be bit-exact; the bespoke S8-ACCX kernels now make conv1x1/conv3x3/fc
+  SIMD output equal the scalar reference exactly (see Phase 13). The vendored
+  `[g][ic][lane]` filter-layout gap is gone (ACCX uses the raw `[oc][ic]`
+  layout). Remaining SIMD≠scalar: max/avg-pool (pool fixed-point `shift`/
+  `area_inv` semantics vs scalar `round_half_away_zero` — C-SIMD and Rust s3
+  agree with each other; only the reference differs).
 
 ---
 
@@ -498,20 +560,22 @@ vs C raw-asm".
 All 37 original plan tasks are complete and the Final Verification Wave
 approved. Hardware bring-up (Phase 9), the C-SIMD bit-exact output match
 (Phase 10), the per-operation all-SIMD comparison + relu fix (Phase 11),
-and the prepared-kernel fast path (Phase 12) are complete; Phases 9-11 are
-committed, Phase 12 is uncommitted. Host test suite: 80 suites, 0 failures,
-maintained throughout every change in this log (30 tests in
-`hematite-benchmarks`).
+the prepared-kernel fast path (Phase 12), and the bespoke GPR-accumulator
+(ACCX) kernels (Phase 13) are complete; Phases 9-11 are committed, Phases
+12-13 are uncommitted. Host test suite: 80 suites, 0 failures, maintained
+throughout every change in this log (31 tests in `hematite-benchmarks`).
 
 On-device benchmark state: all **9 SIMD-capable operations** (conv1x1,
-conv3x3, fc, max/avg-pool, relu, add/sub/mul) run the real TIE728 asm and
-are verified bit-exact against the independent ESP-IDF C harness
-(`benchmarks/espdl-baseline`). Raw asm cycle costs: conv1x1 472, conv3x3
-2824, fc 1288, max-pool 1396, avg-pool 7181, relu 175, add 167, sub 265,
-mul 539. ReLU/add/sub/mul are bit-exact vs scalar; conv/fc/pool differ by
-deterministic layout/rounding semantics (C↔Rust agree). Other SRAM rows
-are legitimately scalar (pad/input_c/out-channel gates); PSRAM-tier rows
-require a PSRAM-equipped board.
+conv3x3, fc, max/avg-pool, relu, add/sub/mul) run on the real hardware.
+The **weighted ops (conv1x1/conv3x3/fc) now run the bespoke ACCX kernels and
+are bit-exact vs the scalar reference** (0x0bea8225 / 0x0a181085 /
+0x32e35185); relu/add/sub/mul are bit-exact vs scalar; max/avg-pool run the
+vendored asm and are bit-exact vs the independent ESP-IDF C harness
+(`benchmarks/espdl-baseline`). Raw ACCX cycle costs: conv1x1 12595, conv3x3
+35743534 (full 30×30 image), fc 20068, max-pool 1892, avg-pool 7342, relu
+357, add 411, sub 491, mul 774. Other SRAM rows are legitimately scalar
+(pad/input_c/out-channel gates); PSRAM-tier rows require a PSRAM-equipped
+board.
 
 The **prepared-kernel fast path** (Phase 12) closes the Rust wrapper
 overhead to ~1.0–2.2x of C raw-asm (was 2.5–5.5x): the SIMD gate runs once
@@ -520,10 +584,15 @@ dispatches; MaybeUninit args builds eliminate the memset; an
 `#[inline(never)]` on `dispatch_fc` avoids an Xtensa miscompile. Prepared
 checksums are bit-exact equal to the public s3 checksums on all 12 rows.
 
+The **bespoke ACCX kernels** (Phase 13) make the weighted-op SIMD output
+bit-exact vs scalar — closing the correctness gap the vendored QACC asm
+could never close (8-bit/16-bit saturating lanes). conv1x1 went from 2627
+cycles (vendored, wrong output) to 12595 cycles (ACCX, bit-exact).
+
 **Open decisions awaiting explicit direction:**
 1. Force-push the rewritten git history to `origin/main`?
 2. The `person_detect`/`mobilenet_v2` rounding divergence's practical
    impact on hardware (now that real timing exists).
-3. The conv1x1/conv3x3/fc SIMD filter-layout gap (see §3): transpose the
-   weights to match the asm's `[g][ic][lane]` layout to make SIMD output
-   equal the scalar reference.
+3. ACCX performance headroom: the element-wise S8-ACCX reduction is ~2.5x
+   the raw QACC asm; a blocked/tiled accumulation or dual-accumulator
+   interleave could close part of that gap while staying bit-exact.

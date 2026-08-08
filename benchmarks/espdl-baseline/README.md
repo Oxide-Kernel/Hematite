@@ -129,14 +129,76 @@ Engineering notes from this work:
    the relu row is bit-exact vs scalar (0x6c620b3d) on both the C and Rust
    SIMD paths.
 
+## Bespoke ACCX kernels — bit-exact SIMD for the weighted ops
+
+On-device probes (this harness's `probe_qacc`/`probe_s8accx`/`probe_accx`)
+established that **no QACC-based accumulation can be bit-exact** for the
+weighted ops: `EE.VSMULAS.S8.QACC` saturates each of its 16 lanes at 8 bits
+(even one `127×127` product reads back `0x7f`), and `EE.VSMULAS.S16.QACC`
+saturates at 16 bits — so the vendored `dl_tie728_s8_conv2d_*` per-layer
+requantize is fundamentally inexact for any realistic accumulator.  All the
+pre-ACCX `bit-exact` C-SIMD == Rust-s3 matches in the table above were the two
+sides producing *the same* 8-bit-saturated garbage.
+
+The fix is a small **bespoke GPR-accumulator kernel** (in
+`hematite-s3/src/asm/s8_accx_conv1x1.S` / `s8_accx_conv3x3.S`, also used from
+this harness):
+
+* `EE.VMULAS.S8.ACCX` is a **16-wide element-wise dot-product reduction** into
+  a 32-bit GPR accumulator with **full 16-bit products** (`127×127=16129`
+  preserved, no lane saturation) — the exact bit-exact int8 conv primitive.
+* It works on the **raw `[oc][ic]` weight layout directly** (element-wise
+  `F[lane]·I[lane]`), so no `[g][ic][lane]` weight transform is needed.
+* `EE.SRS.ACCX gpr, 0, 0` extracts the exact 32-bit accumulator; the
+  TFLite requantize (`(acc·mult + round) >> total_shift`, clamp, saturating
+  cast) runs in Rust — bit-exact vs the scalar reference by construction.
+
+Device results (`bench34` firmware report, ESP32-S3 @ 240 MHz) — **SIMD now
+equals the scalar reference bit-exact** on every weighted row, and also
+matches the scalar reference where the vendored path could never match:
+
+| Operation (row) | ref scalar cycles | s3 SIMD cycles | out_fnv(ref) | out_fnv(s3) | SIMD == scalar ref? |
+|---|---|---|---|---|---|
+| conv1x1 64x1x1x64 | — | 12595 / 12622 | `0x0bea8225` | `0x0bea8225` | ✅ |
+| conv3x3 32x32 64x3x3x64 VALID | — | 35743534 / 35743561 | `0x0a181085` | `0x0a181085` | ✅ (full 30×30 image; the vendored path only ever wrote pixel (0,0)) |
+| fc 256→64 | — | 20068 / 20081 | `0x32e35185` | `0x32e35185` | ✅ |
+| max-pool 2x2, 32x32x16 | — | 1892 / 1920 | `0x651bfdc5` | `0x50d8f9c5` | no (pool fixed-point semantics vs scalar `round_half_away_zero` — same as the C-SIMD row) |
+| avg-pool 2x2, 32x32x16 | — | 7342 / 7343 | `0xb8a6ddc5` | `0xdedd2dc5` | no (same; s3 == C-SIMD `0xdedd2dc5`) |
+
+`conv1x1` went from 2627 cycles (vendored asm, wrong output) to 12595 cycles
+(ACCX, bit-exact) — the ACCX path is ~2.5x the raw asm (element-wise
+reduction is one MAC per lane per input element rather than the QACC
+broadcast trick) but is *correct*.
+
+Three Xtensa-LLVM backend miscompiles were found and fixed while wiring the
+ACCX kernel into `hematite-s3` (each surfaces as a scrambled register at an
+inline-asm or high-arg-count call site):
+
+1. **`clobber_abi("C")` does not mark the caller's `a15` clobbered** across a
+   `call8` — the kernel's `a7` (oc loop counter, = caller's `a15` after the
+   window rotation) corrupted the caller's output pointer → `out.ptr=0x40`
+   garbage. Fix: `out("a15") _` on the `accx_conv1x1` asm.
+2. **`in("a12")` value is clobbered by the kernel's `a4` increment** (callee
+   `a4` = caller `a12`) — the caller re-used the stale `a12` as the accs
+   pointer. Fix: `inout("a12") acc_out => _`.
+3. **`avg_pool_2d_simd_ctx`** (a `&mut`-ctx wrapper for the 8-arg vendored avg
+   pool) is miscompiled both inlined (scrambled `or a10,a7,a7`) and
+   out-of-line (the MaybeUninit args build's 16-byte array copy gets
+   field-swapped, and `{args}`/`{target}` operands get clobbered by the
+   template's `mov a10/a11`). Fix: build the args as a plain struct literal
+   (no MaybeUninit pointer-cast writes) and pin every asm operand to an
+   explicit register (`in("a10")`..`in("a13")`, `callx8 a13`).
+
 ## Files
 
 | File | Role |
 |---|---|
 | `CMakeLists.txt` | ESP-IDF project (`project(espdl_baseline)`); sources the main component only |
 | `sdkconfig.defaults` | `CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y` — match the Rust firmware's 240 MHz benchmark clock |
-| `main/CMakeLists.txt` | Registers `main.c` + **all 8** vendored asm files from `hematite-s3/src/asm/` (compiled with `-x assembler-with-cpp`) |
+| `main/CMakeLists.txt` | Registers `main.c` + **all 8** vendored asm files from `hematite-s3/src/asm/` (compiled with `-x assembler-with-cpp`) + the bespoke probes/kernels |
 | `main/main.c` | Harness: per-op fill_pattern + scalar refs, all `Tie728*Args` C structs, one SIMD wrapper + `run_bench` (1 warm-up + 10 timed, min+median) per op, sign-extending FNV-1a, UART report |
+| `main/probe_qacc.S` / `probe_s16.S` / `probe_s8accx.S` / `probe_accx.S` | On-device TIE728 primitive probes: QACC lane width, S16 QACC, S8-ACCX reduction, ACCX semantics |
+| `main/s8_accx_conv1x1.S` | Bespoke 16-wide S8-ACCX dot-product conv1x1 kernel (bit-exact, raw `[oc][ic]` weights) — proof-of-concept; the production copy lives in `hematite-s3/src/asm/` |
 | `.gitignore` | `build/`, `sdkconfig*`, `managed_components/`, `dependencies.lock` |
 
 ## Build + run on hardware
