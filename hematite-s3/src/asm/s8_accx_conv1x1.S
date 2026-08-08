@@ -10,6 +10,14 @@
 #   input[ic]. Because the reduction is element-wise (F[lane]*I[lane]), the
 #   RAW [oc][ic] weight layout works directly — NO transform needed.
 #
+# Optimization (this revision):
+#   * Input-resident fast path for in_c == 64: the 4 input vectors live in
+#     q0..q3 for the whole kernel, so each output channel only walks the
+#     filter (4 VLD, then 4 VMULAS with loads fully hoisted to hide VLD
+#     latency). Single-level hardware `loop` over output channels.
+#   * General path for any other in_c: the proven branch-based loop structure
+#     (nested Xtensa hardware loops are unreliable on this TIE/LLVM combo).
+#
 # ABI (windowed):
 #   s8_accx_conv1x1(input, filter, acc_out, in_c, out_c)
 #       a2=input (in_c int8), a3=filter (out_c*in_c int8),
@@ -23,38 +31,61 @@
 s8_accx_conv1x1:
     entry a1, 64
 
-    movi a7, 0          # oc index
-    movi a8, 16         # group step
-    # a9 = running filter ptr (starts at filter)
-    mov a9, a3
+    srai a8, a5, 4              # a8 = groups = in_c / 16
+    beqi a8, 4, .Lfast64        # in_c == 64: input-resident fast path
 
+    # ---- General path (any in_c % 16 == 0) ----
+    movi a7, 0                  # oc index
+    mov a9, a3                  # a9 = running filter row ptr
 .Loc:
     bge a7, a6, .Ldone
     EE.ZERO.ACCX
-
-    movi a10, 0         # ic offset within row
-    # a11 = running filter row ptr (= a9)
-    mov a11, a9
-    # a12 = running input ptr (= a2)
-    mov a12, a2
-
+    mov a10, a2                 # a10 = running input ptr
+    mov a11, a9                 # a11 = running filter ptr
+    mov a12, a8                 # a12 = groups counter
 .Lic:
-    bge a10, a5, .Lextract
+    beqz a12, .Lextract
     EE.VLD.128.IP q0, a11, 16
-    EE.VLD.128.IP q1, a12, 16
+    EE.VLD.128.IP q1, a10, 16
     EE.VMULAS.S8.ACCX q0, q1
-    addi a10, a10, 16
+    addi a12, a12, -1
     j .Lic
-
 .Lextract:
     movi a13, 0
     EE.SRS.ACCX a14, a13, 0
     s32i a14, a4, 0
     addi a4, a4, 4
-
     addi a7, a7, 1
-    add a9, a9, a5      # next filter row
+    add a9, a9, a5              # next filter row
     j .Loc
 
 .Ldone:
+    retw
+
+    # ---- Fast path: in_c == 64. Input resident in q0..q3. ----
+.Lfast64:
+    mov a10, a2
+    EE.VLD.128.IP q0, a10, 16
+    EE.VLD.128.IP q1, a10, 16
+    EE.VLD.128.IP q2, a10, 16
+    EE.VLD.128.IP q3, a10, 16
+
+    mov a7, a3                  # a7 = running filter row ptr
+    loop a6, .Lf64done
+        EE.ZERO.ACCX
+        mov a9, a7
+        EE.VLD.128.IP q4, a9, 16    # filter g0
+        EE.VLD.128.IP q5, a9, 16    # filter g1
+        EE.VLD.128.IP q6, a9, 16    # filter g2
+        EE.VLD.128.IP q7, a9, 16    # filter g3
+        EE.VMULAS.S8.ACCX q4, q0
+        EE.VMULAS.S8.ACCX q5, q1
+        EE.VMULAS.S8.ACCX q6, q2
+        EE.VMULAS.S8.ACCX q7, q3
+        movi a12, 0
+        EE.SRS.ACCX a13, a12, 0
+        s32i a13, a4, 0
+        addi a4, a4, 4
+        add a7, a7, a5           # next filter row (a5 == 64)
+    .Lf64done:
     retw
