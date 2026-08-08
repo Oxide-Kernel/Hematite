@@ -1,5 +1,10 @@
 # espdl-baseline — hardware C-SIMD baseline for the ESP32-S3 TIE728 kernels
 
+> 📊 **TL;DR comparison:** see
+> [`benchmarks/ESPRESSIF_VS_HEMATITE.md`](../ESPRESSIF_VS_HEMATITE.md) — the
+> one-page "Espressif NN Stack vs Hematite Stack" summary, operation by
+> operation.
+
 Plain-C harness that calls the **vendored Espressif TIE728 SIMD assembly**
 (the same `dl_tie728_s8_*.S` files `hematite-s3` inlines via `global_asm!`)
 on **real hardware**, so the C-side result can be matched bit-for-bit
