@@ -63,7 +63,7 @@ pub struct S3Backend;
 /// Round a channel count up to the next multiple of 16.
 #[inline(always)]
 fn pad16(n: usize) -> usize {
-    ((n + 15) / 16) * 16
+    n.div_ceil(16) * 16
 }
 
 /// Scratch bytes needed by the 1×1 ACCX path (`conv1x1_accx_dispatch`):

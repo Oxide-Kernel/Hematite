@@ -128,7 +128,7 @@ pub fn transform_weights_11cn(
     src: &[i8],
     dst: &mut [i8],
 ) -> Result<(), KernelError> {
-    if input_c % 16 != 0 || out_channels % 16 != 0 {
+    if !input_c.is_multiple_of(16) || !out_channels.is_multiple_of(16) {
         return Err(KernelError::ShapeMismatch);
     }
     if src.len() != input_c * out_channels || dst.len() != src.len() {
@@ -218,7 +218,7 @@ fn conv1x1_accx_dispatch(ctx: &mut Conv1x1AccxCtx<'_>) -> Result<bool, KernelErr
     if input_offset != 0 {
         let ws = unsafe { core::slice::from_raw_parts_mut(wsum, out_c) };
         let wv = unsafe { core::slice::from_raw_parts(w_ptr, out_c * input_c) };
-        crate::accx::weight_sums_conv(ws, wv, 1, input_c, out_c);
+        crate::accx::weight_sums_conv(ws, wv, 1, input_c);
     }
 
     let multipliers = params.output_multiplier_per_channel;
@@ -523,7 +523,6 @@ pub fn conv2d_1x1(
 ///   This captures per-channel vs per-tensor quantization differences at
 ///   the bit level. Documented in the test file.
 #[cfg(target_arch = "xtensa")]
-#[path = ""]
 mod conv1x1_simd {
     // The global_asm! invocations must live inside a module (per Rust safety
     // rules). On device, the linker resolves dl_tie728_s8_conv2d_11cn from the
@@ -569,13 +568,13 @@ mod conv1x1_simd {
         filter_channel_factor: *const i16, // offset 104
     }
 
-    /// Include the vendored TIE728 shared macros and conv2d entry points.
-    ///
-    /// These two files define:
-    /// * `dl_tie728_s8.S` — shared macros (requantize, bias preload, ReLU/PRelu epilogues)
-    /// * `dl_tie728_s8_conv2d.S` — entry points: `dl_tie728_s8_conv2d_11cn`,
-    ///   `dl_tie728_s8_conv2d_11cn_relu`, `dl_tie728_s8_conv2d_11cn_prelu`,
-    ///   and unaligned variants.
+    // Include the vendored TIE728 shared macros and conv2d entry points.
+    //
+    // These two files define:
+    // * `dl_tie728_s8.S` — shared macros (requantize, bias preload, ReLU/PRelu epilogues)
+    // * `dl_tie728_s8_conv2d.S` — entry points: `dl_tie728_s8_conv2d_11cn`,
+    //   `dl_tie728_s8_conv2d_11cn_relu`, `dl_tie728_s8_conv2d_11cn_prelu`,
+    //   and unaligned variants.
     core::arch::global_asm!(
         include_str!("../src/asm/dl_tie728_s8.S"),
         include_str!("../src/asm/dl_tie728_s8_conv2d.S"),

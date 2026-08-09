@@ -380,11 +380,11 @@ pub fn sub(
 /// preprocessing and postprocessing.
 #[cfg(target_arch = "xtensa")]
 mod elementwise_simd {
-    /// Include the vendored TIE728 shared macros and elementwise entry points.
-    ///
-    /// The shared `dl_tie728_s8.S` provides macros used by all three
-    /// elementwise files (`dl_tie728_s8_unaligned_store0`,
-    /// `tie728_s8_vector_round_result`, etc.).
+    // Include the vendored TIE728 shared macros and elementwise entry points.
+    //
+    // The shared `dl_tie728_s8.S` provides macros used by all three
+    // elementwise files (`dl_tie728_s8_unaligned_store0`,
+    // `tie728_s8_vector_round_result`, etc.).
     core::arch::global_asm!(
         include_str!("../src/asm/dl_tie728_s8.S"),
         include_str!("../src/asm/dl_tie728_s8_add.S"),

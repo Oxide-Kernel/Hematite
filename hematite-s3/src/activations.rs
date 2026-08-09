@@ -300,7 +300,7 @@ pub fn hard_swish(
 // local-notes/notepads/hematite-nn/problems.md, fixed for Phase 10.1).
 #[cfg(target_arch = "xtensa")]
 mod activation_simd {
-    /// Include the vendored TIE728 shared macros and relu entry points.
+    // Include the vendored TIE728 shared macros and relu entry points.
     core::arch::global_asm!(
         include_str!("../src/asm/dl_tie728_s8.S"),
         include_str!("../src/asm/dl_tie728_s8_relu.S"),

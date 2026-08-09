@@ -868,7 +868,7 @@ pub fn layout(spec: &KernelSpec) -> SpecLayout {
         // Relu acts on a single flat int8 tensor: input_len == output_len,
         // no weights or bias. The element count is carried in the spec name
         // but the slices' lengths are what the kernel validates.
-        KernelParams::Activation(p) => {
+        KernelParams::Activation(_p) => {
             // Relu has no num_elements field — the caller's input slice
             // length drives the kernel; the spec row fixes it at 256 for
             // SIMD eligibility. We encode it via a fixed constant.

@@ -62,7 +62,7 @@ use hematite_int8::{multiply_by_quantized_multiplier, saturating_cast};
 /// Host-compilable eligibility for the ACCX 1×1 / FC kernel.
 #[inline]
 pub(crate) fn accx_eligible_1x1(input_c: usize, out_c: usize) -> bool {
-    input_c >= 16 && input_c % 16 == 0 && out_c >= 1
+    input_c >= 16 && input_c.is_multiple_of(16) && out_c >= 1
 }
 
 /// Host-compilable eligibility for the ACCX 3×3 kernel.
@@ -88,9 +88,6 @@ pub(crate) fn accx_eligible_depthwise(input_c: usize, out_c: usize) -> bool {
     input_c >= 1 && out_c >= 1 && input_c == out_c
 }
 
-/// Context for the per-channel requantize epilogue.
-///
-
 /// Compute per-output-channel weight sums into `out`.
 ///
 /// Used to fold a non-zero `input_offset` bit-exactly: the scalar conv
@@ -101,14 +98,8 @@ pub(crate) fn accx_eligible_depthwise(input_c: usize, out_c: usize) -> bool {
 /// `weights` is the raw `[oc][tap][ic]` layout (taps = 1 for 1×1 / FC, 9 for
 /// 3×3). Host-compilable.
 #[inline]
-pub(crate) fn weight_sums_conv(
-    out: &mut [i32],
-    weights: &[i8],
-    taps: usize,
-    in_c: usize,
-    out_c: usize,
-) {
-    for oc in 0..out_c {
+pub(crate) fn weight_sums_conv(out: &mut [i32], weights: &[i8], taps: usize, in_c: usize) {
+    for (oc, o) in out.iter_mut().enumerate() {
         let mut s: i32 = 0;
         for t in 0..taps {
             let base = (oc * taps + t) * in_c;
@@ -116,7 +107,7 @@ pub(crate) fn weight_sums_conv(
                 s = s.wrapping_add(weights[base + ic] as i32);
             }
         }
-        out[oc] = s;
+        *o = s;
     }
 }
 
@@ -124,14 +115,14 @@ pub(crate) fn weight_sums_conv(
 /// `wsum[oc] = Σ_tap weights[tap·out_c + oc]`. Host-compilable.
 #[inline]
 pub(crate) fn weight_sums_depthwise(out: &mut [i32], weights: &[i8], out_c: usize) {
-    for oc in 0..out_c {
+    for (oc, o) in out.iter_mut().enumerate() {
         let mut s: i32 = 0;
         let mut t = oc;
         while t < weights.len() {
             s = s.wrapping_add(weights[t] as i32);
             t += out_c;
         }
-        out[oc] = s;
+        *o = s;
     }
 }
 /// Bundled into a single struct passed by `&mut` because the Xtensa LLVM

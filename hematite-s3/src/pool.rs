@@ -472,10 +472,10 @@ pub fn global_average_pool_2d(
 /// * Leg (c): SIMD vs scalar ref cross-check tolerance ≤1 LSB on requantize.
 #[cfg(target_arch = "xtensa")]
 mod pool_simd {
-    /// Include the vendored TIE728 shared macros and pool entry points.
-    ///
-    /// The shared `dl_tie728_s8.S` provides macros used by both pool files
-    /// (`dl_tie728_s8_unaligned_store0`, `tie728_s8_vector_round_result`, etc.).
+    // Include the vendored TIE728 shared macros and pool entry points.
+    //
+    // The shared `dl_tie728_s8.S` provides macros used by both pool files
+    // (`dl_tie728_s8_unaligned_store0`, `tie728_s8_vector_round_result`, etc.).
     core::arch::global_asm!(
         include_str!("../src/asm/dl_tie728_s8.S"),
         include_str!("../src/asm/dl_tie728_s8_max_pool2d.S"),

@@ -136,7 +136,7 @@ fn fc_accx_dispatch(ctx: &mut FcAccxCtx<'_>) -> Result<bool, KernelError> {
     if input_offset != 0 {
         let ws = unsafe { core::slice::from_raw_parts_mut(wsum, output_dim) };
         let wv = unsafe { core::slice::from_raw_parts(w_ptr, output_dim * input_dim) };
-        crate::accx::weight_sums_conv(ws, wv, 1, input_dim, output_dim);
+        crate::accx::weight_sums_conv(ws, wv, 1, input_dim);
     }
 
     let multipliers = params.output_multiplier_per_channel;
@@ -360,7 +360,7 @@ mod gemm_simd {
         filter_channel_factor: *const i16, // +104
     }
 
-    /// Include the vendored TIE728 shared macros and conv2d entry points.
+    // Include the vendored TIE728 shared macros and conv2d entry points.
     core::arch::global_asm!(
         include_str!("../src/asm/dl_tie728_s8.S"),
         include_str!("../src/asm/dl_tie728_s8_conv2d.S"),

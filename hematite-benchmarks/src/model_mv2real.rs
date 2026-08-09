@@ -33,7 +33,7 @@
 //! capture cross-checks the final FNV-1a against the ESP-NN baseline.
 
 use hematite_core::op_params::{
-    Conv2DParams, DepthwiseConv2DParams, FusedActivation, FullyConnectedParams, Padding,
+    Conv2DParams, DepthwiseConv2DParams, FullyConnectedParams, Padding,
 };
 
 pub const C1_IN_H: usize = 16;

@@ -950,7 +950,7 @@ fn emit_softmax(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedO
     let input = tensor_at(model.tensors(), in_t)?;
     let output = tensor_at(model.tensors(), out_t)?;
     let shape = shape4(&input.shape)?;
-    let row_size = shape[3] as i32;
+    let row_size = shape[3];
     let num_rows = (flat_len(&input.shape)? as i32) / row_size;
     let in_scale = tensor_scale(input)?;
     let in_zp = tensor_zp(input)?;

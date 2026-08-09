@@ -124,7 +124,7 @@ pub fn transform_weights_33cn(
     src: &[i8],
     dst: &mut [i8],
 ) -> Result<(), KernelError> {
-    if input_c % 16 != 0 || out_channels % 16 != 0 {
+    if !input_c.is_multiple_of(16) || !out_channels.is_multiple_of(16) {
         return Err(KernelError::ShapeMismatch);
     }
     let taps = 9;
@@ -330,7 +330,7 @@ fn conv3x3_accx_dispatch(ctx: &mut Conv3x3AccxCtx<'_>) -> Result<bool, KernelErr
     if input_offset != 0 {
         let ws = unsafe { core::slice::from_raw_parts_mut(wsum, out_c) };
         let wv = unsafe { core::slice::from_raw_parts(k_w_ptr, out_c * 9 * k_in_c) };
-        crate::accx::weight_sums_conv(ws, wv, 9, k_in_c, out_c);
+        crate::accx::weight_sums_conv(ws, wv, 9, k_in_c);
     }
 
     let multipliers = params.output_multiplier_per_channel;
@@ -676,7 +676,7 @@ mod conv3x3_simd {
         n_remainder: i32,              // +140
     }
 
-    /// Include the vendored TIE728 shared macros and conv2d entry points.
+    // Include the vendored TIE728 shared macros and conv2d entry points.
     core::arch::global_asm!(
         include_str!("../src/asm/dl_tie728_s8.S"),
         include_str!("../src/asm/dl_tie728_s8_conv2d.S"),
