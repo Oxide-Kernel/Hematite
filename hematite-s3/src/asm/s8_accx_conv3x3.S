@@ -1,5 +1,7 @@
 # s8_accx_conv3x3.S — bespoke GPR-accumulator 3x3 conv kernel (bit-exact).
 #
+# SPDX-License-Identifier: Apache-2.0
+#
 # Strategy (validated on device by probe_s8accx): EE.VMULAS.S8.ACCX is a
 # 16-wide element-wise dot-product reduction into a 32-bit accumulator with
 # full 16-bit products (127x127 = 16129 preserved). EE.SRS.ACCX gpr, 0, 0

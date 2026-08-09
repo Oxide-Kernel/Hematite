@@ -182,8 +182,7 @@ fn conv1x1_accx_dispatch(ctx: &mut Conv1x1AccxCtx<'_>) -> Result<bool, KernelErr
     let out_h = params.output_shape[1] as usize;
     let out_w = params.output_shape[2] as usize;
 
-    if params.input_offset != 0
-        || params.stride_height != 1
+    if params.stride_height != 1
         || params.stride_width != 1
         || params.dilation_height_factor != 1
         || params.dilation_width_factor != 1
@@ -194,7 +193,8 @@ fn conv1x1_accx_dispatch(ctx: &mut Conv1x1AccxCtx<'_>) -> Result<bool, KernelErr
         return Ok(false);
     }
 
-    let need = out_c * 4;
+    let input_offset = params.input_offset;
+    let need = out_c * 4 + if input_offset != 0 { out_c * 4 } else { 0 };
     if ctx.scratch.len() < need {
         return Ok(false);
     }
@@ -209,6 +209,16 @@ fn conv1x1_accx_dispatch(ctx: &mut Conv1x1AccxCtx<'_>) -> Result<bool, KernelErr
         || (accs as usize) % 4 != 0
     {
         return Ok(false);
+    }
+    let wsum = if input_offset != 0 {
+        unsafe { accs.add(out_c) }
+    } else {
+        core::ptr::null_mut()
+    };
+    if input_offset != 0 {
+        let ws = unsafe { core::slice::from_raw_parts_mut(wsum, out_c) };
+        let wv = unsafe { core::slice::from_raw_parts(w_ptr, out_c * input_c) };
+        crate::accx::weight_sums_conv(ws, wv, 1, input_c, out_c);
     }
 
     let multipliers = params.output_multiplier_per_channel;
@@ -233,6 +243,13 @@ fn conv1x1_accx_dispatch(ctx: &mut Conv1x1AccxCtx<'_>) -> Result<bool, KernelErr
                     input_c,
                     out_c,
                 );
+            }
+            if input_offset != 0 {
+                for oc in 0..out_c {
+                    let v = unsafe { accs.add(oc).read() };
+                    let s = unsafe { wsum.add(oc).read() };
+                    unsafe { accs.add(oc).write(v.wrapping_add(input_offset.wrapping_mul(s))) };
+                }
             }
             let acc_slice = unsafe { core::slice::from_raw_parts_mut(accs, out_c) };
             crate::accx::requantize_1x1(&mut crate::accx::ReqCtx {

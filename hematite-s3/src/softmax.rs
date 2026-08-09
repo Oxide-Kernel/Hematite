@@ -209,9 +209,145 @@ fn get_reciprocal(x: i32, x_integer_digits: i32, num_bits_over_unit: &mut i32) -
     one_over_one_plus_x_for_x_in_0_1(shifted_sum_minus_one)
 }
 
+// ── SIMD path (device only) ─────────────────────────────────────────────────
+
+/// Device SIMD helpers for softmax (TIE728 `EE.VMAX.S8` find-max).
+#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+mod softmax_simd {
+    use core::arch::{asm, global_asm};
+
+    global_asm!(include_str!("asm/s8_softmax.S"));
+
+    /// `EE.VMAX.S8` find-max over `input[0..len)`.
+    ///
+    /// `input` must be 16-byte aligned; `len >= 1`. Returns the signed max.
+    pub unsafe fn find_max(input: *const i8, len: usize) -> i8 {
+        let mut max: usize;
+        asm!(
+            "call8 s8_find_max",
+            inout("a10") input => max,
+            in("a11") len,
+            lateout("a11") _,
+            lateout("a12") _,
+            lateout("a13") _,
+            lateout("a14") _,
+            lateout("a15") _,
+            clobber_abi("C"),
+        );
+        max as i8
+    }
+}
+
+/// Softmax with a SIMD find-max (VMAX) + exponential cache in `scratch`.
+///
+/// Bit-exact vs the scalar path: identical gemmlowp fixed-point math; only the
+/// max scan uses TIE728 and the per-element Q0.31 exponentials are computed
+/// once (cached in `scratch` as `i32`) instead of twice (the scalar path
+/// recomputes them in the normalization pass).
+///
+/// # Arguments
+///
+/// * `input` — 16-byte aligned logits, length `num_rows * row_size`.
+/// * `params` — softmax quantization and shape parameters.
+/// * `output` — mutable slice for int8 output, same length as `input`.
+/// * `scratch` — at least `row_size * 4` bytes (Q0.31 exp cache).
+#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+fn softmax_simd(
+    input: &[i8],
+    params: &SoftmaxParams,
+    output: &mut [i8],
+    scratch: &mut [u8],
+) -> Result<(), KernelError> {
+    let num_rows = params.num_rows as usize;
+    let row_size = params.row_size as usize;
+
+    // Scratch = Q0.31 exp cache: row_size * 4 bytes.
+    if scratch.len() < row_size * 4 {
+        return Err(KernelError::ShapeMismatch);
+    }
+    let cache = unsafe {
+        core::slice::from_raw_parts_mut(scratch.as_mut_ptr().cast::<i32>(), row_size)
+    };
+
+    let q526_shift = params.input_left_shift + 1;
+
+    for row in 0..num_rows {
+        let row_start = row * row_size;
+        let row_input = &input[row_start..row_start + row_size];
+        let row_output = &mut output[row_start..row_start + row_size];
+
+        // Step 1: VMAX find-max.
+        let max_val =
+            i32::from(unsafe { softmax_simd::find_max(row_input.as_ptr(), row_size) });
+
+        // Step 2: Q5.26 scaling, gemmlowp exp (Q0.31), accumulate Q12.19.
+        let mut sum_q1219: i32 = 0;
+        {
+            let mut i = 0;
+            while i < row_size {
+                let diff = i32::from(row_input[i]) - max_val;
+                if diff >= params.diff_min {
+                    let scaled = sadhg(diff, params.input_multiplier);
+                    let diff_q526 =
+                        saturating_rounding_left_shift(scaled, q526_shift);
+                    let exp_q031 = exp_on_negative_values(diff_q526, 5);
+                    cache[i] = exp_q031;
+                    let exp_q1219 =
+                        rounding_divide_by_pot(exp_q031, K_ACCUM_INT_BITS);
+                    sum_q1219 = sum_q1219.wrapping_add(exp_q1219);
+                } else {
+                    cache[i] = 0;
+                }
+                i += 1;
+            }
+        }
+
+        // Steps 3-4: Reciprocal of sum, normalization into int8 output.
+        if sum_q1219 > 0 {
+            let mut num_bits_over_unit: i32 = 0;
+            let shifted_scale =
+                get_reciprocal(sum_q1219, K_ACCUM_INT_BITS, &mut num_bits_over_unit);
+            let exponent = num_bits_over_unit + 23;
+
+            let mut i = 0;
+            while i < row_size {
+                let diff = i32::from(row_input[i]) - max_val;
+                if diff < params.diff_min {
+                    row_output[i] = params.quantized_activation_min as i8;
+                } else {
+                    // Reuse cached Q0.31 exponential.
+                    let exp_q031 = cache[i];
+
+                    let scaled_raw = sadhg(shifted_scale, exp_q031);
+                    let unsat = rounding_divide_by_pot(scaled_raw, exponent);
+                    let signed = unsat.wrapping_add(params.output_offset);
+
+                    let clamped = if signed > params.quantized_activation_max {
+                        params.quantized_activation_max
+                    } else if signed < params.quantized_activation_min {
+                        params.quantized_activation_min
+                    } else {
+                        signed
+                    };
+                    row_output[i] = clamped as i8;
+                }
+                i += 1;
+            }
+        } else {
+            let mut i = 0;
+            while i < row_size {
+                row_output[i] = params.quantized_activation_min as i8;
+                i += 1;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
-/// Int8-safe softmax — scalar kernel (SCALAR ONLY).
+/// Int8-safe softmax — scalar kernel (SCALAR ONLY on host).
 ///
 /// Mirrors the TFLM/gemmlowp arithmetic from the golden fixture generator
 /// bit-for-bit. Two-pass recompute (no scratch buffer needed for
@@ -238,6 +374,19 @@ pub fn softmax(
     }
     if output.len() != input.len() {
         return Err(KernelError::ShapeMismatch);
+    }
+
+    // TIE728 VMAX find-max + exp-cache path (device only).
+    #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+    {
+        let row_size_u = params.row_size as usize;
+        if row_size_u >= 16
+            && (input.as_ptr() as usize) % 16 == 0
+            && (scratch.as_ptr() as usize) % 4 == 0
+            && scratch.len() >= row_size_u * 4
+        {
+            return softmax_simd(input, params, output, scratch);
+        }
     }
 
     for row in 0..num_rows {
