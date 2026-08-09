@@ -23,9 +23,9 @@
 //!
 //! ## Bit-exactness vs the executed-TFLite golden
 //!
-//! Three models assert bit-exact output (sine, hello_world, keyword
-//! spotting). Three models compile and execute but are NOT bit-exact
-//! (person_detect, mobilenet_v2, anomaly_detect):
+//! Four models assert bit-exact output (sine, hello_world, keyword
+//! spotting, person_detect). Two models compile and execute but are NOT
+//! bit-exact (mobilenet_v2, anomaly_detect):
 //!
 //! * `anomaly_detect` (10× FC): the golden was regenerated (todo T10) from
 //!   EXECUTED tflite-micro at the pinned SHA. Executed TFLM at this SHA
@@ -36,16 +36,21 @@
 //!   two agree except at exact rounding boundaries: hematite vs executed
 //!   TFLM differs on 210/640 output elements by exactly ±1. Root cause +
 //!   fix path in `models/zoo/DEFERRED_MODELS.md` §6 and todo T11.
-//! * `person_detect` (27 convs + softmax): compiles + executes; its golden
-//!   is byte-identical between LiteRT and executed TFLM, and the model's
-//!   output asserts against neither while the kernel rounding + softmax
-//!   divergences above remain open.
+//! * `person_detect` (27 convs + softmax): **bit-exact** (upgraded by todo
+//!   T11). The executed-TFLM golden at the pinned SHA produces [120, -120]
+//!   (fnv1a 0x6962079d) for this input — hash-identical to the pre-T10
+//!   LiteRT golden — and the hematite kernels match it element-for-element:
+//!   the wide-logit softmax divergence does NOT manifest at this SHA, and
+//!   the conv chain matches through all 27 ops.
 //! * `mobilenet_v2` (transpose/pad/conv/depthwise/add/mean/fc/softmax): the
-//!   PAD kernel fills with raw 0 while TFLM pads with the output/input
-//!   zero point (pad.cc @ pinned SHA: `pad_value = output_zero_point`), and
-//!   the conv rounding differences apply — see DEFERRED_MODELS.md §7. The
-//!   relative s3 == ref check in the S3 test below holds exactly because
-//!   BOTH backends share the same raw-0 fill.
+//!   PAD kernel fills with raw 0 while TFLM pads with the output zero point
+//!   (pad.cc @ pinned SHA: `pad_value = output_zero_point` when
+//!   `constant_values == nullptr`), and the conv rounding differences
+//!   apply — see DEFERRED_MODELS.md §7. Measured residual vs the
+//!   regenerated executed-TFLM golden (todo T11): 984/1000 output elements
+//!   differ, dominated by the PAD-fill propagation. The relative s3 == ref
+//!   check in the S3 test below holds exactly because BOTH backends share
+//!   the same raw-0 fill.
 
 use hematite_ref::RefBackend;
 use hematite_tests::goldens::models;
@@ -74,6 +79,19 @@ fn assert_bit_exact(actual: &[i8], expected: &[i8], name: &str) {
 
 fn flat_len(shape: &[i32]) -> usize {
     shape.iter().map(|&d| d as usize).product()
+}
+
+/// FNV-1a 32-bit over raw output bytes (i8 -> u8) — identical to the
+/// executed-TFLM harness checksum (`tools/generate_goldens/src/ops/
+/// zoo_tflm.rs::fnv1a_i8`), so a matched fnv proves byte-identical output
+/// to the executed interpreter.
+fn fnv1a(values: &[i8]) -> u32 {
+    let mut h: u32 = 2166136261;
+    for &v in values {
+        h ^= v as u8 as u32;
+        h = h.wrapping_mul(16777619);
+    }
+    h
 }
 
 /// Run `f` on a thread with a large stack. The generated straight-line
@@ -211,13 +229,15 @@ mod models_anomaly_detect {
 
 // ── Person detection (VWW, matches person_detect_v2) ───────────────────────
 //
-// Compiles + executes through the emitter (conv/depthwise/pool/reshape/fc/
-// softmax), but is NOT asserted bit-exact: its executed-TFLM golden (todo
-// T10, hash-identical to the pre-T10 LiteRT golden) differs from the
-// hematite kernels at rounding boundaries and the int8 softmax path — the
-// gemmlowp double-rounding requantization + wide-logit softmax saturation
-// semantics of executed TFLM at the pinned SHA. See module docs +
-// DEFERRED_MODELS.md §6.
+// BIT-EXACT (upgraded by todo T11): the executed-TFLM golden at the pinned
+// SHA 18b9e6f2a8c5a9518e588f59c2ba16ef7ef9d551 produces [120, -120] for
+// this input (fnv1a 0x6962079d — hash-identical to the pre-T10 LiteRT
+// golden, so the golden file was not regenerated). The §6.2 wide-logit
+// softmax divergence ([127,-128] TFLM-reference vs [120,-120] LiteRT) does
+// NOT manifest at the pinned SHA: the executed TFLM int8 softmax produces
+// the same [120,-120] as the hematite kernels, and the conv chain matches
+// bit-exactly through all 27 ops. This test asserts both the
+// element-for-element equality AND the executed-TFLM harness fnv.
 
 mod models_person_detect {
     use super::*;
@@ -227,13 +247,20 @@ mod models_person_detect {
     pub struct PersonDetectModel;
 
     #[test]
-    fn person_detect_compiles_and_executes() {
+    fn person_detect_predict_bit_exact() {
         let _ = PersonDetectModel;
         on_large_stack(|| {
             assert_eq!(Model::<RefBackend>::input_len(), flat_len(&models::person_detect_int8::INPUT_SHAPE));
             assert_eq!(Model::<RefBackend>::output_len(), flat_len(&models::person_detect_int8::OUTPUT_SHAPE));
             let model = Model::new(RefBackend);
-            let _out = model.predict(&models::person_detect_int8::INPUT_DATA);
+            let out = model.predict(&models::person_detect_int8::INPUT_DATA);
+            assert_bit_exact(&out, &models::person_detect_int8::EXPECTED_OUTPUT, "person_detect");
+            assert_eq!(
+                fnv1a(&out),
+                0x6962079d,
+                "person_detect: fnv1a 0x{:08x} != executed-TFLM golden 0x6962079d",
+                fnv1a(&out),
+            );
         });
     }
 }
@@ -242,9 +269,18 @@ mod models_person_detect {
 //
 // Compiles + executes through the emitter (transpose/pad/conv/depthwise/add/
 // mean/reshape/fc/softmax — the widest op set in the zoo), but is NOT
-// asserted bit-exact: the PAD kernel fills with raw 0 while LiteRT pads with
-// the input zero point, and the conv/softmax rounding differences noted in
-// the module docs apply. See DEFERRED_MODELS.md.
+// asserted bit-exact vs the executed-TFLM golden. Residual measured directly
+// (todo T11) against the regenerated golden (fnv1a 0x1b01ca5b):
+// 984/1000 output elements differ — 890 by |d| ≥ 3 (max 60), 94 by ±1/±2.
+// The driver is the PAD-fill deviation: TFLM pad.cc @ pinned SHA fills the
+// output zero point (−14) when `constant_values == nullptr` (mv2's 18 PADs);
+// Hematite's `PadParams` carries no zero point and the trait `pad()` has no
+// pad-value arg, so ref + s3 fill raw 0. The zero-fill propagates through
+// the conv chain and dominates the output (the ±1/±2 class is the rounding
+// boundary divergence). Fixing this needs param plumbing (a pad-value /
+// zero-point field on PadParams + codegen emission) — a documented follow-up,
+// NOT attempted here; both backends share the identical fill, so the
+// relative s3 == ref gate holds exactly. See DEFERRED_MODELS.md §7.
 
 mod models_mobilenet_v2 {
     use super::*;
@@ -438,9 +474,10 @@ mod models_anomaly_detect_s3_backend {
 // 27 convs + average pool + RESHAPE + fc + softmax — RESHAPE (code 22) was
 // the last unwired op and is now covered by the todo-25 amendment, so the
 // full model runs on S3. The RefBackend side mirrors `models_person_detect`
-// (compile+execute; known ±1 golden divergence — rounding + int8 softmax
-// provenance, shared identically by both backends). The S3 side asserts the
-// relative s3 == ref equality element-for-element — the wiring gate.
+// (now BIT-EXACT vs the executed-TFLM golden, upgraded by todo T11). The S3
+// side asserts the relative s3 == ref equality element-for-element — the
+// wiring gate (the absolute golden check on S3 is covered by the RefBackend
+// bit-exact test; the s3 scalar kernels share the ref semantics).
 
 #[cfg(feature = "hematite-s3")]
 mod models_person_detect_s3_backend {
