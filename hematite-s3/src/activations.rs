@@ -114,8 +114,9 @@ pub fn relu(
     // quant-affine steps degenerate to the identity: zero offsets and an
     // identity requantize pair. (mult=1<<30, shift=1) is the identity pair:
     // `(v·2³⁰ + 2²⁹) >> 30 = v` exactly (round half-up is swallowed by the
-    // 30-bit shift).
-    #[cfg(target_arch = "xtensa")]
+    // 30-bit shift). Gated `not(feature = "qemu")` — the QEMU TIE728 emulation
+    // of VRELU.S8 is broken (aligns with PreparedRelu + the conv family).
+    #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
     {
         if params.input_offset == 0
             && params.output_offset == 0
@@ -236,8 +237,10 @@ pub fn hard_swish(
 /// TIE728 SIMD backend for activation ops.
 ///
 /// This module is **entirely cfg-gated** behind `#[cfg(target_arch = "xtensa")]`
-/// and is NEVER compiled on the host (stable-aarch64-apple-darwin). It exists
-/// in the tree for structural review and Phase 5 device verification (T5.3).
+/// (the dispatch into it is additionally gated `not(feature = "qemu")`, so the
+/// broken QEMU TIE728 emulation is never reached) and is NEVER compiled on the
+/// host (stable-aarch64-apple-darwin). It exists in the tree for structural
+/// review and Phase 5 device verification (T5.3).
 ///
 /// ## Architecture
 ///

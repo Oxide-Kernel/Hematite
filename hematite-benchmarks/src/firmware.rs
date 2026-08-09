@@ -907,10 +907,12 @@ pub fn run_benchmarks() -> ! {
     crate::model_validation::validate_all();
 
     // 4.6 TIE728 SIMD correctness (elementwise + pool vs hematite-ref) —
-    // same feature gate and ordering rationale as 4.5. conv1x1/conv3x3/gemm
-    // are excluded (already proven broken under QEMU and gated off at the
-    // `hematite-s3` dispatch level, not re-tested here).
-    #[cfg(feature = "model-validation")]
+    // hardware-only: gated `not(feature = "qemu")` because the QEMU fork's
+    // TIE728 compute emulation is broken (VADDS crash, VSUBS silent wrong,
+    // VMULAS/pool hang) — the SIMD suite must never run under qemu. Same
+    // feature + ordering rationale as 4.5. conv1x1/conv3x3/gemm are excluded
+    // (already gated off at the `hematite-s3` dispatch level).
+    #[cfg(all(feature = "model-validation", not(feature = "qemu")))]
     crate::simd_validation::validate_all();
 
     // 5. Per-kernel benchmarks.

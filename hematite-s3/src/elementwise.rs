@@ -12,8 +12,11 @@
 //! | (c) | SIMD vs ref cross-check ≤1 LSB on requantize | Device (Phase 5) |
 //!
 //! On host (stable-aarch64-apple-darwin), only leg (b) executes. The SIMD path
-//! (`#[cfg(target_arch = "xtensa")]`) is NEVER compiled on host — it exists in
-//! the tree for structural review and Phase 5 device verification.
+//! (`#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]`) is NEVER
+//! compiled on host and is additionally compiled out under `feature = "qemu"`
+//! (the Espressif QEMU fork's TIE728 emulation of VADDS/VSUBS/VMULAS is broken
+//! — crashes/silent wrong/hangs) — it exists in the tree for structural review
+//! and Phase 5 device verification.
 //!
 //! # Binary ops (add, mul, sub)
 //!
@@ -58,8 +61,10 @@ pub fn add(
     // when every quant-affine step degenerates to the identity: zero
     // offsets, no left_shift scaling, and both the per-input and output
     // (multiplier, shift) pairs at (1<<30, 1) — the same identity pair the
-    // scalar loop itself already special-cases below.
-    #[cfg(target_arch = "xtensa")]
+    // scalar loop itself already special-cases below. Gated `not(feature =
+    // "qemu")` — the QEMU TIE728 emulation of VADDS crashes, so SIMD dispatch
+    // must be impossible under `feature = "qemu"` (scalar-only there).
+    #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
     {
         let identity = |m: i32, s: i32| m == 1 << 30 && s == 1;
         if params.input1_offset == 0
@@ -161,8 +166,9 @@ pub fn mul(
     // `multiply_by_quantized_multiplier(product, 1<<30, output_shift)` reduces
     // to `round(product >> (1 - output_shift))`, so `mul_shift = 1 -
     // output_shift` reproduces the scalar path exactly; `output_shift <= 1`
-    // is exactly what keeps that `mul_shift` non-negative.
-    #[cfg(target_arch = "xtensa")]
+    // is exactly what keeps that `mul_shift` non-negative. Gated
+    // `not(feature = "qemu")` — the QEMU TIE728 VMULAS emulation hangs.
+    #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
     {
         if params.input1_offset == 0
             && params.input2_offset == 0
@@ -236,7 +242,9 @@ pub fn sub(
     // ── TIE728 SIMD dispatch (device-only; compiled out entirely on host) ──
     // Same identity contract as `add`'s dispatch above — `sub_simd_aligned`
     // computes a raw int8 subtract with no offset/rescale/requantize step.
-    #[cfg(target_arch = "xtensa")]
+    // Gated `not(feature = "qemu")` — the QEMU TIE728 VSUBS emulation is
+    // silently wrong.
+    #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
     {
         let identity = |m: i32, s: i32| m == 1 << 30 && s == 1;
         if params.input1_offset == 0
@@ -315,8 +323,10 @@ pub fn sub(
 /// TIE728 SIMD backend for elementwise ops.
 ///
 /// This module is **entirely cfg-gated** behind `#[cfg(target_arch = "xtensa")]`
-/// and is NEVER compiled on the host (stable-aarch64-apple-darwin). It exists
-/// in the tree for structural review and Phase 5 device verification (T5.3).
+/// (the dispatch into it is additionally gated `not(feature = "qemu")`, so the
+/// broken QEMU TIE728 emulation is never reached) and is NEVER compiled on the
+/// host (stable-aarch64-apple-darwin). It exists in the tree for structural
+/// review and Phase 5 device verification (T5.3).
 ///
 /// ## Architecture
 ///
@@ -631,7 +641,8 @@ pub struct PreparedAdd {
 impl PreparedAdd {
     /// Run the SIMD gate once; subsequent `run` calls skip it.
     pub fn new(params: &'static ElementwiseParams) -> Result<Self, KernelError> {
-        let simd = simd_eligible_add_sub(params) && cfg!(all(target_arch = "xtensa"));
+        let simd = simd_eligible_add_sub(params)
+            && cfg!(all(target_arch = "xtensa", not(feature = "qemu")));
         Ok(Self { simd, params })
     }
 
@@ -648,7 +659,7 @@ impl PreparedAdd {
         output: &mut [i8],
         scratch: &mut [u8],
     ) -> Result<(), KernelError> {
-        #[cfg(target_arch = "xtensa")]
+        #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
         {
             let n = self.params.num_elements as usize;            if self.simd && n % 16 == 0 {
                 let in1_ptr = input1.as_ptr();
@@ -680,7 +691,7 @@ impl PreparedMul {
     /// Run the SIMD gate once; subsequent `run` calls skip it.
     pub fn new(params: &'static ElementwiseParams) -> Result<Self, KernelError> {
         let mul_shift =
-            simd_eligible_mul(params).filter(|_| cfg!(all(target_arch = "xtensa")));
+            simd_eligible_mul(params).filter(|_| cfg!(all(target_arch = "xtensa", not(feature = "qemu"))));
         Ok(Self { mul_shift, params })
     }
 
@@ -697,7 +708,7 @@ impl PreparedMul {
         output: &mut [i8],
         scratch: &mut [u8],
     ) -> Result<(), KernelError> {
-        #[cfg(target_arch = "xtensa")]
+        #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
         {
             let n = self.params.num_elements as usize;            if let Some(mul_shift) = self.mul_shift {
                 if n % 16 == 0 {
@@ -730,7 +741,8 @@ pub struct PreparedSub {
 impl PreparedSub {
     /// Run the SIMD gate once; subsequent `run` calls skip it.
     pub fn new(params: &'static ElementwiseParams) -> Result<Self, KernelError> {
-        let simd = simd_eligible_add_sub(params) && cfg!(all(target_arch = "xtensa"));
+        let simd = simd_eligible_add_sub(params)
+            && cfg!(all(target_arch = "xtensa", not(feature = "qemu")));
         Ok(Self { simd, params })
     }
 
@@ -747,7 +759,7 @@ impl PreparedSub {
         output: &mut [i8],
         scratch: &mut [u8],
     ) -> Result<(), KernelError> {
-        #[cfg(target_arch = "xtensa")]
+        #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
         {
             let n = self.params.num_elements as usize;            if self.simd && n % 16 == 0 {
                 let in1_ptr = input1.as_ptr();

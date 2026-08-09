@@ -12,8 +12,10 @@
 //! | (c) | SIMD vs ref cross-check ≤1 LSB on requantize | Device (Phase 5) |
 //!
 //! On host (stable-aarch64-apple-darwin), only leg (b) executes. The SIMD path
-//! (`#[cfg(target_arch = "xtensa")]`) is NEVER compiled on host — it exists in
-//! the tree for structural review and Phase 5 device verification.
+//! (`#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]`) is NEVER
+//! compiled on host and is additionally compiled out under `feature = "qemu"`
+//! (the Espressif QEMU fork's TIE728 pool emulation hangs) — it exists in the
+//! tree for structural review and Phase 5 device verification.
 //!
 //! # Kernels
 //!
@@ -108,8 +110,9 @@ pub fn average_pool_2d(
     // matches the scalar path when the activation range is the full int8
     // range (native saturating cast, matching the hardware's own int8
     // arithmetic). area_inv=64/shift=8 are the exact reciprocal constants
-    // for a 2x2 (area=4) filter: round(2^8 / 4) = 64.
-    #[cfg(target_arch = "xtensa")]
+    // for a 2x2 (area=4) filter: round(2^8 / 4) = 64. Gated `not(feature =
+    // "qemu")` — the QEMU TIE728 avg-pool emulation hangs.
+    #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
     {
         if filter_h == 2
             && filter_w == 2
@@ -253,8 +256,9 @@ pub fn max_pool_2d(
     // ── TIE728 SIMD dispatch (device-only; compiled out entirely on host) ──
     // Same eligibility contract as `average_pool_2d`'s dispatch above —
     // `dl_tie728_s8_max_pool2d_22c1` hardcodes 2x2/stride-2 and has no
-    // clamp field, so full-range activation bounds are required.
-    #[cfg(target_arch = "xtensa")]
+    // clamp field, so full-range activation bounds are required. Gated
+    // `not(feature = "qemu")` — the QEMU TIE728 max-pool emulation hangs.
+    #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
     {
         if filter_h == 2
             && filter_w == 2
@@ -414,8 +418,10 @@ pub fn global_average_pool_2d(
 /// TIE728 SIMD backend for pooling ops.
 ///
 /// This module is **entirely cfg-gated** behind `#[cfg(target_arch = "xtensa")]`
-/// and is NEVER compiled on the host (stable-aarch64-apple-darwin). It exists
-/// in the tree for structural review and Phase 5 device verification (T5.3).
+/// (the dispatch into it is additionally gated `not(feature = "qemu")`, so the
+/// broken QEMU TIE728 emulation is never reached) and is NEVER compiled on the
+/// host (stable-aarch64-apple-darwin). It exists in the tree for structural
+/// review and Phase 5 device verification (T5.3).
 ///
 /// ## Architecture
 ///
@@ -880,7 +886,8 @@ pub struct PreparedMaxPool {
 impl PreparedMaxPool {
     /// Run the SIMD gate once; subsequent `run` calls skip it.
     pub fn new(params: &'static PoolParams) -> Result<Self, KernelError> {
-        let simd = simd_eligible_pool(params).filter(|_| cfg!(all(target_arch = "xtensa")));
+        let simd = simd_eligible_pool(params)
+            .filter(|_| cfg!(all(target_arch = "xtensa", not(feature = "qemu"))));
         Ok(Self { simd, params })
     }
 
@@ -896,7 +903,7 @@ impl PreparedMaxPool {
         output: &mut [i8],
         scratch: &mut [u8],
     ) -> Result<(), KernelError> {
-        #[cfg(target_arch = "xtensa")]
+        #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
         {
             if let Some((input_channel, input_y_offset, input_x_offset, c_div_x_1)) = self.simd {
                 let in_ptr = input.as_ptr();
@@ -949,7 +956,8 @@ pub struct PreparedAvgPool {
 impl PreparedAvgPool {
     /// Run the SIMD gate once; subsequent `run` calls skip it.
     pub fn new(params: &'static PoolParams) -> Result<Self, KernelError> {
-        let simd = simd_eligible_pool(params).filter(|_| cfg!(all(target_arch = "xtensa")));
+        let simd = simd_eligible_pool(params)
+            .filter(|_| cfg!(all(target_arch = "xtensa", not(feature = "qemu"))));
         Ok(Self { simd, params })
     }
 
@@ -965,7 +973,7 @@ impl PreparedAvgPool {
         output: &mut [i8],
         scratch: &mut [u8],
     ) -> Result<(), KernelError> {
-        #[cfg(target_arch = "xtensa")]
+        #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
         {
             if let Some((input_channel, input_y_offset, input_x_offset, c_div_x_1)) = self.simd {
                 let in_ptr = input.as_ptr();
