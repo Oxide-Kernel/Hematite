@@ -864,6 +864,11 @@ pub fn run_benchmarks() -> ! {
         unsafe {
             PSRAM_ARENA = core::slice::from_raw_parts_mut(psram_ptr, psram_len);
         }
+        // PSRAM presence probe (plan simd-zoo-hardening todo 1, Metis F4): log
+        // the arena capacity BEFORE `verify_boot_profile` asserts — an empty
+        // slice means the board has no PSRAM, and that fact must be reported
+        // rather than preempted by the boot-profile panic.
+        firmware_log!("PSRAM: {} bytes", psram_len);
     }
     #[cfg(feature = "qemu")]
     {
