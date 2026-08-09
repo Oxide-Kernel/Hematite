@@ -605,6 +605,64 @@ Engineering notes:
   immediates illegal, `loop`/`bge` 8-bit fixup range → trampolines +
   short-branch/long-jump patterns.
 
+### Phase 17 — Full MobileNetV2 parity (SAME pad, stride-2, offsets, softmax, non-%16)
+
+Closed every remaining parity gap against standard `esp-nn` so a stock
+MobileNetV2 (SAME padding everywhere, stride-2 first conv + blocks) runs the
+bespoke SIMD kernels instead of falling to scalar. Each phase was verified
+bit-exact on the real board (`bench55`, 19 kernel rows + 3 models, every
+`out_fnv(ref/s3)` equal), then the two stacks were benchmarked head-to-head
+on a **third, real MobileNetV2-style model** (`model_mv2real.rs` / Model C).
+
+| Phase | Gap closed | New SIMD row on device (cyc, bit-exact) |
+|---|---|---|
+| A | **SAME padding** for conv3x3 (spatial zero-pad in scratch) | `conv3x3_s8 16x16,32x3x3x32 SAME` 880125, `0xc53ebbc5`, 76.87× vs scalar |
+| B | **Stride-2** depthwise (pixel-loop stride) | `depthwise_s8 12x12,16x3x3x16 S2 SAME` 30734, `0x5159710e`, 12.6× |
+| C | **Non-zero input_offset** (fold `+offset` into the padded-input copy; OOB taps filled `-offset` so `(-off)·w + off·Σw = 0`) | conv3x3 SAME off3 1129475 `0xc53ebbc5`; dw S2 off-3 41167 `0x9ea5238d`; fc off5 238998 `0x32e35185` |
+| D | **Model C** real MobileNetV2-style 6-layer on both stacks, per-layer checksums | Hematite 649675 vs ESP-NN 655303 cyc, all 5 layers bit-exact |
+| E | **Softmax SIMD** (`s8_find_max` VMAX + cached exp in scratch) | `softmax_s8 1x1000` 263047, `0xaf0d15aa`, 1.70× |
+| F | **Depthwise non-%16 channels** (zero-pad to 16 in scratch) | `depthwise_s8 12x12,12x3x3x12 SAME non16` 104047, `0x8da1a066`, 11.16× |
+
+Model C (`mv2real`) — real MobileNetV2 shape language (SAME + stride-2):
+
+```
+L1 conv3x3   16x16x3   -> 8x8x32     stride 2, SAME,  act (0,127)
+L2 depthwise 3x3 8x8x32 -> 8x8x32    dm=1, stride 1, SAME, act (0,127)
+L3 conv1x1   8x8x32    -> 8x8x64                act (0,127)
+L4 depthwise 3x3 8x8x64 -> 4x4x64    dm=1, stride 2, SAME, act (0,127)
+L5 conv1x1   4x4x64    -> 4x4x128               act (0,127)
+L6 FC        2048      -> 16                      act (-128,127)
+```
+
+Final head-to-head (both stacks bit-exact with the scalar reference on every
+layer; `benchmarks/espnn-baseline` C harness + `hematite-benchmarks`):
+
+| Model | ESP-NN optimized | Hematite | Ratio |
+|---|---|---|---|
+| A (4-layer) | 2,630,401 | 1,708,356 | 1.54× faster |
+| B (mv2mini 7-layer) | 994,782 | 770,986 | 1.29× faster |
+| C (mv2real 6-layer) | 655,303 | 654,407 | 1.01× faster |
+
+Hematite now wins all three. The C side of Model C routes L1 (in_ch=3) through
+ESP-NN's `im2col` and L2 through `mult1_3x3_padded` — both confirmed bit-exact
+vs the scalar reference on device, so the comparison is fair.
+
+Engineering notes:
+- Asymmetric SAME padding is *additive*, not symmetric-doubled:
+  `pad_total = ((out-1)*stride + dilated - in).max(0)`, `pad_before = total/2`,
+  padded size = `in + pad_total`. The naive `in + 2*(total/2)` loses one
+  border row when `total` is odd (the stride-2 SAME case, `total=1`) — fixed
+  in both conv3x3 and depthwise dispatchers.
+- OOB taps in the scalar reference contribute exactly 0 (bounds-skip), so a
+  padded SIMD image must make OOB taps compute 0 too. With a non-zero
+  `input_offset` that means filling the border with `-input_offset`, not 0,
+  then folding `offset·Σw` per channel after the MAC.
+- `EE.VMAX.S8` (softmax find-max) assembles cleanly; `l8si` does not exist in
+  the Xtensa toolchain — use `l8ui` + `sext`.
+- The vendored S16 experiment (`dl_tie728_s16.S` / `_conv2d.S`,
+  `probe_s16.S`) was deleted: S16 QACC lanes saturate at 16 bits, so it could
+  never be bit-exact; the ACCX + QACC-depthwise kernels supersede it.
+
 ---
 
 ## 3. Known divergences and open technical debt
@@ -689,11 +747,12 @@ approved. Hardware bring-up (Phase 9), the C-SIMD bit-exact output match
 (Phase 10), the per-operation all-SIMD comparison + relu fix (Phase 11),
 the prepared-kernel fast path (Phase 12), the bespoke GPR-accumulator
 (ACCX) kernels (Phase 13), the optimized fast64 ACCX paths (Phase 14), the
-requantize fast paths (Phase 15), and the **from-scratch full op-sweep
-(Phase 16)** are complete; Phases 9-15 are committed, Phase 16 is
-uncommitted. Host test suite: 80 suites, 0 failures, maintained throughout
-every change in this log (31 tests in `hematite-benchmarks` + 3 in
-`hematite-s3`).
+requantize fast paths (Phase 15), the **from-scratch full op-sweep
+(Phase 16)**, and the **full MobileNetV2 parity sweep (Phase 17)** are
+complete. Phases 9-15 are committed; Phase 16 is committed locally (5
+commits, not pushed); Phase 17 is uncommitted. Host test suite: 34 tests
+in `hematite-benchmarks` + 3 in `hematite-s3`, 0 failures, maintained
+throughout every change in this log.
 
 On-device benchmark state: all **9 SIMD-capable operations** (conv1x1,
 conv3x3, fc, max/avg-pool, relu, add/sub/mul) run on the real hardware.
@@ -735,11 +794,25 @@ against standard ESP-NN, **Hematite now wins both, bit-exact**:
 Model A 1,707,746 vs ESP-NN 2,630,401 cycles (1.54×); Model B 770,827 vs
 994,782 (1.29×). conv1x1 now 4379, fc256 8393, conv3x3 8868886.
 
+**Phase 17** closed every remaining parity gap against standard ESP-NN so a
+stock MobileNetV2 runs bespoke SIMD instead of scalar: **SAME padding**
+(conv3x3, 880125 cyc `0xc53ebbc5`), **stride-2 depthwise** (30734 cyc
+`0x5159710e`), **non-zero input_offset** (conv3x3 off3 1129475 / dw off-3
+41167 / fc off5 238998, all bit-exact), **softmax SIMD** (263047 cyc
+`0xaf0d15aa`, 1.70×), and **depthwise non-%16 channels** (104047 cyc
+`0x8da1a066`, 11.16×). A third real MobileNetV2-style model (Model C,
+`model_mv2real.rs`) runs head-to-head on both stacks: **Hematite 654,407 vs
+ESP-NN 655,303 cycles, bit-exact on every layer** — Hematite wins all three
+models. The vendored S16 experiment asm was deleted. Final state
+(`bench55`): all 19 kernel rows + 3 models report `out_fnv(ref/s3)` equal
+on the real board.
+
 **Open decisions awaiting explicit direction:**
 1. Force-push the rewritten git history to `origin/main`?
 2. The `person_detect`/`mobilenet_v2` rounding divergence's practical
    impact on hardware (now that real timing exists).
-3. Phase 16 (op-sweep) docs + commit: the working tree holds the full
-   from-scratch kernel rewrite and the two-model ESP-NN comparison; commit
-   is pending explicit user confirmation (per the standing "don't push
-   until I verify" rule).
+3. Phase 16 + Phase 17 commit/push: everything is uncommitted (or
+   committed-only-locally for Phase 16); committing + pushing is pending
+   explicit user verification per the standing "don't push until I verify"
+   rule. User intent is to open a PR presenting Hematite as the best Rust NN
+   library for ESP32-S3.
