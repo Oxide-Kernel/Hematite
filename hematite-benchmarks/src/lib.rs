@@ -28,6 +28,7 @@ pub mod guardrails;
 pub mod model_bench;
 pub mod model_cnn;
 pub mod model_mv2;
+pub mod model_mv2real;
 pub mod report;
 pub mod spec;
 pub mod timing;
