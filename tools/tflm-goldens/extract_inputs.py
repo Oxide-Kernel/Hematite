@@ -15,11 +15,20 @@ and emits, for each of the 6 zoo models:
                             golden EXPECTED_OUTPUT, for the kws sanity gate
                             and future regeneration (todo T10) comparison
 
+Plus a 7th case for the hard_swish op fixture (see Usage below).
+
 Deterministic and re-runnable: pure stdlib, stable ordering, no timestamps.
 
 Usage:
     python3 extract_inputs.py [--goldens-dir ../../hematite-tests/goldens/models]
+                              [--op-goldens-dir ../../hematite-tests/goldens]
                               [--out-dir generated]
+
+In addition to the 6 zoo model goldens, a 7th case is emitted for the
+hard_swish op fixture (`goldens/hard_swish.rs`, read from --op-goldens-dir):
+its INPUT_DATA is run through the committed hard_swish-only micro-model
+`models/hard_swish_int8.tflite` (see generate_hard_swish_model.py) so the
+executed-TFLM HardSwish output can be captured (todo T10 re-tier).
 """
 
 import argparse
@@ -72,10 +81,12 @@ def prod(xs: list[int]) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--goldens-dir", default="../../hematite-tests/goldens/models")
+    ap.add_argument("--op-goldens-dir", default=None)
     ap.add_argument("--out-dir", default="generated")
     args = ap.parse_args()
 
     goldens_dir = Path(args.goldens_dir).resolve()
+    op_goldens_dir = Path(args.op_goldens_dir or goldens_dir.parent).resolve()
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -175,6 +186,57 @@ def main() -> int:
             f"output={output_shape} ({len(expected)} elems) "
             f"golden_fnv1a=0x{golden_hashes[stem]:08x}"
         )
+
+    # ── hard_swish op fixture (7th case) ──────────────────────────────────
+    # The op fixture lives in the goldens dir root (not goldens/models/); it
+    # has no MODEL_PATH, so the committed hard_swish micro-model path is
+    # supplied here. Input is the fixture's own INPUT_DATA, so the executed
+    # TFLM HardSwish output is directly comparable with EXPECTED_OUTPUT.
+    hs_rs = op_goldens_dir / "hard_swish.rs"
+    if not hs_rs.exists():
+        print(f"error: hard_swish fixture not found: {hs_rs}", file=sys.stderr)
+        return 1
+    hs_text = hs_rs.read_text()
+    hs_input = parse_const(hs_text, "INPUT_DATA")
+    hs_in_shape = parse_shape(hs_text, "INPUT_SHAPE")
+    hs_out_shape = parse_shape(hs_text, "OUTPUT_SHAPE")
+    hs_expected = parse_const(hs_text, "EXPECTED_OUTPUT")
+    if None in (hs_input, hs_in_shape, hs_out_shape, hs_expected):
+        print(f"error: could not parse all consts from {hs_rs}", file=sys.stderr)
+        return 1
+    if len(hs_input) != prod(hs_in_shape):
+        print(
+            f"error: hard_swish: INPUT_DATA len {len(hs_input)} != "
+            f"prod(INPUT_SHAPE) {prod(hs_in_shape)}",
+            file=sys.stderr,
+        )
+        return 1
+
+    hs_stem = "hard_swish"
+    hs_model_path = "tools/tflm-goldens/models/hard_swish_int8.tflite"
+    (out_dir / f"{hs_stem}.bin").write_bytes(bytes((v & 0xFF) for v in hs_input))
+    manifest.append(
+        {
+            "name": hs_stem,
+            "tflite_path": hs_model_path,
+            "input_shape": hs_in_shape,
+            "output_shape": hs_out_shape,
+            "input_len": len(hs_input),
+            "output_len": len(hs_expected),
+            "input_bin": f"{hs_stem}.bin",
+            "arena_bytes": 64 * 1024,
+        }
+    )
+    golden_hashes[hs_stem] = fnv1a_i8(hs_expected)
+    cases_inc_lines.append(
+        f'  {{"{hs_stem}", "../../{hs_model_path}", "generated/{hs_stem}.bin", '
+        f"{len(hs_input)}, {64 * 1024}}},"
+    )
+    print(
+        f"{hs_stem}: input={hs_in_shape} ({len(hs_input)}B) "
+        f"output={hs_out_shape} ({len(hs_expected)} elems) "
+        f"golden_fnv1a=0x{golden_hashes[hs_stem]:08x}"
+    )
 
     cases_inc_lines.append("};")
 

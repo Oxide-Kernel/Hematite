@@ -39,15 +39,18 @@ The clone lives **outside this repo** (e.g. `/tmp/tflite-micro` or
 
 | File | Role |
 |---|---|
-| `extract_inputs.py` | Parses `hematite-tests/goldens/models/*.rs` — single source of truth — and emits `generated/<stem>.bin` (raw i8 input bytes, **byte-identical** to the Rust `INPUT_DATA` arrays), `generated/manifest.json`, `generated/cases.inc` (the model table `main.cc` compiles in), `generated/golden_hashes.json` |
+| `extract_inputs.py` | Parses `hematite-tests/goldens/models/*.rs` — single source of truth — and emits `generated/<stem>.bin` (raw i8 input bytes, **byte-identical** to the Rust `INPUT_DATA` arrays), `generated/manifest.json`, `generated/cases.inc` (the model table `main.cc` compiles in), `generated/golden_hashes.json`. Also emits a 7th case: the `hard_swish` op fixture's INPUT_DATA (from `goldens/hard_swish.rs`) run through the committed hard_swish micro-model |
+| `generate_hard_swish_model.py` | Deterministic flatbuffers builder for `models/hard_swish_int8.tflite` — a minimal int8 HardSwish-only micro-model (scale 1.0 / zero-point 0 both sides), committed (472 bytes); consumed by the 7th case |
 | `main.cc` | C++ harness: `tflite::MicroInterpreter` + `MicroMutableOpResolver` (reference kernels via `TF_LITE_DISABLE_X86_NEON`), loads each model, runs inference on the `.bin` input, prints the output tensor as a comma-separated i8 array + FNV-1a 32-bit hash |
 | `Makefile` | Extracts inputs, builds `libtensorflow-microlite.a` at the pinned SHA (via upstream make), compiles/links `main.cc` |
 
-The 6 models: `models/sine.tflite`, `models/zoo/sine_regression/hello_world_int8.tflite`,
+The 7 cases: the 6 models `models/sine.tflite`,
+`models/zoo/sine_regression/hello_world_int8.tflite`,
 `models/zoo/keyword_spotting/kws_micro_speech_int8.tflite`,
 `models/zoo/anomaly_detect/anomaly_detect_int8.tflite`,
 `models/zoo/person_detect_vww/person_detect_int8.tflite`,
-`models/zoo/mobilenetv2_cls/mobilenet_v2_1.0_224_int8.tflite`.
+`models/zoo/mobilenetv2_cls/mobilenet_v2_1.0_224_int8.tflite`
+plus `models/hard_swish_int8.tflite` (the hard_swish op case).
 
 ## Build & run
 
@@ -88,6 +91,22 @@ fnv1a: 0x3a24ca75 (975504501)
 
 FNV-1a is 32-bit, seed `2166136261`, prime `16777619`, over the raw output
 bytes (i8 → u8) — identical to `hematite-benchmarks/src/model_validation.rs`.
+
+## Regenerating goldens from harness output (todo T10)
+
+```sh
+make TFLM_ROOT=/tmp/tflite-micro run > generated/harness_output.txt
+cargo run -p generate-goldens -- tflm-regen generated/harness_output.txt
+```
+
+The generator (1) cross-checks the FNV-1a printed per case against a
+recompute, (2) rewrites model goldens whose executed-TFLM hash differs from
+the current golden (`anomaly_detect_int8`, `mobilenet_v2_1.0_224_int8` —
+values from the harness output VERBATIM; the other 4 models match and are
+left untouched), and (3) re-tiers the `hard_swish` op fixture from the
+DOWNGRADED integer-rational approximation to executed-TFLM HardSwish output.
+All regenerated files carry a `GOLDEN_PROVENANCE` recording the pinned SHA,
+date, and generation command.
 
 ## Sanity gate (MUST pass before goldens may be regenerated — todo T10)
 

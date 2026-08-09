@@ -26,9 +26,31 @@ mod fixture;
 mod ops;
 
 use fixture::FixtureWriter;
+use ops::zoo_tflm;
 use std::path::PathBuf;
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    // tflm-regen: regenerate model goldens + hard_swish fixture from
+    // EXECUTED tflite-micro harness output (tools/tflm-goldens). This is a
+    // targeted mode: it touches ONLY the goldens whose executed-TFLM hash
+    // differs (anomaly_detect, mobilenet_v2) plus the hard_swish re-tier —
+    // it must never run the full generation below, which would overwrite the
+    // whole corpus with fallback-reimplementation provenance.
+    if args.len() >= 3 && args[1] == "tflm-regen" {
+        let workspace_root = find_workspace_root();
+        let goldens_dir = workspace_root.join("hematite-tests").join("goldens");
+        println!("Hematite Golden Fixture Generator — tflm-regen mode");
+        println!("=====================================================");
+        println!("Harness output: {}\n", args[2]);
+        let mut w = FixtureWriter::new(goldens_dir.clone());
+        zoo_tflm::regen_from_tflm_harness(&mut w, &workspace_root, &PathBuf::from(&args[2]));
+        guard_generated_fixtures(&goldens_dir);
+        println!("\nDone.");
+        return;
+    }
+
     let workspace_root = find_workspace_root();
     let goldens_dir = workspace_root.join("hematite-tests").join("goldens");
 

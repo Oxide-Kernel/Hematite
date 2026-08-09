@@ -1,10 +1,11 @@
 // tflm-goldens — golden-capture harness for tflite-micro at pinned SHA.
 //
-// Loads each of the 6 zoo tflite models through the REAL tflite-micro
-// interpreter (tflite::MicroInterpreter + reference kernels), runs inference
-// on the byte-identical INPUT_DATA the Rust goldens use (from
-// generated/<stem>.bin, produced by extract_inputs.py), and prints the output
-// tensor as a comma-separated i8 array plus an FNV-1a 32-bit hash.
+// Loads each of the 6 zoo tflite models — plus the hard_swish-only
+// micro-model (7th case, todo T10: re-tier the hard_swish fixture) — through
+// the REAL tflite-micro interpreter (tflite::MicroInterpreter + reference
+// kernels), runs inference on the byte-identical INPUT_DATA the Rust goldens
+// use (from generated/<stem>.bin, produced by extract_inputs.py), and prints
+// the output tensor as a comma-separated i8 array plus an FNV-1a 32-bit hash.
 //
 // This retires the provenance debt: the current model goldens were captured
 // from ai-edge-litert (LiteRT, double-rounding) or the in-repo TFLM arithmetic
@@ -80,13 +81,15 @@ bool LoadFile(const char* path, std::vector<uint8_t>* out) {
   return true;
 }
 
-// Registers every op the 6 zoo models can contain. The set is a documented
-// superset of the op lists in models/zoo/DEFERRED_MODELS.md §5/§6 (conv,
-// depthwise, avgpool, reshape, fc, softmax, add, mul, mean, pad, transpose,
-// plus a few safety entries). If a model ever needs an op not listed here,
-// tflite-micro reports "Op not found" and this list must grow.
-tflite::MicroMutableOpResolver<24> BuildResolver() {
-  tflite::MicroMutableOpResolver<24> resolver;
+// Registers every op the 6 zoo models can contain plus the hard_swish
+// micro-model case (7th case, added todo T10 for the hard_swish fixture
+// re-tier). The set is a documented superset of the op lists in
+// models/zoo/DEFERRED_MODELS.md §5/§6 (conv, depthwise, avgpool, reshape,
+// fc, softmax, add, mul, mean, pad, transpose, hard_swish, plus a few safety
+// entries). If a model ever needs an op not listed here, tflite-micro reports
+// "Op not found" and this list must grow.
+tflite::MicroMutableOpResolver<25> BuildResolver() {
+  tflite::MicroMutableOpResolver<25> resolver;
   resolver.AddConv2D();
   resolver.AddDepthwiseConv2D();
   resolver.AddAveragePool2D();
@@ -105,6 +108,7 @@ tflite::MicroMutableOpResolver<24> BuildResolver() {
   resolver.AddConcatenation();
   resolver.AddRelu();
   resolver.AddRelu6();
+  resolver.AddHardSwish();
   resolver.AddLogistic();
   resolver.AddLeakyRelu();
   resolver.AddPrelu();
@@ -151,7 +155,7 @@ bool RunCase(const ModelCase& c) {
     return false;
   }
 
-  tflite::MicroMutableOpResolver<24> resolver = BuildResolver();
+  tflite::MicroMutableOpResolver<25> resolver = BuildResolver();
   tflite::MicroInterpreter interpreter(model, resolver, arena, c.arena_bytes);
   if (interpreter.AllocateTensors() != kTfLiteOk) {
     fprintf(stderr,

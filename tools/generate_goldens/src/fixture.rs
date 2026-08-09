@@ -215,8 +215,7 @@ impl FixtureWriter {
         expected_output: &[i8],
         runtime_version: &str,
         model_rel_path: &str,
-    ) {
-        let mut buf = String::with_capacity(16384);
+    ) {        let mut buf = String::with_capacity(16384);
         buf.push_str(SPDX_HEADER);
         buf.push('\n');
         buf.push_str(&format!(
@@ -264,6 +263,143 @@ impl FixtureWriter {
         std::fs::create_dir_all(&dir).expect("create goldens/models dir");
         let path = dir.join(format!("{name}.rs"));
         std::fs::write(&path, buf).expect("write model fixture");
+        println!("  Wrote {}", path.display());
+    }
+
+    /// Write a per-model golden fixture captured from EXECUTED tflite-micro
+    /// at the pinned SHA via the `tools/tflm-goldens` host harness (todo T10
+    /// regeneration; retires the ai-edge-litert provenance of `write_model`).
+    /// The `model_rel_path`/`input_data` come from the PRE-EXISTING golden
+    /// (inputs are unchanged); `expected_output` comes from the harness output
+    /// VERBATIM. Emitted under `goldens/models/`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_model_tflm(
+        &mut self,
+        name: &str,
+        input_shape: &[i32],
+        output_shape: &[i32],
+        input_data: &[i8],
+        expected_output: &[i8],
+        model_rel_path: &str,
+    ) {
+        let mut buf = String::with_capacity(16384);
+        buf.push_str(SPDX_HEADER);
+        buf.push('\n');
+        buf.push_str(&format!(
+            "// ═══════════════════════════════════════════════════════════════\n\
+             // CAPTURED FROM EXECUTED TFLITE-MICRO — REAL MODEL OUTPUT\n\
+             //\n\
+             // This fixture is a per-model golden: INPUT_DATA was run through\n\
+             // the model {model_rel_path} via the EXECUTED tflite-micro\n\
+             // interpreter (tools/tflm-goldens host harness, reference kernels,\n\
+             // pinned SHA below), and EXPECTED_OUTPUT is the exact int8 output\n\
+             // captured from that execution. This retires the previous\n\
+             // ai-edge-litert (LiteRT) interpreter provenance.\n\
+             // ═══════════════════════════════════════════════════════════════\n\n"
+        ));
+
+        buf.push_str(&format!(
+            "/// TFLite Micro pin that defines this golden corpus.\n\
+             pub const GOLDEN_TFLM_VERSION: &str = \"{TFLM_VERSION}\";\n\n"
+        ));
+        buf.push_str(&format!(
+            "/// Executed interpreter that produced these values.\n\
+             pub const GOLDEN_RUNTIME_VERSION: &str = \"tflite-micro @ {TFLM_VERSION} (executed, reference kernels)\";\n\n"
+        ));
+        buf.push_str(
+            "/// Provenance: captured from executed tflite-micro at the pinned\n\
+             /// SHA via the tools/tflm-goldens host harness.\n\
+             pub const GOLDEN_PROVENANCE: &str = \"captured-from-executed-tflite-micro @ 18b9e6f2a8c5a9518e588f59c2ba16ef7ef9d551; date 2026-08-10; cmd: (cd tools/tflm-goldens && make TFLM_ROOT=/tmp/tflite-micro run > generated/harness_output.txt)\";\n\n"
+        );
+
+        buf.push_str(&format!(
+            "/// Path to the model relative to the workspace root.\n\
+             pub const MODEL_PATH: &str = \"{model_rel_path}\";\n\n"
+        ));
+        buf.push_str(&format!(
+            "pub const INPUT_SHAPE: [i32; {}] = {:?};\n",
+            input_shape.len(), input_shape
+        ));
+        buf.push_str(&format!(
+            "pub const OUTPUT_SHAPE: [i32; {}] = {:?};\n\n",
+            output_shape.len(), output_shape
+        ));
+
+        emit_const_array(&mut buf, "INPUT_DATA", "i8", input_data);
+        emit_const_array(&mut buf, "EXPECTED_OUTPUT", "i8", expected_output);
+
+        let dir = self.output_dir.join("models");
+        std::fs::create_dir_all(&dir).expect("create goldens/models dir");
+        let path = dir.join(format!("{name}.rs"));
+        std::fs::write(&path, buf).expect("write model fixture");
+        println!("  Wrote {}", path.display());
+    }
+
+    /// Re-tier the hard_swish op fixture: DOWNGRADED integer-rational
+    /// approximation -> captured from EXECUTED tflite-micro HardSwish kernel
+    /// (HardSwishParams chain) via the `tools/tflm-goldens` hard_swish
+    /// micro-model (tools/tflm-goldens/models/hard_swish_int8.tflite; input
+    /// scale 1.0/zp 0, output scale 1.0/zp 0). `expected_output` is the
+    /// harness output VERBATIM. Emitted at `goldens/hard_swish.rs`.
+    pub fn write_hard_swish_tflm(
+        &mut self,
+        input_data: &[i8],
+        expected_output: &[i8],
+    ) {
+        let mut buf = String::with_capacity(8192);
+        buf.push_str(SPDX_HEADER);
+        buf.push('\n');
+        buf.push_str(
+            "// ═══════════════════════════════════════════════════════════════\n\
+             // CAPTURED FROM EXECUTED TFLITE-MICRO — HARD_SWISH OP (RE-TIERED T10)\n\
+             //\n\
+             // Previously DOWNGRADED (integer-div-rational-approx, NOT\n\
+             // TFLM-faithful). Now re-tiered: INPUT_DATA was run through the\n\
+             // HardSwish micro-model tools/tflm-goldens/models/hard_swish_int8.tflite\n\
+             // (int8, input scale 1.0 / zero-point 0, output scale 1.0 /\n\
+             // zero-point 0) via the EXECUTED tflite-micro reference HardSwish\n\
+             // kernel (HardSwishParams chain: SaturatingDoublingHighMul /\n\
+             // SaturatingRoundingDoublingHighMul / RoundingDivideByPOT, see\n\
+             // tensorflow/lite/kernels/internal/reference/hard_swish.h at the\n\
+             // pinned SHA). EXPECTED_OUTPUT is the exact int8 output captured\n\
+             // from that execution (VERBATIM).\n\
+             // ═══════════════════════════════════════════════════════════════\n\n"
+        );
+
+        buf.push_str(&format!(
+            "/// TFLite Micro pin that defines this golden corpus.\n\
+             pub const GOLDEN_TFLM_VERSION: &str = \"{TFLM_VERSION}\";\n\n"
+        ));
+        buf.push_str(&format!(
+            "/// Executed interpreter that produced these values.\n\
+             pub const GOLDEN_RUNTIME_VERSION: &str = \"tflite-micro @ {TFLM_VERSION} (executed, reference kernels)\";\n\n"
+        ));
+        buf.push_str(
+            "/// Provenance: captured from executed tflite-micro at the pinned\n\
+             /// SHA via the tools/tflm-goldens host harness (hard_swish\n\
+             /// micro-model case).\n\
+             pub const GOLDEN_PROVENANCE: &str = \"captured-from-executed-tflite-micro @ 18b9e6f2a8c5a9518e588f59c2ba16ef7ef9d551; hard_swish micro-model; date 2026-08-10; cmd: (cd tools/tflm-goldens && make TFLM_ROOT=/tmp/tflite-micro run > generated/harness_output.txt)\";\n\n"
+        );
+
+        buf.push_str(
+            "pub const INPUT_SHAPE: [i32; 4] = [1, 1, 1, 8];\n\
+             pub const OUTPUT_SHAPE: [i32; 4] = [1, 1, 1, 8];\n\n"
+        );
+
+        buf.push_str(
+            "pub const INPUT_ZERO_POINT: i32 = 0;\n\
+             pub const OUTPUT_ZERO_POINT: i32 = 0;\n\n\
+             pub const INPUT_SCALE: f64 = 1.0;\n\
+             pub const OUTPUT_SCALE: f64 = 1.0;\n\n"
+        );
+
+        buf.push_str("// HardSwish: x * ReLU6(x+3) / 6 (executed TFLM HardSwishParams chain)\n\n");
+
+        emit_const_array(&mut buf, "INPUT_DATA", "i8", input_data);
+        emit_const_array(&mut buf, "EXPECTED_OUTPUT", "i8", expected_output);
+
+        let path = self.output_dir.join("hard_swish.rs");
+        std::fs::write(&path, buf).expect("write hard_swish fixture");
         println!("  Wrote {}", path.display());
     }
 }
