@@ -43,7 +43,9 @@
 //! * `mobilenet_v2` (transpose/pad/conv/depthwise/add/mean/fc/softmax): the
 //!   PAD kernel fills with raw 0 while TFLM pads with the output/input
 //!   zero point (pad.cc @ pinned SHA: `pad_value = output_zero_point`), and
-//!   the conv rounding differences apply — see DEFERRED_MODELS.md §7.
+//!   the conv rounding differences apply — see DEFERRED_MODELS.md §7. The
+//!   relative s3 == ref check in the S3 test below holds exactly because
+//!   BOTH backends share the same raw-0 fill.
 
 use hematite_ref::RefBackend;
 use hematite_tests::goldens::models;
@@ -278,20 +280,23 @@ mod models_mobilenet_v2 {
 //   sine            [9 FC]                         — fully wired on S3
 //   hello_world     [9 FC ×3]                      — fully wired on S3
 //   anomaly_detect  [9 FC ×10]                     — fully wired on S3
-//   kws             [22 RESHAPE, 4, 9, 25]         — RESHAPE is op #1
-//   person_detect   [3/4 convs ×27, 1, 22, 9, 25]  — RESHAPE near the tail
-//   mobilenet_v2    [39 TRANSPOSE, 34 PAD ×18, …, 40, 22, 9] — TRANSPOSE op #1
+//   kws             [22 RESHAPE, 4, 9, 25]         — RESHAPE wired in T25
+//   person_detect   [3/4 convs ×27, 1, 22, 9, 25]  — RESHAPE wired in T25
+//   mobilenet_v2    [39 TRANSPOSE, 34 PAD ×18, …, 40, 22, 9] — data-movement
+//                                                            wired in T25
 //
-// The committed S3Backend (e064e7b) returns `KernelError::Unsupported` for
-// the data-movement ops it has no kernel for (reshape/transpose/pad — see the
-// status matrix in `local-notes/evidence/simd-zoo-hardening/task-3-s3backend.log`),
-// and `Model::predict` swallows the error (output left zeroed). So the three
-// models whose op sequence includes an unwired op cannot produce an s3 output
-// on the host; their tests assert the honest contract instead —
-// `predict_with_scratch` returns `Err(KernelError::Unsupported)` at the exact
-// unwired op, never a silent wrong answer. The RefBackend side of each test
-// mirrors the existing RefBackend-only test (bit-exact where the golden
-// applies, compile-and-execute otherwise).
+// The committed S3Backend (e064e7b) returned `KernelError::Unsupported` for
+// the data-movement ops it had no kernel for (reshape/transpose/pad — see
+// the status matrix in `local-notes/evidence/simd-zoo-hardening/task-3-s3backend.log`),
+// and `Model::predict` swallows the error (output left zeroed). The todo-25
+// amendment added scalar data-movement kernels (`hematite-s3/src/
+// data_movement.rs`) and wired them into S3Backend, so every zoo model now
+// runs through `Model::<S3Backend>` on the host. The three previously
+// `Unsupported` tests (kws / person_detect / mobilenet_v2 below) assert the
+// RELATIVE s3 == ref equality element-for-element — the wiring gate; kws is
+// additionally bit-exact against the executed-TFLite golden. The absolute
+// golden check stays only where the documented PAD/rounding divergences do
+// not apply (see the per-model module docs below).
 
 // ── Sine via S3Backend — fully wired (FC only) ─────────────────────────────
 
@@ -350,13 +355,14 @@ mod models_hello_world_s3_backend {
     }
 }
 
-// ── Keyword spotting via S3Backend — RESHAPE (op 22) is Unsupported ────────
+// ── Keyword spotting via S3Backend — fully wired (data-movement amendment) ──
 //
-// The model's operator sequence starts with RESHAPE (code 22), which the
-// committed S3Backend has no kernel for. The RefBackend path keeps its
-// bit-exact golden contract (mirrored below); the S3 path asserts the honest
-// `Unsupported` failure — `predict` would swallow it into a zeroed output, so
-// the contract is checked through `predict_with_scratch`.
+// The model's operator sequence starts with RESHAPE (code 22); the todo-25
+// amendment wired the data-movement kernels into S3Backend, so the full
+// RESHAPE → conv → fc → softmax chain runs on S3. The RefBackend path keeps
+// its bit-exact golden contract (mirrored below); the S3 path asserts BOTH
+// the relative s3 == ref equality (the wiring gate) and the absolute golden
+// (kws is fully bit-exact — its op set has no PAD/rounding divergence).
 
 #[cfg(feature = "hematite-s3")]
 mod models_keyword_spotting_s3_backend {
@@ -379,20 +385,17 @@ mod models_keyword_spotting_s3_backend {
                 "kws_s3_ref_golden",
             );
 
-            // S3Backend: op #1 is RESHAPE (22) — no s3 kernel, honest Err.
-            let s3 = Model::<S3Backend>::new(S3Backend);
-            let mut out_buf = [0i8; Model::<S3Backend>::output_len()];
-            let mut scratch = [0u8; 65536];
-            let r = s3.predict_with_scratch(
-                &models::kws_micro_speech_int8::INPUT_DATA,
-                &mut out_buf,
-                &mut scratch,
-            );
-            assert_eq!(
-                r,
-                Err(::hematite_core::KernelError::Unsupported),
-                "kws_s3: model op sequence starts with RESHAPE (22); S3Backend must \
-                 report Unsupported, not silently produce a zeroed output",
+            // S3Backend: RESHAPE (22) wired in T25 → full model runs.
+            let s3_out = Model::<S3Backend>::new(S3Backend)
+                .predict(&models::kws_micro_speech_int8::INPUT_DATA);
+
+            // Relative (the critical check): s3 == ref element-for-element.
+            assert_bit_exact(&s3_out, &ref_out, "kws_s3_vs_ref");
+            // Absolute: kws is fully bit-exact — no PAD/rounding divergence.
+            assert_bit_exact(
+                &s3_out,
+                &models::kws_micro_speech_int8::EXPECTED_OUTPUT,
+                "kws_s3_golden",
             );
         });
     }
@@ -430,12 +433,14 @@ mod models_anomaly_detect_s3_backend {
     }
 }
 
-// ── Person detection via S3Backend — RESHAPE (op 22) is Unsupported ────────
+// ── Person detection via S3Backend — fully wired (data-movement amendment) ──
 //
-// 27 convs + average pool execute on S3, then the RESHAPE (code 22) returns
-// `Unsupported` — honest failure, and the reason the model is NOT bit-exact
-// capable on the S3 backend yet (T10/T11 execute-TFLM goldens + data-movement
-// kernels). RefBackend side mirrors `models_person_detect` (compile+execute).
+// 27 convs + average pool + RESHAPE + fc + softmax — RESHAPE (code 22) was
+// the last unwired op and is now covered by the todo-25 amendment, so the
+// full model runs on S3. The RefBackend side mirrors `models_person_detect`
+// (compile+execute; known ±1 golden divergence — rounding + int8 softmax
+// provenance, shared identically by both backends). The S3 side asserts the
+// relative s3 == ref equality element-for-element — the wiring gate.
 
 #[cfg(feature = "hematite-s3")]
 mod models_person_detect_s3_backend {
@@ -454,34 +459,29 @@ mod models_person_detect_s3_backend {
 
             // RefBackend: full model executes (known ±1 golden divergence —
             // rounding provenance; see module docs).
-            let _ref_out = Model::<RefBackend>::new(RefBackend)
+            let ref_out = Model::<RefBackend>::new(RefBackend)
                 .predict(&models::person_detect_int8::INPUT_DATA);
 
-            // S3Backend: convs run, then RESHAPE (22) → honest Err.
-            let s3 = Model::<S3Backend>::new(S3Backend);
-            let mut out_buf = [0i8; Model::<S3Backend>::output_len()];
-            let mut scratch = [0u8; 65536];
-            let r = s3.predict_with_scratch(
-                &models::person_detect_int8::INPUT_DATA,
-                &mut out_buf,
-                &mut scratch,
-            );
-            assert_eq!(
-                r,
-                Err(::hematite_core::KernelError::Unsupported),
-                "person_detect_s3: model op sequence contains RESHAPE (22); S3Backend \
-                 must report Unsupported, not silently produce a zeroed output",
-            );
+            // S3Backend: full model executes (RESHAPE wired in T25).
+            let s3_out = Model::<S3Backend>::new(S3Backend)
+                .predict(&models::person_detect_int8::INPUT_DATA);
+
+            // Relative (the critical check): s3 == ref element-for-element.
+            assert_bit_exact(&s3_out, &ref_out, "person_detect_s3_vs_ref");
         });
     }
 }
 
-// ── MobileNetV2 via S3Backend — TRANSPOSE/PAD/RESHAPE are Unsupported ──────
+// ── MobileNetV2 via S3Backend — fully wired (data-movement amendment) ──────
 //
 // The model's op sequence starts with TRANSPOSE (39) then 18× PAD (34) and a
-// tail RESHAPE (22) — none have s3 kernels. RefBackend side mirrors
-// `models_mobilenet_v2` (compile+execute); the S3 side asserts the honest
-// `Unsupported` at the very first op.
+// tail RESHAPE (22); the todo-25 amendment wired all data-movement ops into
+// S3Backend, so the full model runs. Both backends fill PAD borders with
+// raw 0 (TFLM fills the output zero point −14 — pad.cc @ pinned SHA; the
+// zero-point fill needs param plumbing, T10-documented follow-up), so the
+// PAD divergence vs the executed-TFLM golden applies EQUALLY to s3 and ref:
+// the relative s3 == ref equality is the gate (see module docs + the
+// amendment learnings).
 
 #[cfg(feature = "hematite-s3")]
 mod models_mobilenet_v2_s3_backend {
@@ -500,24 +500,18 @@ mod models_mobilenet_v2_s3_backend {
 
             // RefBackend: full model executes (PAD zero-fill + rounding
             // divergence vs golden; see module docs).
-            let _ref_out = Model::<RefBackend>::new(RefBackend)
+            let ref_out = Model::<RefBackend>::new(RefBackend)
                 .predict(&models::mobilenet_v2_1_0_224_int8::INPUT_DATA);
 
-            // S3Backend: op #1 is TRANSPOSE (39) → honest Err.
-            let s3 = Model::<S3Backend>::new(S3Backend);
-            let mut out_buf = [0i8; Model::<S3Backend>::output_len()];
-            let mut scratch = [0u8; 65536];
-            let r = s3.predict_with_scratch(
-                &models::mobilenet_v2_1_0_224_int8::INPUT_DATA,
-                &mut out_buf,
-                &mut scratch,
-            );
-            assert_eq!(
-                r,
-                Err(::hematite_core::KernelError::Unsupported),
-                "mobilenet_v2_s3: model op sequence starts with TRANSPOSE (39); \
-                 S3Backend must report Unsupported, not silently produce a zeroed output",
-            );
+            // S3Backend: full model executes (TRANSPOSE/PAD/RESHAPE wired).
+            let s3_out = Model::<S3Backend>::new(S3Backend)
+                .predict(&models::mobilenet_v2_1_0_224_int8::INPUT_DATA);
+
+            // Relative (the critical check): s3 == ref element-for-element.
+            // Both backends share the same PAD zero-fill + rounding behavior,
+            // so the s3==ref equality is exact despite the shared golden
+            // divergence.
+            assert_bit_exact(&s3_out, &ref_out, "mobilenet_v2_s3_vs_ref");
         });
     }
 }

@@ -12,6 +12,7 @@ pub mod conv1x1;
 pub mod accx;
 pub mod elementwise;
 pub mod conv3x3;
+pub mod data_movement;
 pub mod depthwise;
 pub mod gemm;
 pub mod pool;

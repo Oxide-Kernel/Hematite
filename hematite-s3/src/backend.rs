@@ -23,7 +23,16 @@
 //!
 //! | Trait method | Reason |
 //! |---|---|
-//! | `matmul`, `sigmoid`, `tanh`, `leaky_relu`, `prelu`, `quantize`, `dequantize`, `reshape`, `transpose`, `concat`, `split`, `pad`, `slice`, `resize_nearest`, `unidirectional_sequence_lstm`, `svdf`, `gru`, `sum`, `reduce_max`, `reduce_min`, `arg_max`, `arg_min`, `l2_normalization` | No s3 kernel exists for the op. |
+//! | `matmul`, `sigmoid`, `tanh`, `leaky_relu`, `prelu`, `quantize`, `dequantize`, `unidirectional_sequence_lstm`, `svdf`, `gru`, `sum`, `reduce_max`, `reduce_min`, `arg_max`, `arg_min`, `l2_normalization` | No s3 kernel exists for the op. |
+//!
+//! # Data movement (plan todo 25 amendment)
+//!
+//! `reshape` / `transpose` / `concat` / `split` / `pad` / `slice` /
+//! `resize_nearest` forward to the scalar kernels in [`data_movement`]
+//! (added by the todo-25 amendment so the zoo models whose op sequences
+//! contain RESHAPE=22 / TRANSPOSE=39 / PAD=34 can run through
+//! `Model::<S3Backend>`). The kernels are bit-exact copies of the
+//! `hematite-ref` scalar semantics — pure data movement, no arithmetic.
 //!
 //! # Scratch sizes
 //!
@@ -47,6 +56,7 @@ use hematite_core::{KernelBackend, KernelError};
 use crate::activations;
 use crate::conv1x1;
 use crate::conv3x3;
+use crate::data_movement;
 use crate::depthwise;
 use crate::elementwise;
 use crate::gemm;
@@ -362,67 +372,70 @@ impl KernelBackend for S3Backend {
 
     fn reshape(
         &self,
-        _input: &[i8],
-        _params: &ReshapeParams,
-        _output: &mut [i8],
+        input: &[i8],
+        params: &ReshapeParams,
+        output: &mut [i8],
     ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported)
+        data_movement::reshape(input, params, output)
     }
 
     fn transpose(
         &self,
-        _input: &[i8],
-        _params: &TransposeParams,
-        _output: &mut [i8],
+        input: &[i8],
+        params: &TransposeParams,
+        output: &mut [i8],
     ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported)
+        data_movement::transpose(input, params, output)
     }
 
     fn concat(
         &self,
-        _input_a: &[i8],
-        _input_b: &[i8],
-        _params: &ConcatParams,
-        _output: &mut [i8],
+        input_a: &[i8],
+        input_b: &[i8],
+        params: &ConcatParams,
+        output: &mut [i8],
     ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported)
+        data_movement::concat_op(input_a, input_b, params, output, &mut [])
     }
 
+    /// Splits both output slices in one call, mirroring RefBackend's
+    /// split-index adaptation (split_index 0 → `output_a`, 1 → `output_b`).
     fn split(
         &self,
-        _input: &[i8],
-        _params: &SplitParams,
-        _output_a: &mut [i8],
-        _output_b: &mut [i8],
+        input: &[i8],
+        params: &SplitParams,
+        output_a: &mut [i8],
+        output_b: &mut [i8],
     ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported)
+        data_movement::split_op(input, 0, params, output_a, &mut [])?;
+        data_movement::split_op(input, 1, params, output_b, &mut [])
     }
 
     fn pad(
         &self,
-        _input: &[i8],
-        _params: &PadParams,
-        _output: &mut [i8],
+        input: &[i8],
+        params: &PadParams,
+        output: &mut [i8],
     ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported)
+        data_movement::pad_op(input, params, output, &mut [])
     }
 
     fn slice(
         &self,
-        _input: &[i8],
-        _params: &SliceParams,
-        _output: &mut [i8],
+        input: &[i8],
+        params: &SliceParams,
+        output: &mut [i8],
     ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported)
+        data_movement::slice_op(input, params, output, &mut [])
     }
 
     fn resize_nearest(
         &self,
-        _input: &[i8],
-        _params: &ResizeNearestParams,
-        _output: &mut [i8],
+        input: &[i8],
+        params: &ResizeNearestParams,
+        output: &mut [i8],
     ) -> Result<(), KernelError> {
-        Err(KernelError::Unsupported)
+        data_movement::resize_nearest_neighbor(input, params, output, &mut [])
     }
 
     // ── Tier3 — Recurrent ───────────────────────────────────────────────
