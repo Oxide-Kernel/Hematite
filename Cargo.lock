@@ -873,6 +873,7 @@ dependencies = [
  "hematite-core",
  "hematite-int8",
  "hematite-memory",
+ "hematite-ref",
  "hematite-tests",
 ]
 

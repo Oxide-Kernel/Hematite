@@ -11,6 +11,9 @@ hematite-memory = { path = "../hematite-memory" }
 
 [dev-dependencies]
 hematite-tests = { path = "../hematite-tests" }
+# The independent scalar oracle for the Wave-2 relu6 vs-ref golden check
+# (tests/activations_golden.rs) — never linked into device builds.
+hematite-ref = { path = "../hematite-ref" }
 
 [features]
 # Propagated from hematite-benchmarks' `qemu` feature. QEMU's xtensa/esp32s3
