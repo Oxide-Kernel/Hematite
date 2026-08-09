@@ -90,6 +90,33 @@ static const char *TAG = "espnn-baseline";
 #define M7_IN_DIM (M6_OUT_H * M6_OUT_W * M6_OUT_C) /* 1152 */
 #define M7_OUT_C 16
 
+/* ---------------- model C (mv2real, MobileNetV2-style) shapes ---------------- */
+#define C1_IN_H 16
+#define C1_IN_W 16
+#define C1_IN_C 3
+#define C1_OUT_H 8
+#define C1_OUT_W 8
+#define C1_OUT_C 32
+
+#define C2_OUT_H 8
+#define C2_OUT_W 8
+#define C2_OUT_C 32
+
+#define C3_OUT_H 8
+#define C3_OUT_W 8
+#define C3_OUT_C 64
+
+#define C4_OUT_H 4
+#define C4_OUT_W 4
+#define C4_OUT_C 64
+
+#define C5_OUT_H 4
+#define C5_OUT_W 4
+#define C5_OUT_C 128
+
+#define C6_IN_DIM (C5_OUT_H * C5_OUT_W * C5_OUT_C) /* 2048 */
+#define C6_OUT_C 16
+
 #define MULT_Q30 (1 << 30)
 
 /* ---------------- model A buffers (16-aligned) ---------------- */
@@ -132,8 +159,35 @@ static int32_t __attribute__((aligned(16))) m_l6b[M6_OUT_C];
 static int8_t __attribute__((aligned(16))) m_l7w[M7_IN_DIM * M7_OUT_C]; /* 18432 */
 static int32_t __attribute__((aligned(16))) m_l7b[M7_OUT_C];
 
+/* ---------------- model C (mv2real) buffers (16-aligned arena) ----------------
+ * Models A/B/C run strictly sequentially in app_main, so model C reuses a
+ * single 16-aligned arena instead of its own DRAM footprint. */
+#define C_ARENA_BYTES (768 + 2048 + 2048 + 4096 + 1024 + 2048 + 16 \
+                     + 864 + 32 * 4 + 288 + 32 * 4 + 2048 + 64 * 4 \
+                     + 576 + 64 * 4 + 8192 + 128 * 4 + 32768 + 16 * 4)
+static int8_t __attribute__((aligned(16))) c_arena[C_ARENA_BYTES];
+#define c_in      ((int8_t *)(c_arena + 0))                            /* 768 */
+#define c_l1out   ((int8_t *)(c_arena + 768))                          /* 2048 */
+#define c_l2out   ((int8_t *)(c_arena + 768 + 2048))                   /* 2048 */
+#define c_l3out   ((int8_t *)(c_arena + 768 + 2048 + 2048))            /* 4096 */
+#define c_l4out   ((int8_t *)(c_arena + 768 + 2048 + 2048 + 4096))     /* 1024 */
+#define c_l5out   ((int8_t *)(c_arena + 768 + 2048 + 2048 + 4096 + 1024)) /* 2048 */
+#define c_out     ((int8_t *)(c_arena + 768 + 2048 + 2048 + 4096 + 1024 + 2048)) /* 16 */
+#define c_l1w     ((int8_t *)(c_arena + 768 + 2048 + 2048 + 4096 + 1024 + 2048 + 16)) /* 864 */
+#define c_l1b     ((int32_t *)(c_arena + 768 + 2048 + 2048 + 4096 + 1024 + 2048 + 16 + 864)) /* 32 */
+#define c_l2w     ((int8_t *)(c_arena + 768 + 2048 + 2048 + 4096 + 1024 + 2048 + 16 + 864 + 32 * 4)) /* 288 */
+#define c_l2b     ((int32_t *)(c_arena + 768 + 2048 + 2048 + 4096 + 1024 + 2048 + 16 + 864 + 32 * 4 + 288)) /* 32 */
+#define c_l3w     ((int8_t *)(c_arena + 768 + 2048 + 2048 + 4096 + 1024 + 2048 + 16 + 864 + 32 * 4 + 288 + 32 * 4)) /* 2048 */
+#define c_l3b     ((int32_t *)(c_arena + 768 + 2048 + 2048 + 4096 + 1024 + 2048 + 16 + 864 + 32 * 4 + 288 + 32 * 4 + 2048)) /* 64 */
+#define c_l4w     ((int8_t *)(c_arena + 768 + 2048 + 2048 + 4096 + 1024 + 2048 + 16 + 864 + 32 * 4 + 288 + 32 * 4 + 2048 + 64 * 4)) /* 576 */
+#define c_l4b     ((int32_t *)(c_arena + 768 + 2048 + 2048 + 4096 + 1024 + 2048 + 16 + 864 + 32 * 4 + 288 + 32 * 4 + 2048 + 64 * 4 + 576)) /* 64 */
+#define c_l5w     ((int8_t *)(c_arena + 768 + 2048 + 2048 + 4096 + 1024 + 2048 + 16 + 864 + 32 * 4 + 288 + 32 * 4 + 2048 + 64 * 4 + 576 + 64 * 4)) /* 8192 */
+#define c_l5b     ((int32_t *)(c_arena + 768 + 2048 + 2048 + 4096 + 1024 + 2048 + 16 + 864 + 32 * 4 + 288 + 32 * 4 + 2048 + 64 * 4 + 576 + 64 * 4 + 8192)) /* 128 */
+#define c_l6w     ((int8_t *)(c_arena + 768 + 2048 + 2048 + 4096 + 1024 + 2048 + 16 + 864 + 32 * 4 + 288 + 32 * 4 + 2048 + 64 * 4 + 576 + 64 * 4 + 8192 + 128 * 4)) /* 32768 */
+#define c_l6b     ((int32_t *)(c_arena + 768 + 2048 + 2048 + 4096 + 1024 + 2048 + 16 + 864 + 32 * 4 + 288 + 32 * 4 + 2048 + 64 * 4 + 576 + 64 * 4 + 8192 + 128 * 4 + 32768)) /* 16 */
+
 /* scratch for esp_nn conv/depthwise */
-static int8_t __attribute__((aligned(16))) s_scratch[64 * 1024];
+static int8_t __attribute__((aligned(16))) s_scratch[12 * 1024];
 
 /* ---------------- fill ---------------- */
 static void fill_pattern(void)
@@ -177,6 +231,31 @@ static void fill_pattern_mv2(void)
     memset(m_l5out, 0, sizeof(m_l5out));
     memset(m_l6out, 0, sizeof(m_l6out));
     memset(m_out, 0, sizeof(m_out));
+}
+
+static void fill_pattern_mv2real(void)
+{
+    int i;
+    for (i = 0; i < C1_IN_H * C1_IN_W * C1_IN_C; i++) c_in[i] = (int8_t)((i * 7 + 3) & 0xFF);
+    for (i = 0; i < C1_OUT_C * 3 * 3 * C1_IN_C; i++) c_l1w[i] = (int8_t)((i * 13 + 11) & 0xFF);
+    for (i = 0; i < C1_OUT_C; i++) c_l1b[i] = i * 17 - 8;
+    for (i = 0; i < 3 * 3 * C2_OUT_C; i++) c_l2w[i] = (int8_t)((i * 13 + 11) & 0xFF);
+    for (i = 0; i < C2_OUT_C; i++) c_l2b[i] = i * 17 - 8;
+    for (i = 0; i < C3_OUT_C * C2_OUT_C; i++) c_l3w[i] = (int8_t)((i * 13 + 11) & 0xFF);
+    for (i = 0; i < C3_OUT_C; i++) c_l3b[i] = i * 17 - 8;
+    for (i = 0; i < 3 * 3 * C4_OUT_C; i++) c_l4w[i] = (int8_t)((i * 13 + 11) & 0xFF);
+    for (i = 0; i < C4_OUT_C; i++) c_l4b[i] = i * 17 - 8;
+    for (i = 0; i < C5_OUT_C * C4_OUT_C; i++) c_l5w[i] = (int8_t)((i * 13 + 11) & 0xFF);
+    for (i = 0; i < C5_OUT_C; i++) c_l5b[i] = i * 17 - 8;
+    for (i = 0; i < C6_IN_DIM * C6_OUT_C; i++) c_l6w[i] = (int8_t)((i * 13 + 11) & 0xFF);
+    for (i = 0; i < C6_OUT_C; i++) c_l6b[i] = i * 17 - 8;
+    for (i = 0; i < 128; i++) { s_shift[i] = 0; s_mult[i] = MULT_Q30; }
+    memset(c_l1out, 0, 2048);
+    memset(c_l2out, 0, 2048);
+    memset(c_l3out, 0, 4096);
+    memset(c_l4out, 0, 1024);
+    memset(c_l5out, 0, 2048);
+    memset(c_out, 0, 16);
 }
 
 /* ---------------- FNV-1a (sign-extending, matches Rust firmware) ---------------- */
@@ -262,6 +341,7 @@ static int8_t sat8(int32_t v)
     if (v < -128) return -128;
     return (int8_t)v;
 }
+static int imax(int a, int b) { return a > b ? a : b; }
 
 /* ================= MODEL A scalar refs ================= */
 static void ref_conv3x3(void)
@@ -501,6 +581,158 @@ static void run_scalar_model_mv2(void)
     ref_m7_fc();
 }
 
+/* ================= MODEL C (mv2real) scalar refs ================= */
+/* SAME padding: pad_total = imax(0, (out-1)*stride + dilated - in);
+ * pad_before = pad_total/2; taps outside the input are skipped (contribute 0). */
+static void ref_c1_conv3x3(void)
+{
+    /* 16x16x3 -> 8x8x32, stride2, SAME, act(0,127) */
+    int oh, ow, oc, kh, kw, ic;
+    int pad_ht = imax(0, ((C1_OUT_H - 1) * 2 + 3 - C1_IN_H) / 2); /* =0 */
+    int pad_wd = imax(0, ((C1_OUT_W - 1) * 2 + 3 - C1_IN_W) / 2); /* =0 */
+    for (oh = 0; oh < C1_OUT_H; oh++) {
+        for (ow = 0; ow < C1_OUT_W; ow++) {
+            for (oc = 0; oc < C1_OUT_C; oc++) {
+                int32_t acc = c_l1b[oc];
+                for (kh = 0; kh < 3; kh++) {
+                    int ih = oh * 2 + kh - pad_ht;
+                    if (ih < 0 || ih >= C1_IN_H) continue;
+                    for (kw = 0; kw < 3; kw++) {
+                        int iw = ow * 2 + kw - pad_wd;
+                        if (iw < 0 || iw >= C1_IN_W) continue;
+                        for (ic = 0; ic < C1_IN_C; ic++) {
+                            int w_idx = ((oc * 3 + kh) * 3 + kw) * C1_IN_C + ic;
+                            acc += (int32_t)c_in[(ih * C1_IN_W + iw) * C1_IN_C + ic] * c_l1w[w_idx];
+                        }
+                    }
+                }
+                int32_t sc = req(acc, MULT_Q30, 0);
+                int32_t cl = sc > 127 ? 127 : (sc < 0 ? 0 : sc);
+                c_l1out[(oh * C1_OUT_W + ow) * C1_OUT_C + oc] = sat8(cl);
+            }
+        }
+    }
+}
+
+static void ref_c2_depthwise(void)
+{
+    /* 8x8x32 -> 8x8x32, 3x3 stride1 SAME, dm=1, act(0,127) */
+    int oh, ow, oc, ky, kx;
+    int pad_ht = imax(0, ((C2_OUT_H - 1) * 1 + 3 - C1_OUT_H) / 2); /* =1 */
+    int pad_wd = imax(0, ((C2_OUT_W - 1) * 1 + 3 - C1_OUT_W) / 2); /* =1 */
+    for (oh = 0; oh < C2_OUT_H; oh++) {
+        for (ow = 0; ow < C2_OUT_W; ow++) {
+            for (oc = 0; oc < C2_OUT_C; oc++) {
+                int32_t acc = c_l2b[oc];
+                for (ky = 0; ky < 3; ky++) {
+                    int ih = oh * 1 + ky - pad_ht;
+                    if (ih < 0 || ih >= C1_OUT_H) continue;
+                    for (kx = 0; kx < 3; kx++) {
+                        int iw = ow * 1 + kx - pad_wd;
+                        if (iw < 0 || iw >= C1_OUT_W) continue;
+                        acc += (int32_t)c_l1out[(ih * C1_OUT_W + iw) * C2_OUT_C + oc] *
+                               c_l2w[(ky * 3 + kx) * C2_OUT_C + oc];
+                    }
+                }
+                int32_t sc = req(acc, MULT_Q30, 0);
+                int32_t cl = sc > 127 ? 127 : (sc < 0 ? 0 : sc);
+                c_l2out[(oh * C2_OUT_W + ow) * C2_OUT_C + oc] = sat8(cl);
+            }
+        }
+    }
+}
+
+static void ref_c3_conv1x1(void)
+{
+    /* 8x8x32 -> 8x8x64 */
+    int h, w, oc, ic;
+    for (h = 0; h < C3_OUT_H; h++) {
+        for (w = 0; w < C3_OUT_W; w++) {
+            for (oc = 0; oc < C3_OUT_C; oc++) {
+                int32_t acc = c_l3b[oc];
+                for (ic = 0; ic < C2_OUT_C; ic++) {
+                    acc += (int32_t)c_l2out[(h * C3_OUT_W + w) * C2_OUT_C + ic] * c_l3w[oc * C2_OUT_C + ic];
+                }
+                int32_t sc = req(acc, MULT_Q30, 0);
+                int32_t cl = sc > 127 ? 127 : (sc < 0 ? 0 : sc);
+                c_l3out[(h * C3_OUT_W + w) * C3_OUT_C + oc] = sat8(cl);
+            }
+        }
+    }
+}
+
+static void ref_c4_depthwise(void)
+{
+    /* 8x8x64 -> 4x4x64, 3x3 stride2 SAME, dm=1, act(0,127) */
+    int oh, ow, oc, ky, kx;
+    int pad_ht = imax(0, ((C4_OUT_H - 1) * 2 + 3 - C3_OUT_H) / 2); /* =0 */
+    int pad_wd = imax(0, ((C4_OUT_W - 1) * 2 + 3 - C3_OUT_W) / 2); /* =0 */
+    for (oh = 0; oh < C4_OUT_H; oh++) {
+        for (ow = 0; ow < C4_OUT_W; ow++) {
+            for (oc = 0; oc < C4_OUT_C; oc++) {
+                int32_t acc = c_l4b[oc];
+                for (ky = 0; ky < 3; ky++) {
+                    int ih = oh * 2 + ky - pad_ht;
+                    if (ih < 0 || ih >= C3_OUT_H) continue;
+                    for (kx = 0; kx < 3; kx++) {
+                        int iw = ow * 2 + kx - pad_wd;
+                        if (iw < 0 || iw >= C3_OUT_W) continue;
+                        acc += (int32_t)c_l3out[(ih * C3_OUT_W + iw) * C4_OUT_C + oc] *
+                               c_l4w[(ky * 3 + kx) * C4_OUT_C + oc];
+                    }
+                }
+                int32_t sc = req(acc, MULT_Q30, 0);
+                int32_t cl = sc > 127 ? 127 : (sc < 0 ? 0 : sc);
+                c_l4out[(oh * C4_OUT_W + ow) * C4_OUT_C + oc] = sat8(cl);
+            }
+        }
+    }
+}
+
+static void ref_c5_conv1x1(void)
+{
+    /* 4x4x64 -> 4x4x128 */
+    int h, w, oc, ic;
+    for (h = 0; h < C5_OUT_H; h++) {
+        for (w = 0; w < C5_OUT_W; w++) {
+            for (oc = 0; oc < C5_OUT_C; oc++) {
+                int32_t acc = c_l5b[oc];
+                for (ic = 0; ic < C4_OUT_C; ic++) {
+                    acc += (int32_t)c_l4out[(h * C5_OUT_W + w) * C4_OUT_C + ic] * c_l5w[oc * C4_OUT_C + ic];
+                }
+                int32_t sc = req(acc, MULT_Q30, 0);
+                int32_t cl = sc > 127 ? 127 : (sc < 0 ? 0 : sc);
+                c_l5out[(h * C5_OUT_W + w) * C5_OUT_C + oc] = sat8(cl);
+            }
+        }
+    }
+}
+
+static void ref_c6_fc(void)
+{
+    /* fc 2048 -> 16, act(-128,127) */
+    int oc, i;
+    for (oc = 0; oc < C6_OUT_C; oc++) {
+        int32_t acc = c_l6b[oc];
+        for (i = 0; i < C6_IN_DIM; i++) {
+            acc += (int32_t)c_l5out[i] * c_l6w[oc * C6_IN_DIM + i];
+        }
+        int32_t sc = req(acc, MULT_Q30, 0);
+        int32_t cl = sc > 127 ? 127 : (sc < -128 ? -128 : sc);
+        c_out[oc] = sat8(cl);
+    }
+}
+
+static void run_scalar_model_mv2real(void)
+{
+    ref_c1_conv3x3();
+    ref_c2_depthwise();
+    ref_c3_conv1x1();
+    ref_c4_depthwise();
+    ref_c5_conv1x1();
+    ref_c6_fc();
+}
+
 /* ================= MODEL A esp_nn runner ================= */
 static void run_espnn_model(void)
 {
@@ -616,11 +848,86 @@ static void run_espnn_model_mv2(void)
                                      M7_OUT_C, 0, s_shift, s_mult, -128, 127);
 }
 
+/* ================= MODEL C (mv2real) esp_nn runner ================= */
+static void run_espnn_model_mv2real(void)
+{
+    data_dims_t in_dims, f_dims, out_dims;
+    conv_params_t cparams;
+    dw_conv_params_t dwparams;
+    quant_data_t qdata;
+
+    /* L1 conv3x3 stride2 SAME 16x16x3 -> 8x8x32 */
+    in_dims.width = C1_IN_W; in_dims.height = C1_IN_H; in_dims.channels = C1_IN_C; in_dims.extra = 1;
+    f_dims.width = 3; f_dims.height = 3; f_dims.channels = C1_IN_C; f_dims.extra = C1_OUT_C;
+    out_dims.width = C1_OUT_W; out_dims.height = C1_OUT_H; out_dims.channels = C1_OUT_C; out_dims.extra = 1;
+    cparams.in_offset = 0; cparams.out_offset = 0;
+    cparams.stride.width = 2; cparams.stride.height = 2;
+    cparams.padding.width = 0; cparams.padding.height = 0;
+    cparams.dilation.width = 1; cparams.dilation.height = 1;
+    cparams.activation.min = 0; cparams.activation.max = 127;
+    qdata.shift = s_shift; qdata.mult = s_mult;
+    esp_nn_conv_s8(&in_dims, c_in, &f_dims, c_l1w, c_l1b, &out_dims, c_l1out, &cparams, &qdata);
+
+    /* L2 depthwise 3x3 stride1 SAME 8x8x32 -> 8x8x32 dm=1 */
+    in_dims.width = C1_OUT_W; in_dims.height = C1_OUT_H; in_dims.channels = C1_OUT_C; in_dims.extra = 1;
+    f_dims.width = 3; f_dims.height = 3; f_dims.channels = C1_OUT_C; f_dims.extra = C2_OUT_C;
+    out_dims.width = C2_OUT_W; out_dims.height = C2_OUT_H; out_dims.channels = C2_OUT_C; out_dims.extra = 1;
+    dwparams.in_offset = 0; dwparams.out_offset = 0; dwparams.ch_mult = 1;
+    dwparams.stride.width = 1; dwparams.stride.height = 1;
+    dwparams.padding.width = 1; dwparams.padding.height = 1;
+    dwparams.dilation.width = 1; dwparams.dilation.height = 1;
+    dwparams.activation.min = 0; dwparams.activation.max = 127;
+    qdata.shift = s_shift; qdata.mult = s_mult;
+    esp_nn_depthwise_conv_s8(&in_dims, c_l1out, &f_dims, c_l2w, c_l2b, &out_dims, c_l2out, &dwparams, &qdata);
+
+    /* L3 conv1x1 8x8x32 -> 8x8x64 */
+    in_dims.width = C2_OUT_W; in_dims.height = C2_OUT_H; in_dims.channels = C2_OUT_C; in_dims.extra = 1;
+    f_dims.width = 1; f_dims.height = 1; f_dims.channels = C2_OUT_C; f_dims.extra = C3_OUT_C;
+    out_dims.width = C3_OUT_W; out_dims.height = C3_OUT_H; out_dims.channels = C3_OUT_C; out_dims.extra = 1;
+    cparams.in_offset = 0; cparams.out_offset = 0;
+    cparams.stride.width = 1; cparams.stride.height = 1;
+    cparams.padding.width = 0; cparams.padding.height = 0;
+    cparams.dilation.width = 1; cparams.dilation.height = 1;
+    cparams.activation.min = 0; cparams.activation.max = 127;
+    qdata.shift = s_shift; qdata.mult = s_mult;
+    esp_nn_conv_s8(&in_dims, c_l2out, &f_dims, c_l3w, c_l3b, &out_dims, c_l3out, &cparams, &qdata);
+
+    /* L4 depthwise 3x3 stride2 SAME 8x8x64 -> 4x4x64 dm=1 */
+    in_dims.width = C3_OUT_W; in_dims.height = C3_OUT_H; in_dims.channels = C3_OUT_C; in_dims.extra = 1;
+    f_dims.width = 3; f_dims.height = 3; f_dims.channels = C3_OUT_C; f_dims.extra = C4_OUT_C;
+    out_dims.width = C4_OUT_W; out_dims.height = C4_OUT_H; out_dims.channels = C4_OUT_C; out_dims.extra = 1;
+    dwparams.in_offset = 0; dwparams.out_offset = 0; dwparams.ch_mult = 1;
+    dwparams.stride.width = 2; dwparams.stride.height = 2;
+    dwparams.padding.width = 0; dwparams.padding.height = 0;
+    dwparams.dilation.width = 1; dwparams.dilation.height = 1;
+    dwparams.activation.min = 0; dwparams.activation.max = 127;
+    qdata.shift = s_shift; qdata.mult = s_mult;
+    esp_nn_depthwise_conv_s8(&in_dims, c_l3out, &f_dims, c_l4w, c_l4b, &out_dims, c_l4out, &dwparams, &qdata);
+
+    /* L5 conv1x1 4x4x64 -> 4x4x128 */
+    in_dims.width = C4_OUT_W; in_dims.height = C4_OUT_H; in_dims.channels = C4_OUT_C; in_dims.extra = 1;
+    f_dims.width = 1; f_dims.height = 1; f_dims.channels = C4_OUT_C; f_dims.extra = C5_OUT_C;
+    out_dims.width = C5_OUT_W; out_dims.height = C5_OUT_H; out_dims.channels = C5_OUT_C; out_dims.extra = 1;
+    cparams.in_offset = 0; cparams.out_offset = 0;
+    cparams.stride.width = 1; cparams.stride.height = 1;
+    cparams.padding.width = 0; cparams.padding.height = 0;
+    cparams.dilation.width = 1; cparams.dilation.height = 1;
+    cparams.activation.min = 0; cparams.activation.max = 127;
+    qdata.shift = s_shift; qdata.mult = s_mult;
+    esp_nn_conv_s8(&in_dims, c_l4out, &f_dims, c_l5w, c_l5b, &out_dims, c_l5out, &cparams, &qdata);
+
+    /* L6 fc 2048 -> 16 */
+    esp_nn_fully_connected_per_ch_s8(c_l5out, 0, C6_IN_DIM, c_l6w, 0, c_l6b, c_out,
+                                     C6_OUT_C, 0, s_shift, s_mult, -128, 127);
+}
+
 /* ================= bench wrappers ================= */
 static void bench_espnn(void) { run_espnn_model(); }
 static void bench_scalar(void) { run_scalar_model(); }
 static void bench_espnn_mv2(void) { run_espnn_model_mv2(); }
 static void bench_scalar_mv2(void) { run_scalar_model_mv2(); }
+static void bench_espnn_mv2real(void) { run_espnn_model_mv2real(); }
+static void bench_scalar_mv2real(void) { run_scalar_model_mv2real(); }
 
 static void dump_layer_checksums(const char *tag)
 {
@@ -643,6 +950,18 @@ static void dump_layer_checksums_mv2(const char *tag)
            (unsigned)fnv1a(m_l5out, M5_OUT_H * M5_OUT_W * M5_OUT_C),
            (unsigned)fnv1a(m_l6out, M6_OUT_H * M6_OUT_W * M6_OUT_C),
            (unsigned)fnv1a(m_out, M7_OUT_C));
+}
+
+static void dump_layer_checksums_mv2real(const char *tag)
+{
+    printf("  %s: L1=0x%08x L2=0x%08x L3=0x%08x L4=0x%08x L5=0x%08x out=0x%08x\n",
+           tag,
+           (unsigned)fnv1a(c_l1out, C1_OUT_H * C1_OUT_W * C1_OUT_C),
+           (unsigned)fnv1a(c_l2out, C2_OUT_H * C2_OUT_W * C2_OUT_C),
+           (unsigned)fnv1a(c_l3out, C3_OUT_H * C3_OUT_W * C3_OUT_C),
+           (unsigned)fnv1a(c_l4out, C4_OUT_H * C4_OUT_W * C4_OUT_C),
+           (unsigned)fnv1a(c_l5out, C5_OUT_H * C5_OUT_W * C5_OUT_C),
+           (unsigned)fnv1a(c_out, C6_OUT_C));
 }
 
 void app_main(void)
@@ -701,6 +1020,24 @@ void app_main(void)
     printf("=== model B esp_nn 0x%08x | scalar-ref 0x%08x | %s ===\n",
            (unsigned)espnn_mv2_chk, (unsigned)scalar_mv2_chk,
            espnn_mv2_chk == scalar_mv2_chk ? "MATCH" : "DIFFER");
+
+    /* ============ MODEL C (mv2real, MobileNetV2-style SAME/stride-2) ============ */
+    {
+        uint32_t espnn_c_chk = 0, scalar_c_chk = 0;
+        printf("MODEL C (mv2real): conv3x3 s2 SAME 16x16x3->8x8x32 | dw 3x3 s1 SAME 32->32 | conv1x1 32->64 | dw 3x3 s2 SAME 64->64 | conv1x1 64->128 | fc 2048->16\n");
+        fill_pattern_mv2real();
+        run_bench("model C esp_nn (mv2real: conv+dw+conv1x1+dw+conv1x1+fc)", bench_espnn_mv2real, c_out, C6_OUT_C, &espnn_c_chk);
+        fill_pattern_mv2real();
+        run_scalar_model_mv2real();
+        dump_layer_checksums_mv2real("model C scalar-ref layers");
+        fill_pattern_mv2real();
+        run_espnn_model_mv2real();
+        dump_layer_checksums_mv2real("model C esp_nn layers");
+        run_bench("model C scalar-ref (TFLite semantics)", bench_scalar_mv2real, c_out, C6_OUT_C, &scalar_c_chk);
+        printf("=== model C esp_nn 0x%08x | scalar-ref 0x%08x | %s ===\n",
+               (unsigned)espnn_c_chk, (unsigned)scalar_c_chk,
+               espnn_c_chk == scalar_c_chk ? "MATCH" : "DIFFER");
+    }
 
     printf("=== benchmark complete - ESP-NN halt ===\n");
 

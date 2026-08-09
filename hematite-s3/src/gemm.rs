@@ -107,13 +107,12 @@ fn fc_accx_dispatch(ctx: &mut FcAccxCtx<'_>) -> Result<bool, KernelError> {
     let input_dim = params.input_dim as usize;
     let output_dim = params.output_dim as usize;
 
-    if params.input_offset != 0
-        || !crate::accx::accx_eligible_1x1(input_dim, output_dim)
-    {
+    if !crate::accx::accx_eligible_1x1(input_dim, output_dim) {
         return Ok(false);
     }
 
-    let need = output_dim * 4;
+    let input_offset = params.input_offset;
+    let need = output_dim * 4 + if input_offset != 0 { output_dim * 4 } else { 0 };
     if ctx.scratch.len() < need {
         return Ok(false);
     }
@@ -129,6 +128,16 @@ fn fc_accx_dispatch(ctx: &mut FcAccxCtx<'_>) -> Result<bool, KernelError> {
     {
         return Ok(false);
     }
+    let wsum = if input_offset != 0 {
+        unsafe { accs.add(output_dim) }
+    } else {
+        core::ptr::null_mut()
+    };
+    if input_offset != 0 {
+        let ws = unsafe { core::slice::from_raw_parts_mut(wsum, output_dim) };
+        let wv = unsafe { core::slice::from_raw_parts(w_ptr, output_dim * input_dim) };
+        crate::accx::weight_sums_conv(ws, wv, 1, input_dim, output_dim);
+    }
 
     let multipliers = params.output_multiplier_per_channel;
     let shifts = params.output_shift_per_channel;
@@ -142,6 +151,13 @@ fn fc_accx_dispatch(ctx: &mut FcAccxCtx<'_>) -> Result<bool, KernelError> {
 
     unsafe {
         crate::accx::accx_conv1x1(in_ptr, w_ptr, accs, input_dim, output_dim);
+    }
+    if input_offset != 0 {
+        for oc in 0..output_dim {
+            let v = unsafe { accs.add(oc).read() };
+            let s = unsafe { wsum.add(oc).read() };
+            unsafe { accs.add(oc).write(v.wrapping_add(input_offset.wrapping_mul(s))) };
+        }
     }
     let acc_slice = unsafe { core::slice::from_raw_parts_mut(accs, output_dim) };
     crate::accx::requantize_1x1(&mut crate::accx::ReqCtx {

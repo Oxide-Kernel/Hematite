@@ -78,16 +78,62 @@ pub(crate) fn accx_eligible_3x3(input_c: usize, out_c: usize) -> bool {
 
 /// Host-compilable eligibility for the bespoke QACC depthwise kernel.
 ///
-/// The depthwise kernel accumulates PER-LANE into QACC and writes 16 int32
-/// lanes per 16-channel group, so both `in_c` and `out_c` must be multiples of
-/// 16 with `out_c >= 16` (the kernel loops `out_c / 16` groups).
+/// Any `input_c >= 1` is accepted: when `input_c % 16 != 0` the dispatch
+/// zero-pads the input and filter channel dimensions in scratch up to the
+/// next multiple of 16 (the kernel VLDs 16-channel vectors and loops
+/// `out_c / 16` groups), so the `% 16` requirement is lifted here. Depthwise
+/// per-lane semantics require `out_c == input_c` (dm == 1).
 #[inline]
 pub(crate) fn accx_eligible_depthwise(input_c: usize, out_c: usize) -> bool {
-    input_c >= 16 && input_c % 16 == 0 && out_c >= 16 && out_c % 16 == 0
+    input_c >= 1 && out_c >= 1 && input_c == out_c
 }
 
 /// Context for the per-channel requantize epilogue.
 ///
+
+/// Compute per-output-channel weight sums into `out`.
+///
+/// Used to fold a non-zero `input_offset` bit-exactly: the scalar conv
+/// computes `acc = Σ (in + offset)·w = Σ in·w + offset·Σw`, and the ACCX
+/// kernel produces `Σ in·w`; adding `offset·wsum[oc]` (in wrapping i32, same
+/// as the scalar's i32 accumulator) reproduces the reference.
+///
+/// `weights` is the raw `[oc][tap][ic]` layout (taps = 1 for 1×1 / FC, 9 for
+/// 3×3). Host-compilable.
+#[inline]
+pub(crate) fn weight_sums_conv(
+    out: &mut [i32],
+    weights: &[i8],
+    taps: usize,
+    in_c: usize,
+    out_c: usize,
+) {
+    for oc in 0..out_c {
+        let mut s: i32 = 0;
+        for t in 0..taps {
+            let base = (oc * taps + t) * in_c;
+            for ic in 0..in_c {
+                s = s.wrapping_add(weights[base + ic] as i32);
+            }
+        }
+        out[oc] = s;
+    }
+}
+
+/// Depthwise weight sums: the depthwise filter is `[tap][oc]` (HWCN), so
+/// `wsum[oc] = Σ_tap weights[tap·out_c + oc]`. Host-compilable.
+#[inline]
+pub(crate) fn weight_sums_depthwise(out: &mut [i32], weights: &[i8], out_c: usize) {
+    for oc in 0..out_c {
+        let mut s: i32 = 0;
+        let mut t = oc;
+        while t < weights.len() {
+            s = s.wrapping_add(weights[t] as i32);
+            t += out_c;
+        }
+        out[oc] = s;
+    }
+}
 /// Bundled into a single struct passed by `&mut` because the Xtensa LLVM
 /// backend miscompiles the multi-arg (9-slot) call site on device — the same
 /// class of bug as the `dispatch_fc` inline regression. A 1-arg call is safe.

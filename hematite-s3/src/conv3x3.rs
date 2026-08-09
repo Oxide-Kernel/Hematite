@@ -186,41 +186,52 @@ fn conv3x3_accx_dispatch(ctx: &mut Conv3x3AccxCtx<'_>) -> Result<bool, KernelErr
 
     let dilated_filter_h = (filter_h - 1) * params.dilation_height_factor + 1;
     let dilated_filter_w = (filter_w - 1) * params.dilation_width_factor + 1;
-    let pad_h = ((params.output_shape[1] - 1) * params.stride_height + dilated_filter_h
-        - params.input_shape[1])
-        / 2;
-    let pad_w = ((params.output_shape[2] - 1) * params.stride_width + dilated_filter_w
-        - params.input_shape[2])
-        / 2;
 
-    if params.input_offset != 0
-        || params.dilation_height_factor != 1
+    if params.dilation_height_factor != 1
         || params.dilation_width_factor != 1
         || filter_h != 3
         || filter_w != 3
-        || pad_h != 0
-        || pad_w != 0
         || !crate::accx::accx_eligible_3x3(input_c, out_c)
     {
         return Ok(false);
     }
+    // Phase C fold requires the padded fill `-input_offset` to fit in i8.
+    if params.input_offset != 0 && params.input_offset.abs() > 127 {
+        return Ok(false);
+    }
 
-    // Phase 3 — first-conv zero-padding: the ACCX kernel VLDs 16-channel
-    // vectors, so `input_c` must be a multiple of 16. When it isn't (e.g. a
-    // 3-channel RGB first conv), pad the input AND the weights up to the next
-    // multiple of 16 in scratch. Padded channels are all-zero in both, so the
-    // dot products are bit-identical to the scalar conv (which skips them).
+    // Phase A — SAME-padding + first-conv zero-padding. The ACCX kernel VLDs
+    // 16-channel vectors and a 3×3 window with `row_delta` row strides, so we
+    // stage a padded copy of the input in scratch whenever the layer needs
+    // spatial padding (`pad_h`/`pad_w` > 0, derived from SAME semantics) or a
+    // channel multiple of 16. Padded regions are all-zero, so the dot
+    // products are bit-identical to the scalar conv (which skips them).
+    // SAME padding is asymmetric for odd totals (see conv3x3_accx_dispatch):
+    // pad_top = total/2, padded = in + total.
+    let pad_total_h = ((out_h as i32 - 1) * params.stride_height + dilated_filter_h
+        - in_h as i32)
+        .max(0) as usize;
+    let pad_total_w = ((out_w as i32 - 1) * params.stride_width + dilated_filter_w
+        - in_w as i32)
+        .max(0) as usize;
+    let pad_h = (pad_total_h / 2) as usize;
+    let pad_w = (pad_total_w / 2) as usize;
     let padded_c = ((input_c + 15) / 16) * 16;
-    let pad = padded_c != input_c;
+    let padded_h = in_h + pad_total_h;
+    let padded_w = in_w + pad_total_w;
+    let needs_pad = pad_total_h > 0 || pad_total_w > 0 || padded_c != input_c;
 
     // Scratch layout when padding:
-    //   [padded_input: in_h*in_w*padded_c][padded_weights: out_c*9*padded_c][accs: out_c*4]
-    let pad_input_len = in_h * in_w * padded_c;
+    //   [padded_input: padded_h*padded_w*padded_c][padded_weights: out_c*9*padded_c][accs: out_c*4]
+    // When input_offset != 0 we also need a weight-sum buffer (out_c*4) — see
+    // the fold below — carved right after `accs`.
+    let pad_input_len = padded_h * padded_w * padded_c;
     let pad_weights_len = out_c * 9 * padded_c;
-    let need = if pad {
-        pad_input_len + pad_weights_len + out_c * 4
+    let wsum_extra = if params.input_offset != 0 { out_c * 4 } else { 0 };
+    let need = if needs_pad {
+        pad_input_len + pad_weights_len + out_c * 4 + wsum_extra
     } else {
-        out_c * 4
+        out_c * 4 + wsum_extra
     };
     if ctx.scratch.len() < need {
         return Ok(false);
@@ -232,8 +243,10 @@ fn conv3x3_accx_dispatch(ctx: &mut Conv3x3AccxCtx<'_>) -> Result<bool, KernelErr
     let scratch_ptr = ctx.scratch.as_mut_ptr();
     let scratch_u = scratch_ptr as usize;
 
-    let (k_in_ptr, k_w_ptr, accs, k_in_c, k_row_delta);
-    if pad {
+    let (k_in_ptr, k_w_ptr, accs, k_in_c, k_row_delta, k_pad_w);
+    let input_offset = params.input_offset;
+    let wsum: *mut i32;
+    if needs_pad {
         // Padded buffers — carve from scratch at 16-byte boundaries so the
         // kernel's VLD.128 stays aligned.
         let in_off = (scratch_u + 15) & !15;
@@ -245,14 +258,29 @@ fn conv3x3_accx_dispatch(ctx: &mut Conv3x3AccxCtx<'_>) -> Result<bool, KernelErr
         if (accs_off - scratch_u) % 4 != 0 {
             return Ok(false);
         }
-
-        // Zero-fill the padded input, then copy the real channels of each
-        // pixel into the padded channel slots.
-        unsafe { core::ptr::write_bytes(p_in as *mut i8, 0, pad_input_len) };
+        wsum = if input_offset != 0 {
+            (unsafe { scratch_ptr.add(accs_off - scratch_u + out_c * 4) }) as *mut i32
+        } else {
+            core::ptr::null_mut()
+        };
+        // Zero-fill the padded input, then copy the real interior (offset by
+        // pad_h/pad_w) and its channels into the padded channel slots. When
+        // `input_offset != 0` the pad border is filled with `-input_offset`
+        // (i8) so out-of-bounds taps compute `(-off)·w`, which the Phase C
+        // `+off·Σw` fold cancels to exactly 0 — matching the scalar ref's
+        // bounds-skip semantics for padded layers.
+        let fill: u8 = if input_offset != 0 {
+            (-input_offset) as u8
+        } else {
+            0
+        };
+        unsafe { core::ptr::write_bytes(p_in as *mut i8, fill, pad_input_len) };
         for h in 0..in_h {
             for w in 0..in_w {
                 let src = unsafe { in_ptr.add((h * in_w + w) * input_c) };
-                let dst = unsafe { p_in.add((h * in_w + w) * padded_c) as *mut i8 };
+                let dst = unsafe {
+                    p_in.add(((h + pad_h) * padded_w + (w + pad_w)) * padded_c) as *mut i8
+                };
                 unsafe { core::ptr::copy_nonoverlapping(src, dst, input_c) };
             }
         }
@@ -271,7 +299,8 @@ fn conv3x3_accx_dispatch(ctx: &mut Conv3x3AccxCtx<'_>) -> Result<bool, KernelErr
         k_w_ptr = p_w;
         accs = p_accs;
         k_in_c = padded_c;
-        k_row_delta = if in_w >= 3 { (in_w - 3) * padded_c } else { 0 };
+        k_pad_w = padded_w;
+        k_row_delta = if padded_w >= 3 { (padded_w - 3) * padded_c } else { 0 };
     } else {
         if (in_ptr as usize) % 16 != 0
             || (w_ptr as usize) % 16 != 0
@@ -285,8 +314,23 @@ fn conv3x3_accx_dispatch(ctx: &mut Conv3x3AccxCtx<'_>) -> Result<bool, KernelErr
         if (accs as usize) % 4 != 0 {
             return Ok(false);
         }
+        wsum = if input_offset != 0 {
+            unsafe { accs.add(out_c) }
+        } else {
+            core::ptr::null_mut()
+        };
         k_in_c = input_c;
+        k_pad_w = in_w;
         k_row_delta = if in_w >= 3 { (in_w - 3) * input_c } else { 0 };
+    }
+
+    // Compute the per-channel weight sums once (they are input-independent)
+    // so a non-zero `input_offset` can be folded bit-exactly: the scalar acc is
+    // `Σ (in + offset)·w = Σ in·w + offset·Σw`; the kernel produced `Σ in·w`.
+    if input_offset != 0 {
+        let ws = unsafe { core::slice::from_raw_parts_mut(wsum, out_c) };
+        let wv = unsafe { core::slice::from_raw_parts(k_w_ptr, out_c * 9 * k_in_c) };
+        crate::accx::weight_sums_conv(ws, wv, 9, k_in_c, out_c);
     }
 
     let multipliers = params.output_multiplier_per_channel;
@@ -303,7 +347,7 @@ fn conv3x3_accx_dispatch(ctx: &mut Conv3x3AccxCtx<'_>) -> Result<bool, KernelErr
 
     for oh in 0..out_h {
         for ow in 0..out_w {
-            let px = (oh * stride_h * in_w + ow * stride_w) * k_in_c;
+            let px = (oh * stride_h * k_pad_w + ow * stride_w) * k_in_c;
             let po = (oh * out_w + ow) * out_c;
             unsafe {
                 crate::accx::accx_conv3x3(
@@ -314,6 +358,13 @@ fn conv3x3_accx_dispatch(ctx: &mut Conv3x3AccxCtx<'_>) -> Result<bool, KernelErr
                     out_c,
                     k_row_delta,
                 );
+            }
+            if input_offset != 0 {
+                for oc in 0..out_c {
+                    let v = unsafe { accs.add(oc).read() };
+                    let s = unsafe { wsum.add(oc).read() };
+                    unsafe { accs.add(oc).write(v.wrapping_add(input_offset.wrapping_mul(s))) };
+                }
             }
             let acc_slice = unsafe { core::slice::from_raw_parts_mut(accs, out_c) };
             crate::accx::requantize_1x1(&mut crate::accx::ReqCtx {

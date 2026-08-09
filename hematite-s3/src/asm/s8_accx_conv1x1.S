@@ -1,5 +1,7 @@
 # s8_accx_conv1x1.S — bespoke GPR-accumulator conv1x1/fc kernel (bit-exact).
 #
+# SPDX-License-Identifier: Apache-2.0
+#
 # Strategy (validated on device by probe_s8accx):
 #   EE.VMULAS.S8.ACCX F, I performs a 16-wide element-wise dot-product
 #   reduction: accx += sum(i=0..15) F[i]*I[i], with 16-bit products

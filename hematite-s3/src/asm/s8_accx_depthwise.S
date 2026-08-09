@@ -1,5 +1,7 @@
 # s8_accx_depthwise.S — bespoke QACC per-lane depthwise kernel (bit-exact).
 #
+# SPDX-License-Identifier: Apache-2.0
+#
 # Depthwise CANNOT use EE.VMULAS.S8.ACCX (that is a dot-product REDUCTION into
 # a single 32-bit accumulator). Depthwise needs PER-LANE accumulation: output
 # channel oc only sees input channel oc. The primitive is

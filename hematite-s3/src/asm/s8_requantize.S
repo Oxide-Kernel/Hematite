@@ -1,3 +1,7 @@
+# s8_requantize.S — bespoke uniform requantize epilogue (bit-exact).
+#
+# SPDX-License-Identifier: Apache-2.0
+#
     .text
     .align 4
     .global s8_requantize_uniform

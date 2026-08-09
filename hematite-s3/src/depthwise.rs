@@ -242,36 +242,151 @@ fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, Kerne
         - params.input_shape[2])
         / 2;
 
-    if params.input_offset != 0
-        || params.depth_multiplier != 1
+    if params.depth_multiplier != 1
         || params.dilation_height_factor != 1
         || params.dilation_width_factor != 1
-        || params.stride_height != 1
-        || params.stride_width != 1
         || filter_h != 3
         || filter_w != 3
-        || pad_h != 0
-        || pad_w != 0
         || !crate::accx::accx_eligible_depthwise(input_c, out_c)
     {
         return Ok(false);
     }
+    // Phase C fold requires the padded fill `-input_offset` to fit in i8.
+    if params.input_offset != 0 && params.input_offset.abs() > 127 {
+        return Ok(false);
+    }
 
-    let need = out_c * 4;
+    let stride_h = params.stride_height.max(1) as usize;
+    let stride_w = params.stride_width.max(1) as usize;
+    // SAME padding is asymmetric for odd totals: the scalar ref reads
+    // `oh*stride - pad + fh` with a bounds-check skip, which is equivalent to
+    // `pad_top = total/2` rows of zeros above and `total - pad_top` below. We
+    // must pad the staged copy by the FULL total (not 2*(total/2), which drops
+    // the odd leftover and would make the kernel read out of bounds).
+    let pad_total_h = ((out_h as i32 - 1) * params.stride_height + dilated_filter_h
+        - in_h as i32)
+        .max(0) as usize;
+    let pad_total_w = ((out_w as i32 - 1) * params.stride_width + dilated_filter_w
+        - in_w as i32)
+        .max(0) as usize;
+    let pad_h = (pad_total_h / 2) as usize;
+    let pad_w = (pad_total_w / 2) as usize;
+    let padded_h = in_h + pad_total_h;
+    let padded_w = in_w + pad_total_w;
+    // Phase F — non-%16 channels: the kernel VLDs 16-channel vectors and loops
+    // `out_c / 16` groups, so we zero-pad the input AND filter channel
+    // dimensions up to the next multiple of 16 (same trick as the conv3x3
+    // channel padding). Padded channels have zero input and zero weights, so
+    // they contribute 0 to every real output channel (depthwise per-lane
+    // semantics: output channel oc only sees input channel oc).
+    let padded_c = ((input_c + 15) / 16) * 16;
+    let needs_channel_pad = padded_c != input_c;
+    let needs_pad = pad_total_h > 0 || pad_total_w > 0 || needs_channel_pad;
+
+    //   [padded_input: padded_h*padded_w*padded_c]
+    //   [padded_filter: 9*padded_c   (only when channel padding)]
+    //   [accs: padded_c*4][wsum: out_c*4 (only when input_offset != 0)]
+    let pad_input_len = padded_h * padded_w * padded_c;
+    let pad_filter_len = if needs_channel_pad { 9 * padded_c } else { 0 };
+    let input_offset = params.input_offset;
+    let wsum_extra = if input_offset != 0 { out_c * 4 } else { 0 };
+    let need = if needs_pad {
+        pad_input_len + pad_filter_len + padded_c * 4 + wsum_extra
+    } else {
+        out_c * 4 + wsum_extra
+    };
     if ctx.scratch.len() < need {
         return Ok(false);
     }
 
-    let in_ptr = ctx.input.as_ptr();
     let w_ptr = ctx.weights.as_ptr();
     let out_ptr = ctx.output.as_mut_ptr();
-    let accs = ctx.scratch.as_mut_ptr() as *mut i32;
-    if (in_ptr as usize) % 16 != 0
-        || (w_ptr as usize) % 16 != 0
+    let mut accs = ctx.scratch.as_mut_ptr() as *mut i32;
+    if (w_ptr as usize) % 16 != 0
         || (out_ptr as usize) % 16 != 0
         || (accs as usize) % 4 != 0
     {
         return Ok(false);
+    }
+
+    // When padding, carve a zero-filled [padded_h][padded_w][padded_c] input
+    // (and padded [tap][padded_c] filter when channel padding) in scratch
+    // (16-byte aligned bases) and copy the real interior at (h+pad_h, w+pad_w);
+    // the kernel then runs on the padded buffers with stride stepping in the
+    // caller pixel loop. When no padding, use the input directly.
+    let (k_in_ptr, k_w_ptr, k_pad_w, k_in_c, row_delta);
+    let mut wsum: *mut i32 = core::ptr::null_mut();
+    if needs_pad {
+        let scratch_u = ctx.scratch.as_mut_ptr() as usize;
+        let in_off = (scratch_u + 15) & !15;
+        let w_off = in_off + pad_input_len;
+        let accs_off = (w_off + pad_filter_len + 15) & !15;
+        let p_in = unsafe { ctx.scratch.as_mut_ptr().add(in_off - scratch_u) };
+        let p_w = if needs_channel_pad {
+            unsafe { ctx.scratch.as_mut_ptr().add(w_off - scratch_u) }
+        } else {
+            w_ptr as *mut u8
+        };
+        let p_accs =
+            unsafe { ctx.scratch.as_mut_ptr().add(accs_off - scratch_u) as *mut i32 };
+        if input_offset != 0 {
+            wsum = unsafe { ctx.scratch.as_mut_ptr().add(accs_off - scratch_u + padded_c * 4) }
+                as *mut i32;
+        }
+        // Fill the padded input with `-input_offset` (or 0) so out-of-bounds
+        // taps compute `(-off)·w` and the Phase C `+off·Σw` fold cancels them
+        // to 0 — matching the scalar ref's bounds-skip semantics. Padded
+        // channel slots also get the fill, but their weights are zero so they
+        // contribute 0 regardless.
+        let fill: u8 = if input_offset != 0 { (-input_offset) as u8 } else { 0 };
+        unsafe { core::ptr::write_bytes(p_in, fill, pad_input_len) };
+        let src = ctx.input.as_ptr();
+        for h in 0..in_h {
+            for w in 0..in_w {
+                let srow = unsafe { src.add((h * in_w + w) * input_c) };
+                let drow = unsafe {
+                    p_in.add(((h + pad_h) * padded_w + (w + pad_w)) * padded_c) as *mut i8
+                };
+                unsafe { core::ptr::copy_nonoverlapping(srow, drow, input_c) };
+            }
+        }
+
+        // Zero-fill the padded filter [tap][padded_c], copy real channels.
+        if needs_channel_pad {
+            unsafe { core::ptr::write_bytes(p_w, 0, pad_filter_len) };
+            for tap in 0..9 {
+                let src = unsafe { w_ptr.add(tap * out_c) };
+                let dst = unsafe { p_w.add(tap * padded_c) as *mut i8 };
+                unsafe { core::ptr::copy_nonoverlapping(src, dst, out_c) };
+            }
+        }
+
+        k_in_ptr = p_in as *const i8;
+        k_w_ptr = p_w as *const i8;
+        k_pad_w = padded_w;
+        k_in_c = padded_c;
+        row_delta = if padded_w >= 3 { (padded_w - 3) * padded_c } else { 0 };
+        accs = p_accs;
+    } else {
+        let in_ptr = ctx.input.as_ptr();
+        if (in_ptr as usize) % 16 != 0 {
+            return Ok(false);
+        }
+        k_in_ptr = in_ptr;
+        k_w_ptr = w_ptr;
+        k_pad_w = in_w;
+        k_in_c = input_c;
+        row_delta = if in_w >= 3 { (in_w - 3) * input_c } else { 0 };
+        if input_offset != 0 {
+            wsum = unsafe { accs.add(out_c) };
+        }
+    }
+
+    // Depthwise filter is [tap][oc] (HWCN); wsum[oc] = Σ_tap w[tap·out_c + oc].
+    if input_offset != 0 {
+        let ws = unsafe { core::slice::from_raw_parts_mut(wsum, out_c) };
+        let wv = unsafe { core::slice::from_raw_parts(k_w_ptr, 9 * k_in_c) };
+        crate::accx::weight_sums_depthwise(ws, wv, out_c);
     }
 
     let multipliers = params.output_multiplier_per_channel;
@@ -283,15 +398,27 @@ fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, Kerne
         Some((m, s)) => (m, s),
         None => (0, i32::MIN),
     };
-    let row_delta = if in_w >= 3 { (in_w - 3) * input_c } else { 0 };
-    let _ = in_h;
 
     for oh in 0..out_h {
         for ow in 0..out_w {
-            let px = (oh * in_w + ow) * input_c;
+            let px = (oh * stride_h * k_pad_w + ow * stride_w) * k_in_c;
             let po = (oh * out_w + ow) * out_c;
             unsafe {
-                crate::accx::accx_depthwise(in_ptr.add(px), w_ptr, accs, input_c, out_c, row_delta);
+                crate::accx::accx_depthwise(
+                    k_in_ptr.add(px),
+                    k_w_ptr,
+                    accs,
+                    k_in_c,
+                    k_in_c,
+                    row_delta,
+                );
+            }
+            if input_offset != 0 {
+                for oc in 0..out_c {
+                    let v = unsafe { accs.add(oc).read() };
+                    let s = unsafe { wsum.add(oc).read() };
+                    unsafe { accs.add(oc).write(v.wrapping_add(input_offset.wrapping_mul(s))) };
+                }
             }
             let acc_slice = unsafe { core::slice::from_raw_parts_mut(accs, out_c) };
             crate::accx::requantize_1x1(&mut crate::accx::ReqCtx {
