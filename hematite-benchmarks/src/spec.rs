@@ -289,7 +289,11 @@ const SOFTMAX_1X1000_PARAMS: SoftmaxParams = SoftmaxParams {
     row_size: 1000,
     input_multiplier: 1_717_986_918, // quantize_multiplier(0.1), from the softmax golden
     input_left_shift: 22,
-    diff_min: -128,
+    // TFLM diff_min = -CalculateInputRadius(5, left_shift)
+    // (softmax_common.cc @ 18b9e6f2a8c5a9518e588f59c2ba16ef7ef9d551);
+    // radius = floor(31 * 2^26 / 2^(input_left_shift + 1)) — the +1 matches
+    // TFLM's stored shift (26+s) vs our 25+s convention → -(31 << 26 >> 23) = -248.
+    diff_min: -248,
     input_offset: 0,
     output_offset: -128,
     quantized_activation_min: -128,

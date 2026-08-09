@@ -959,6 +959,16 @@ fn emit_softmax(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedO
     // round(diff * in_scale * 2^26) → input_left_shift = 25 + s.
     let input_left_shift = 25 + s;
 
+    // TFLM-correct `diff_min` (was hardcoded -128). TFLM softmax_common.cc
+    // @ 18b9e6f2a8c5a9518e588f59c2ba16ef7ef9d551:
+    //   diff_min = -CalculateInputRadius(kScaledDiffIntegerBits=5, left_shift),
+    // with CalculateInputRadius (quantization_util.cc, same SHA)
+    //   = floor((2^5 - 1) * 2^(31 - 5) / 2^left_shift) = floor(31 * 2^26 / 2^ls).
+    // TFLM's shift comes from QuantizeMultiplier(in_scale * 2^26) → `26 + s`,
+    // while we store `25 + s` (the extra +1 lives in the kernel's sadhg doubling
+    // shift), so the radius uses `input_left_shift + 1` to match TFLM exactly:
+    let diff_min = -(((31i64) << 26) >> (input_left_shift + 1)) as i32;
+
     let p_name = Ident::new(&format!("SOFTMAX_PARAMS_{i}"), proc_macro2::Span::call_site());
     let params_c = quote! {
         const #p_name: ::hematite_core::op_params::SoftmaxParams =
@@ -967,7 +977,7 @@ fn emit_softmax(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedO
                 row_size: #row_size,
                 input_multiplier: #m,
                 input_left_shift: #input_left_shift,
-                diff_min: -128,
+                diff_min: #diff_min,
                 input_offset: #in_zp,
                 output_offset: -128,
                 quantized_activation_min: -128,

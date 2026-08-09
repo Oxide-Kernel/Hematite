@@ -77,15 +77,17 @@ fn softmax_golden_5elem() {
 
 // ── Unit tests — guard the general path beyond the single golden ────────────
 
-/// Standard params matching the golden fixture (copied to avoid coupling to
-/// the include! module for tests that use custom shapes).
+/// Standard params matching the golden fixture's scale (copied to avoid
+/// coupling to the include! module for tests that use custom shapes).
+/// `diff_min` is the TFLM-correct value for this scale/left_shift:
+/// -CalculateInputRadius(5, 23) = -(31 << 26 >> 23) = -248 (see codegen).
 fn standard_params(num_rows: i32, row_size: i32) -> SoftmaxParams {
     SoftmaxParams {
         num_rows,
         row_size,
         input_multiplier: 1_717_986_918,
         input_left_shift: 22,
-        diff_min: -128,
+        diff_min: -248,
         input_offset: 0,
         output_offset: -128,
         quantized_activation_min: -128,
@@ -140,9 +142,10 @@ fn softmax_unit_two_row_independence() {
 ///
 /// Input = [-128, -128, 127], max = 127.
 /// Diffs = [-255, -255, 0].
-/// diff_min = -128, so elements 0 and 1 (diff = -255 < -128) are skipped
-/// → output = -128. Element 2 (diff = 0) proceeds through exponential →
-/// gets the full probability mass → softmax output is the sole contributor.
+/// diff_min = -248 (TFLM-correct for this scale), so elements 0 and 1
+/// (diff = -255 < -248) are skipped → output = -128. Element 2 (diff = 0)
+/// proceeds through exponential → gets the full probability mass → softmax
+/// output is the sole contributor.
 ///
 /// Derivation for element 2:
 ///   exp(0) = i32::MAX (Q0.31)

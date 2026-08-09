@@ -401,7 +401,7 @@ fn check_softmax_simd_matches_ref() {
         row_size: 1000,
         input_multiplier: 1_717_986_918, // quantize_multiplier(0.1), softmax golden
         input_left_shift: 22,
-        diff_min: -128,
+        diff_min: -248, // TFLM -CalculateInputRadius(5, 23) — see spec.rs SOFTMAX_1X1000_PARAMS
         input_offset: 0,
         output_offset: -128,
         quantized_activation_min: -128,
