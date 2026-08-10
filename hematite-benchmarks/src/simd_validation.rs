@@ -364,6 +364,65 @@ fn run_max_pool_check() {
     report(&compare("max_pool_2x2", &got.0, &want.0));
 }
 
+// ── Generic pool (T3.1): 3×3 stride-1 VALID 8x8x16 -> 6x6x16 ────────────────
+//
+// The widened `simd_eligible_pool` gate accepts any filter/stride with
+// pad_total ≤ 0, so these shapes dispatch the `*_hwc1` SIMD kernels on
+// device. Max semantics equal the ref bit-exact (PASS expected); avg runs
+// the documented fixed-point semantics (the ±1 known-delta class — see
+// `hematite-s3/src/pool.rs` module doc and `local-notes/evidence/composed-kernels/
+// t31-pool.md`). The relu-clamp shape exercises the Rust clamp post-pass.
+
+const GEN_POOL_IN: usize = 8 * 8 * 16;
+const GEN_POOL_OUT: usize = 6 * 6 * 16;
+
+fn generic_pool_params(act_min: i32) -> PoolParams {
+    PoolParams {
+        input_shape: [1, 8, 8, 16],
+        output_shape: [1, 6, 6, 16],
+        filter_width: 3,
+        filter_height: 3,
+        stride_width: 1,
+        stride_height: 1,
+        padding: Padding::Valid,
+        activation: FusedActivation::None,
+        quantized_activation_min: act_min,
+        quantized_activation_max: 127,
+    }
+}
+
+fn run_generic_max_pool_checks() {
+    for (act_min, name) in [(i8::MIN as i32, "max_pool_3x3_s1"), (0, "max_pool_3x3_s1_relu")] {
+        let input = Aligned(make_pattern::<GEN_POOL_IN>(0x1A7E_5EED));
+        let mut want = Aligned([0i8; GEN_POOL_OUT]);
+        let mut got = Aligned([0i8; GEN_POOL_OUT]);
+        let params = generic_pool_params(act_min);
+
+        hematite_ref::pool::max_pool_2d(&input.0, &params, &mut want.0, &mut [])
+            .expect("harness: ref generic max_pool_2d shape");
+        hematite_s3::pool::max_pool_2d(&input.0, &params, &mut got.0, &mut [])
+            .expect("harness: s3 generic max_pool_2d shape");
+
+        report(&compare(name, &got.0, &want.0));
+    }
+}
+
+fn run_generic_avg_pool_check() {
+    let input = Aligned(make_pattern::<GEN_POOL_IN>(0x2BAD_F00D));
+    let mut want = Aligned([0i8; GEN_POOL_OUT]);
+    let mut got = Aligned([0i8; GEN_POOL_OUT]);
+    let params = generic_pool_params(i8::MIN as i32);
+
+    hematite_ref::pool::average_pool_2d(&input.0, &params, &mut want.0, &mut [])
+        .expect("harness: ref generic average_pool_2d shape");
+    hematite_s3::pool::average_pool_2d(&input.0, &params, &mut got.0, &mut [])
+        .expect("harness: s3 generic average_pool_2d shape");
+
+    // The avg fixed-point semantics may diverge ±1 LSB from ref (the
+    // documented known-delta class, same as `avg_pool_2x2`).
+    report(&compare("avg_pool_3x3_s1", &got.0, &want.0));
+}
+
 // ── Relu: 256 elems, identity requantize (spec.rs SIMD_RELU_256_PARAMS) ─────
 
 fn check_relu_simd_matches_ref() {
@@ -1177,6 +1236,8 @@ pub fn validate_all() {
     run_elementwise_check::<48>(ElemOp::Sub, "sub_n48");
     run_avg_pool_check();
     run_max_pool_check();
+    run_generic_avg_pool_check();
+    run_generic_max_pool_checks();
     check_relu_simd_matches_ref();
     check_softmax_simd_matches_ref();
     check_depthwise_simd_matches_ref();

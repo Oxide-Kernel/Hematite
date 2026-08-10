@@ -767,6 +767,135 @@ const SIMD_AVGPOOL_32X32_PARAMS: PoolParams = PoolParams {
     quantized_activation_max: 127,
 };
 
+// ── T3.1 generic-pool rows — the widened matrix ──────────────────────────────
+//
+// filter {2×2, 3×3, 5×5, global 7×7} × stride {1, 2} × pad {0, 1, SAME} ×
+// clamp {full-range, relu}. The device SIMD path (`simd_eligible_pool`)
+// engages for the no-padding / no-partial-window shapes (pad_total ≤ 0:
+// VALID rows and 2×2/stride-2 SAME); padded rows run the scalar fallback on
+// device (bit-exact vs ref — the pool backend delivers no scratch for
+// spatial padding staging) and are model-verified on the host. The avg
+// fixed-point-vs-ref divergence is documented in
+// `local-notes/evidence/composed-kernels/t31-pool.md`.
+
+/// 3×3 stride-1 VALID (pad_total 0) — the generic hwc1 SIMD path (avg).
+const POOL_3X3_S1_VALID_PARAMS: PoolParams = PoolParams {
+    input_shape: [1, 8, 8, 16],
+    output_shape: [1, 6, 6, 16],
+    filter_width: 3,
+    filter_height: 3,
+    stride_width: 1,
+    stride_height: 1,
+    padding: Padding::Valid,
+    activation: FusedActivation::None,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// Same as `POOL_3X3_S1_VALID_PARAMS` with a relu-range clamp (0..127) —
+/// the generic driver's Rust clamp post-pass.
+const POOL_3X3_S1_VALID_RELU_PARAMS: PoolParams = PoolParams {
+    input_shape: [1, 8, 8, 16],
+    output_shape: [1, 6, 6, 16],
+    filter_width: 3,
+    filter_height: 3,
+    stride_width: 1,
+    stride_height: 1,
+    padding: Padding::Valid,
+    activation: FusedActivation::None,
+    quantized_activation_min: 0,
+    quantized_activation_max: 127,
+};
+
+/// 3×3 stride-1 SAME (pad 1) — model-verified on host; scalar on device.
+const POOL_3X3_S1_SAME_PARAMS: PoolParams = PoolParams {
+    input_shape: [1, 8, 8, 16],
+    output_shape: [1, 8, 8, 16],
+    filter_width: 3,
+    filter_height: 3,
+    stride_width: 1,
+    stride_height: 1,
+    padding: Padding::Same,
+    activation: FusedActivation::None,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 3×3 stride-2 SAME on 12×12 (pad_total 1 — asymmetric SAME, partial
+/// windows) — model-verified on host; scalar on device.
+const POOL_3X3_S2_SAME_PARAMS: PoolParams = PoolParams {
+    input_shape: [1, 12, 12, 16],
+    output_shape: [1, 6, 6, 16],
+    filter_width: 3,
+    filter_height: 3,
+    stride_width: 2,
+    stride_height: 2,
+    padding: Padding::Same,
+    activation: FusedActivation::None,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 5×5 stride-1 SAME on 12×12 (pad 2) — model-verified on host; scalar on
+/// device.
+const POOL_5X5_S1_SAME_PARAMS: PoolParams = PoolParams {
+    input_shape: [1, 12, 12, 16],
+    output_shape: [1, 12, 12, 16],
+    filter_width: 5,
+    filter_height: 5,
+    stride_width: 1,
+    stride_height: 1,
+    padding: Padding::Same,
+    activation: FusedActivation::None,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 5×5 stride-2 SAME on 14×14 (pad_total 3, pad 1) — model-verified on
+/// host; scalar on device.
+const POOL_5X5_S2_SAME_PARAMS: PoolParams = PoolParams {
+    input_shape: [1, 14, 14, 16],
+    output_shape: [1, 7, 7, 16],
+    filter_width: 5,
+    filter_height: 5,
+    stride_width: 2,
+    stride_height: 2,
+    padding: Padding::Same,
+    activation: FusedActivation::None,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// Global 7×7 avg/max pool (pad_total 0) — the generic hwc1 path on a
+/// 1×1 output.
+const POOL_7X7_GLOBAL_PARAMS: PoolParams = PoolParams {
+    input_shape: [1, 7, 7, 16],
+    output_shape: [1, 1, 1, 16],
+    filter_width: 7,
+    filter_height: 7,
+    stride_width: 7,
+    stride_height: 7,
+    padding: Padding::Valid,
+    activation: FusedActivation::None,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 3×3 stride-1 VALID with 24 channels — the model's C%16 scalar tail
+/// (host-verified); scalar on device (the device gate requires C % 16).
+const POOL_3X3_S1_VALID_C24_PARAMS: PoolParams = PoolParams {
+    input_shape: [1, 8, 8, 24],
+    output_shape: [1, 6, 6, 24],
+    filter_width: 3,
+    filter_height: 3,
+    stride_width: 1,
+    stride_height: 1,
+    padding: Padding::Valid,
+    activation: FusedActivation::None,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
 /// ReLU over 256 elements with the identity requantize pair
 /// (mult=1<<30, shift=1) and zero offsets — fires `dl_tie728_s8_relu_11c`
 /// (the Phase-0-fixed dispatch gate in `hematite-s3::activations::relu`).
@@ -1423,6 +1552,134 @@ pub const fn kernel_specs() -> &'static [KernelSpec] {
             params: KernelParams::Pool(&SIMD_AVGPOOL_32X32_PARAMS),
             reference: None,
             note: "TIE728 avg_pool2d_22c1 SIMD row: 2x2 stride2 VALID, channels 16.",
+        },
+        KernelSpec {
+            name: "avg_pool_s8 3x3 s1 p0 (T3.1 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::AvgPool,
+            params: KernelParams::Pool(&POOL_3X3_S1_VALID_PARAMS),
+            reference: None,
+            note: "T3.1 generic avg-pool: 3x3 stride-1 VALID (pad_total 0) — the hwc1 SIMD path engages on device; fixed-point vs ref documented in t31-pool.md.",
+        },
+        KernelSpec {
+            name: "max_pool_s8 3x3 s1 p0 (T3.1 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::MaxPool,
+            params: KernelParams::Pool(&POOL_3X3_S1_VALID_PARAMS),
+            reference: None,
+            note: "T3.1 generic max-pool: 3x3 stride-1 VALID — hwc1 SIMD engages; max semantics equal ref bit-exact.",
+        },
+        KernelSpec {
+            name: "avg_pool_s8 3x3 s1 p0 relu (T3.1 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::AvgPool,
+            params: KernelParams::Pool(&POOL_3X3_S1_VALID_RELU_PARAMS),
+            reference: None,
+            note: "T3.1 generic avg-pool with relu-range clamp (0..127) — the Rust clamp post-pass over the hwc1 output.",
+        },
+        KernelSpec {
+            name: "max_pool_s8 3x3 s1 p0 relu (T3.1 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::MaxPool,
+            params: KernelParams::Pool(&POOL_3X3_S1_VALID_RELU_PARAMS),
+            reference: None,
+            note: "T3.1 generic max-pool with relu-range clamp — hwc1 SIMD + clamp post-pass.",
+        },
+        KernelSpec {
+            name: "avg_pool_s8 3x3 s1 SAME (T3.1)",
+            tier: MemoryTier::Sram,
+            op: OpKind::AvgPool,
+            params: KernelParams::Pool(&POOL_3X3_S1_SAME_PARAMS),
+            reference: None,
+            note: "T3.1 widened shape (pad 1): model-verified on host (avg fixed-point vs ref documented in t31-pool.md); scalar on device — the pool backend delivers no scratch for spatial padding.",
+        },
+        KernelSpec {
+            name: "max_pool_s8 3x3 s1 SAME (T3.1)",
+            tier: MemoryTier::Sram,
+            op: OpKind::MaxPool,
+            params: KernelParams::Pool(&POOL_3X3_S1_SAME_PARAMS),
+            reference: None,
+            note: "T3.1 widened shape (pad 1): max model == ref bit-exact (host-verified); scalar on device.",
+        },
+        KernelSpec {
+            name: "avg_pool_s8 3x3 s2 SAME (T3.1)",
+            tier: MemoryTier::Sram,
+            op: OpKind::AvgPool,
+            params: KernelParams::Pool(&POOL_3X3_S2_SAME_PARAMS),
+            reference: None,
+            note: "T3.1 widened shape (asymmetric SAME, partial windows): model-verified on host; scalar on device.",
+        },
+        KernelSpec {
+            name: "max_pool_s8 3x3 s2 SAME (T3.1)",
+            tier: MemoryTier::Sram,
+            op: OpKind::MaxPool,
+            params: KernelParams::Pool(&POOL_3X3_S2_SAME_PARAMS),
+            reference: None,
+            note: "T3.1 widened shape (asymmetric SAME): max model == ref (host-verified); scalar on device.",
+        },
+        KernelSpec {
+            name: "avg_pool_s8 5x5 s1 SAME (T3.1)",
+            tier: MemoryTier::Sram,
+            op: OpKind::AvgPool,
+            params: KernelParams::Pool(&POOL_5X5_S1_SAME_PARAMS),
+            reference: None,
+            note: "T3.1 widened shape (5x5, pad 2): model-verified on host; scalar on device.",
+        },
+        KernelSpec {
+            name: "max_pool_s8 5x5 s1 SAME (T3.1)",
+            tier: MemoryTier::Sram,
+            op: OpKind::MaxPool,
+            params: KernelParams::Pool(&POOL_5X5_S1_SAME_PARAMS),
+            reference: None,
+            note: "T3.1 widened shape (5x5, pad 2): max model == ref (host-verified); scalar on device.",
+        },
+        KernelSpec {
+            name: "avg_pool_s8 5x5 s2 SAME (T3.1)",
+            tier: MemoryTier::Sram,
+            op: OpKind::AvgPool,
+            params: KernelParams::Pool(&POOL_5X5_S2_SAME_PARAMS),
+            reference: None,
+            note: "T3.1 widened shape (5x5 stride-2 SAME, pad 1): model-verified on host; scalar on device.",
+        },
+        KernelSpec {
+            name: "max_pool_s8 5x5 s2 SAME (T3.1)",
+            tier: MemoryTier::Sram,
+            op: OpKind::MaxPool,
+            params: KernelParams::Pool(&POOL_5X5_S2_SAME_PARAMS),
+            reference: None,
+            note: "T3.1 widened shape (5x5 stride-2 SAME): max model == ref (host-verified); scalar on device.",
+        },
+        KernelSpec {
+            name: "avg_pool_s8 7x7 global (T3.1 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::AvgPool,
+            params: KernelParams::Pool(&POOL_7X7_GLOBAL_PARAMS),
+            reference: None,
+            note: "T3.1 global avg-pool 7x7x16 (pad_total 0) — the hwc1 SIMD path on a 1x1 output.",
+        },
+        KernelSpec {
+            name: "max_pool_s8 7x7 global (T3.1 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::MaxPool,
+            params: KernelParams::Pool(&POOL_7X7_GLOBAL_PARAMS),
+            reference: None,
+            note: "T3.1 global max-pool 7x7x16 — hwc1 SIMD engages.",
+        },
+        KernelSpec {
+            name: "avg_pool_s8 3x3 s1 p0 c24 (T3.1 tail)",
+            tier: MemoryTier::Sram,
+            op: OpKind::AvgPool,
+            params: KernelParams::Pool(&POOL_3X3_S1_VALID_C24_PARAMS),
+            reference: None,
+            note: "T3.1 C%16 scalar tail (24 channels): host model-verified; scalar on device (device gate requires C % 16).",
+        },
+        KernelSpec {
+            name: "max_pool_s8 3x3 s1 p0 c24 (T3.1 tail)",
+            tier: MemoryTier::Sram,
+            op: OpKind::MaxPool,
+            params: KernelParams::Pool(&POOL_3X3_S1_VALID_C24_PARAMS),
+            reference: None,
+            note: "T3.1 C%16 scalar tail (24 channels): host model-verified; scalar on device.",
         },
         KernelSpec {
             name: "relu_s8 256 (SIMD)",
