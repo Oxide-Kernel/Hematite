@@ -127,7 +127,7 @@ pub(crate) fn weight_sums_depthwise(out: &mut [i32], weights: &[i8], out_c: usiz
 }
 /// Bundled into a single struct passed by `&mut` because the Xtensa LLVM
 /// backend miscompiles the multi-arg (9-slot) call site on device — the same
-/// class of bug as the `dispatch_fc` inline regression. A 1-arg call is safe.
+/// class of bug as the Xtensa multi-arg call miscompile. A 1-arg call is safe.
 ///
 /// `uniform_mult`/`uniform_shift` are the fast-path hint computed once by the
 /// dispatcher: when all channels share the same `mult`/`shift`, `requantize_1x1`
@@ -195,8 +195,8 @@ fn clamp(v: i32, lo: i32, hi: i32) -> i32 {
 ///
 /// `#[inline(never)]`: when inlined, the Xtensa LLVM backend miscompiles the
 /// `accs.iter()` loop bound (the write index runs one past `output.len()`,
-/// panicking `index out of bounds`) — same class of bug as the earlier
-/// `dispatch_fc` inline regression. Keeping this call separate is required.
+/// panicking `index out of bounds`) — the Xtensa multi-arg call miscompile
+/// class (formerly seen as the `dispatch_fc` inline regression).
 #[inline(never)]
 pub(crate) fn requantize_1x1(ctx: &mut ReqCtx<'_>) {
     let n = ctx.accs.len();

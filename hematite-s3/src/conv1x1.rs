@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Hematite Contributors.
 //
-//! Conv2D 1×1 GEMM kernel — scalar fallback + TIE728 SIMD backend.
+//! Conv2D 1×1 GEMM kernel — scalar fallback + ACCX SIMD backend.
 //!
 //! # Bit-exact contract (Plan A4)
 //!
@@ -11,9 +11,10 @@
 //! | (b) | Scalar ref ≡ per-channel TFLM golden bit-exact | **Host** (this test) |
 //! | (c) | SIMD vs ref cross-check ≤1 LSB on requantize | Device (Phase 5) |
 //!
-//! On host (stable-aarch64-apple-darwin), only leg (b) executes. The SIMD path
-//! (`#[cfg(target_arch = "xtensa")]`) is NEVER compiled on host — it exists in
-//! the tree for structural review and Phase 5 device verification.
+//! On host (stable-aarch64-apple-darwin), only leg (b) executes. The SIMD
+//! dispatch is `#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]` —
+//! device-only (see [`conv1x1_accx_dispatch`]); the scalar kernel below is the
+//! complete bit-exact fallback on every other target.
 //!
 //! # Layouts
 //!
@@ -22,38 +23,20 @@
 //! * `bias` — per-output-channel `[Cout]`
 //! * `output` — NHWC `[batch=1, OH, OW, Cout]`
 //!
-//! Scalar fallback handles odd input channels (not a multiple of 16) where the
-//! TIE728 HWC16 layout requires 16-wide SIMD lanes. The SIMD backend pads to
-//! HWC16 (channel dimension rounded up to multiple of 16); the scalar fallback
-//! handles the residual channels or provides the complete kernel when no SIMD.
+//! The scalar kernel is the complete implementation on host/QEMU. On device
+//! the ACCX dispatch (`EE.VMULAS.S8.ACCX`, i32 GPR accumulators — the
+//! bit-exact TFLite requantize epilogue runs in Rust) handles eligible
+//! aligned layers, falling back to this scalar kernel otherwise; output is
+//! bit-exact either way.
+
+//! # ACCX SIMD (device only)
 //!
-//! # ABI (TIE728 SIMD — device only)
-//!
-//! The SIMD path calls the vendored `dl_tie728_s8_conv2d_11cn` /
-//! `dl_tie728_s8_conv2d_11cn_relu` entry points from
-//! `hematite-s3/src/asm/dl_tie728_s8_conv2d.S` via `global_asm!`.
-//!
-//! Register convention:
-//! * a2 = output pointer (i8*)
-//! * a3 = input pointer (i8*)
-//! * a4 = args pointer (packed struct of input/output params)
-//!
-//! Args struct layout (offsets in bytes):
-//! * +48: filter pointer
-//! * +64: mac_shift
-//! * +68: bias pointer
-//! * +76: activation_alpha
-//! * +84: activation_shift
-//! * +96: output_channel_div_8
-//! * +100: c_div_x_1 (input_channel / 16 - 1)
-//! * +104: filter_channel_factor (per-channel scale factor pointer)
-//!
-//! Key instruction sequence (from `tie728_s8_conv2d_11c16`):
-//! 1. `EE.VSMULAS.S8.QACC.LD.INCP` — 16-wide int8 MAC with QACC accumulate
-//!    and auto-load-increment of input/filter pointers
-//! 2. `EE.SRCMB.S8.QACC` — requantize from QACC (i48 accumulator) to int8
-//! 3. `EE.VRELU.S8` — fused ReLU in vector epilogue
-//! 4. `EE.VST.128.IP` — 128-bit aligned store with post-increment
+//! The bespoke `s8_accx_conv1x1.S` kernel (assembled into the crate by
+//! [`crate::accx`] via `global_asm!`) accumulates into i32 GPR accumulators,
+//! so the bit-exact requantize epilogue runs in Rust — no fused-asm
+//! requantize, no arg-struct ABI. See [`conv1x1_accx_dispatch`] for the
+//! eligibility gate (zero offsets, 16-aligned channel counts, runtime 16-byte
+//! pointer alignment, sufficient scratch).
 
 use hematite_core::op_params::Conv2DParams;
 use hematite_core::KernelError;
@@ -63,50 +46,6 @@ use hematite_int8::{multiply_by_quantized_multiplier, saturating_cast};
 #[inline(always)]
 fn shape_product(shape: &[i32; 4]) -> usize {
     shape[0] as usize * shape[1] as usize * shape[2] as usize * shape[3] as usize
-}
-
-/// Shared TIE728 SIMD eligibility gate for the 1×1 conv — host-compilable.
-///
-/// Returns `Some((mac_shift, output_channel_div_8, c_div_x_1, use_relu))` when
-/// the params qualify for the vendored `dl_tie728_s8_conv2d_11cn` entry point,
-/// `None` otherwise. This is the single source of truth reused by both the
-/// legacy `conv2d_1x1` dispatch and the [`PreparedConv1x1`] handle.
-#[inline]
-pub(crate) fn simd_eligible_conv1x1(
-    params: &Conv2DParams<'_>,
-    input_c: i32,
-    out_channels: i32,
-) -> Option<(i32, i32, i32, bool)> {
-    let mult = params.output_multiplier_per_channel;
-    let shift = params.output_shift_per_channel;
-    let mult_uniform = !mult.is_empty() && mult.iter().all(|&m| m == mult[0]) && mult[0] == 1 << 30;
-    let shift_uniform = !shift.is_empty() && shift.iter().all(|&s| s == shift[0]);
-    let full_range = params.quantized_activation_min == i8::MIN as i32
-        && params.quantized_activation_max == i8::MAX as i32;
-    let relu_range = params.quantized_activation_min == 0
-        && params.quantized_activation_max == i8::MAX as i32;
-
-    if params.input_offset == 0
-        && params.output_offset == 0
-        && (full_range || relu_range)
-        && mult_uniform
-        && shift_uniform
-        && shift[0] <= 1
-        && input_c % 16 == 0
-        && input_c >= 16
-        && out_channels % 16 == 0
-    {
-        let use_relu = relu_range && !full_range;
-        // Asm rounding semantics: the TIE728 per-layer path applies
-        // round_result(acc, mac_shift) ≈ (acc + 2^(mac_shift-1)) >> mac_shift.
-        // For mult == 1<<30 the scalar reference computes
-        // (acc*2^30 + 2^30) >> 31 == (acc+1) >> 1, i.e. mac_shift must be
-        // `1 - shift[0]` (NOT shift[0]) to reproduce the reference bit-exact.
-        // shift[0] == 1 (identity) → mac_shift 0 = plain extract = identity.
-        Some((1 - shift[0], out_channels / 16, input_c / 16 - 1, use_relu))
-    } else {
-        None
-    }
 }
 
 /// Transform weights from the caller's `[oc][ic]` (OHWI) layout into the
@@ -150,7 +89,7 @@ pub fn transform_weights_11cn(
 
 /// Context for the ACCX 1×1 conv dispatch — bundled into one `&mut` arg so the
 /// Xtensa LLVM backend generates a 1-arg call (multi-arg calls are miscompiled
-/// on device; see the `dispatch_fc` inline regression and `ReqCtx`).
+/// on device; see the Xtensa multi-arg call miscompile class).
 #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
 pub(crate) struct Conv1x1AccxCtx<'a> {
     pub input: &'a [i8],
@@ -390,7 +329,7 @@ pub fn conv2d_1x1(
         return Err(KernelError::ShapeMismatch);
     }
 
-    // ── TIE728 SIMD dispatch (device-only; compiled out entirely on host) ──
+    // ── ACCX SIMD dispatch (device-only; compiled out entirely on host) ──
     // Eligibility per Plan A4 T5.3: zero offsets, uniform per-channel
     // multiplier/shift collapsing to the hardware's fixed-multiplier fast
     // path, 16-aligned channel counts, batch=1 (checked above), and runtime
@@ -494,222 +433,3 @@ pub fn conv2d_1x1(
 
     Ok(())
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TIE728 SIMD backend — device-only (NEVER compiled on host)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// TIE728 SIMD backend for 1×1 conv2d.
-///
-/// This module is **entirely cfg-gated** behind `#[cfg(target_arch = "xtensa")]`
-/// and is NEVER compiled on the host (stable-aarch64-apple-darwin). It exists
-/// in the tree for structural review and Phase 5 device verification (T5.3).
-///
-/// ## Architecture
-///
-/// The SIMD path:
-/// 1. Pads input channels to multiple of 16 (HWC16 layout — zero-pad if
-///    `input_c % 16 != 0`).
-/// 2. Calls the vendored `dl_tie728_s8_conv2d_11cn` entry point from
-///    `hematite-s3/src/asm/dl_tie728_s8_conv2d.S` via `global_asm!`.
-/// 3. For inputs with odd channels (not a multiple of 16), calls the host-
-///    compiled scalar `conv2d_1x1` above as a fallback.
-///
-/// ## A4 contract notes
-///
-/// * Leg (a): SIMD output must match a per-tensor TFLM golden (Phase 5 fixture
-///   with per-tensor OUTPUT_MULTIPLIER/SHIFT instead of per-channel arrays).
-/// * Leg (c): SIMD vs scalar ref cross-check tolerance ≤1 LSB on requantize.
-///   This captures per-channel vs per-tensor quantization differences at
-///   the bit level. Documented in the test file.
-#[cfg(target_arch = "xtensa")]
-mod conv1x1_simd {
-    // The global_asm! invocations must live inside a module (per Rust safety
-    // rules). On device, the linker resolves dl_tie728_s8_conv2d_11cn from the
-    // vendored .S files.
-    //
-    // TIE728 args struct (packed, repr(C), u32-aligned):
-    // Layout mirrors esp-dl's Conv2D args at dl_tie728_s8_conv2d.S
-    // dl_tie728_s8_conv2d_11cn function.
-
-    /// TIE728 args struct — matches the `void *args` pointer convention in the
-    /// vendored `dl_tie728_s8_conv2d_11cn` entry point.
-    ///
-    /// Field offsets (in bytes) — verified against
-    /// `tie728_s8_conv2d_11cn_load_args` in dl_tie728_s8_conv2d.S:
-    ///
-    /// | Offset | Field | Description |
-    /// |--------|-------|-------------|
-    /// | +48 | filter | int8_t* filter_ptr |
-    /// | +64 | mac_shift | i32 requantize shift (negative → per-channel) |
-    /// | +68 | bias | i32* bias_ptr |
-    /// | +76 | activation_alpha | i32 (LeakyReLU alpha / ReLU flag) |
-    /// | +84 | activation_shift | i32 (negative → no activation) |
-    /// | +96 | output_channel_div_8 | i32 |
-    /// | +100 | c_div_x_1 | i32 = input_channel / 16 - 1 |
-    /// | +104 | filter_channel_factor | i16* per-channel scale factor ptr |
-    #[repr(C)]
-    #[allow(dead_code)]
-    pub struct Tie728ConvArgs {
-        // Layout verified against the vendored .S — fields are referenced by
-        // byte offset (l32i a5, a4, 48 etc.), not by struct access.
-        _pad0: [u8; 48],               // offset 0-47: unused by the .S
-        filter: *const i8,              // offset 48
-        _pad1: [u8; 12],               // offset 52-63
-        mac_shift: i32,                // offset 64
-        bias: *const i32,              // offset 68
-        _pad2: [u8; 4],                // offset 72-75
-        activation_alpha: i32,          // offset 76
-        _pad3: [u8; 4],                // offset 80-83
-        activation_shift: i32,          // offset 84
-        _pad4: [u8; 8],                // offset 88-95
-        output_channel_div_8: i32,      // offset 96
-        c_div_x_1: i32,                // offset 100
-        filter_channel_factor: *const i16, // offset 104
-    }
-
-    // Include the vendored TIE728 shared macros and conv2d entry points.
-    //
-    // These two files define:
-    // * `dl_tie728_s8.S` — shared macros (requantize, bias preload, ReLU/PRelu epilogues)
-    // * `dl_tie728_s8_conv2d.S` — entry points: `dl_tie728_s8_conv2d_11cn`,
-    //   `dl_tie728_s8_conv2d_11cn_relu`, `dl_tie728_s8_conv2d_11cn_prelu`,
-    //   and unaligned variants.
-    core::arch::global_asm!(
-        include_str!("../src/asm/dl_tie728_s8.S"),
-        include_str!("../src/asm/dl_tie728_s8_conv2d.S"),
-    );
-
-    // ── SIMD kernel glue ────────────────────────────────────────────────
-
-    /// SIMD 1×1 conv2d — calls the vendored TIE728 entry point.
-    ///
-    /// # Safety
-    ///
-    /// This function is inherently unsafe: it calls into foreign
-    /// assembly via the C ABI (a2=output, a3=input, a4=args).
-    ///
-    /// # Preconditions (caller MUST guarantee)
-    ///
-    /// * Input channels must be a multiple of 16 (HWC16 layout).
-    ///   The scalar fallback handles odd channels.
-    /// * All pointers must be 16-byte aligned for EE.VLD.128.IP / EE.VST.128.IP.
-    /// * `input`, `weights`, `bias`, and `output` must be valid for the
-    ///   declared shapes.
-    /// * The `Tie728ConvArgs` struct must be correctly populated per the
-    ///   vendored .S ABI.
-    #[allow(dead_code)]
-    pub unsafe fn conv2d_1x1_simd_aligned(
-        output: *mut i8,
-        input: *const i8,
-        args: &Tie728ConvArgs,
-    ) {
-        // Procedure call standard (Xtensa XCC):
-        // a2 = output (first arg)
-        // a3 = input (second arg)
-        // a4 = args (third arg — pointer to Tie728ConvArgs)
-        //
-        // The vendored .S entry points use the `entry sp, 128` convention
-        // which saves the caller's registers in a 128-byte window.
-        //
-        // The call site below is hand-written inline asm that loads the
-        // three pointer arguments into a2/a3/a4 and branches to the
-        // appropriate entry point.
-
-        core::arch::asm!(
-            // Load arguments into the ABI registers.
-            //
-            // `dl_tie728_s8_conv2d_11cn` uses `entry sp, 128`, so it is called
-            // with the windowed `call8` convention: the callee's a2/a3/a4 are
-            // the caller's a10/a11/a12 (the window rotates by 8). Placing the
-            // args in a2/a3/a4 would deliver garbage pointers to the callee.
-            "mov a10, {output}",
-            "mov a11, {input}",
-            "mov a12, {args}",
-
-            // Branch to dl_tie728_s8_conv2d_11cn (aligned, no fused activation)
-            "call8 dl_tie728_s8_conv2d_11cn",
-
-            output = in(reg) output,
-            input  = in(reg) input,
-            args   = in(reg) args,
-            // Clobber all caller-saved registers
-            clobber_abi("C"),
-        );
-    }
-
-    /// SIMD 1×1 conv2d with fused ReLU — calls the vendored TIE728 entry point.
-    ///
-    /// # Safety
-    ///
-    /// Same safety contract as `conv2d_1x1_simd_aligned`. Additionally,
-    /// `args.activation_alpha` and `args.activation_shift` must be set for
-    /// ReLU (alpha=0 means standard ReLU; non-zero means LeakyReLU).
-    #[allow(dead_code)]
-    pub unsafe fn conv2d_1x1_simd_relu(
-        output: *mut i8,
-        input: *const i8,
-        args: &Tie728ConvArgs,
-    ) {
-        core::arch::asm!(
-            "mov a10, {output}",
-            "mov a11, {input}",
-            "mov a12, {args}",
-            "call8 dl_tie728_s8_conv2d_11cn_relu",
-            output = in(reg) output,
-            input  = in(reg) input,
-            args   = in(reg) args,
-            clobber_abi("C"),
-        );
-    }
-
-    /// Build a [`Tie728ConvArgs`] and dispatch — called from the public
-    /// scalar `conv2d_1x1` eligibility check in the parent module.
-    ///
-    /// `Tie728ConvArgs`'s fields are private to this module, so the
-    /// eligibility-gated caller in `conv2d_1x1` cannot construct the struct
-    /// itself; this wrapper does it with plain scalar arguments.
-    ///
-    /// # Safety
-    ///
-    /// Same safety contract as `conv2d_1x1_simd_aligned` / `_relu`.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) unsafe fn dispatch_1x1(
-        output: *mut i8,
-        input: *const i8,
-        filter: *const i8,
-        bias: *const i32,
-        mac_shift: i32,
-        output_channel_div_8: i32,
-        c_div_x_1: i32,
-        use_relu: bool,
-    ) {
-        // Build the args struct writing ONLY the 8 fields the asm reads
-        // (+48/+64/+68/+76/+84/+96/+100/+104), leaving all padding
-        // uninitialized. A struct literal would emit a memset + dead pad
-        // stores per call (~50+ cycles of pure overhead on the hot path).
-        let mut args = core::mem::MaybeUninit::<Tie728ConvArgs>::uninit();
-        let p = args.as_mut_ptr();
-        p.cast::<u8>().add(48).cast::<*const i8>().write(filter);
-        p.cast::<u8>().add(64).cast::<i32>().write(mac_shift);
-        p.cast::<u8>().add(68).cast::<*const i32>().write(bias);
-        p.cast::<u8>().add(76).cast::<i32>().write(0);
-        p.cast::<u8>().add(84).cast::<i32>().write(if use_relu { 0 } else { -1 });
-        p.cast::<u8>().add(96).cast::<i32>().write(output_channel_div_8);
-        p.cast::<u8>().add(100).cast::<i32>().write(c_div_x_1);
-        p.cast::<u8>().add(104).cast::<*const i16>().write(core::ptr::null());
-        let args = args.assume_init_ref();
-        if use_relu {
-            conv2d_1x1_simd_relu(output, input, args);
-        } else {
-            conv2d_1x1_simd_aligned(output, input, args);
-        }
-    }
-}
-
-// Re-export the SIMD entry points at the crate level so the device
-// integration layer can call them without navigating the module tree.
-#[cfg(target_arch = "xtensa")]
-pub use conv1x1_simd::conv2d_1x1_simd_aligned;
-#[cfg(target_arch = "xtensa")]
-pub use conv1x1_simd::conv2d_1x1_simd_relu;

@@ -200,8 +200,7 @@ pub fn depthwise_conv2d(
 
 /// Context for the bespoke QACC depthwise dispatch — bundled into one `&mut`
 /// arg so the Xtensa LLVM backend generates a 1-arg call (multi-arg calls are
-/// miscompiled on device; see the `dispatch_fc` inline regression and
-/// `ReqCtx`).
+/// miscompiled on device; see the Xtensa multi-arg call miscompile class).
 #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
 pub(crate) struct DepthwiseAccxCtx<'a> {
     pub input: &'a [i8],

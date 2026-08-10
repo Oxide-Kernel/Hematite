@@ -739,8 +739,8 @@ mod pool_simd {
         c_div_x_1: i32,
     ) {
         // NOTE: an 8-arg call like this is the Xtensa-LLVM multi-arg-call
-        // miscompile class (args spill to stack and get scrambled, cf.
-        // `dispatch_fc` inline and the `accx` ctx refactors). Callers must
+        // miscompile class (args spill to stack and get scrambled, cf. the
+        // `accx` ctx refactors). Callers must
         // route through `avg_pool_2d_simd_ctx` (single `&mut` arg) instead.
         let mut area_inv = [0i8; 16];
         area_inv.copy_from_slice(avg_pool_area_inv);

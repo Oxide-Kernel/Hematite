@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Hematite Contributors.
 //
-//! Fully-connected / GEMM kernel — scalar fallback + TIE728 SIMD backend.
+//! Fully-connected / GEMM kernel — scalar fallback + ACCX SIMD backend.
 //!
 //! # Bit-exact contract (Plan A4)
 //!
@@ -11,8 +11,10 @@
 //! | (b) | Scalar ref ≡ per-channel TFLM golden bit-exact | **Host** (this test) |
 //! | (c) | SIMD vs ref cross-check ≤1 LSB on requantize | Device (Phase 5) |
 //!
-//! On host (stable-aarch64-apple-darwin), only leg (b) executes. The SIMD path
-//! (`#[cfg(target_arch = "xtensa")]`) is NEVER compiled on host.
+//! On host (stable-aarch64-apple-darwin), only leg (b) executes. The SIMD
+//! dispatch is `#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]` —
+//! device-only (see [`fc_accx_dispatch`]); the scalar kernel below is the
+//! complete bit-exact fallback on every other target.
 //!
 //! # Layouts
 //!
@@ -26,62 +28,19 @@
 //!
 //! # SIMD backend
 //!
-//! The GEMM core is the same as the 1×1 conv (11cN) — each output is a dot
-//! product of the input vector with one row of the weight matrix. On device,
-//! the `dl_tie728_s8_conv2d_11cn` entry point is reused with the spatial
-//! dimensions collapsed to 1×1.
+//! On device, the bespoke `s8_accx_conv1x1` kernel (assembled into the crate
+//! by [`crate::accx`]) computes the exact 32-bit dot product per output unit
+//! into scratch, then the bit-exact TFLite requantize epilogue runs in Rust —
+//! an FC layer is mathematically a 1×1 conv with H=W=1. See
+//! [`fc_accx_dispatch`] for the eligibility gate.
 
 use hematite_core::op_params::FullyConnectedParams;
 use hematite_core::KernelError;
 use hematite_int8::{multiply_by_quantized_multiplier, saturating_cast};
 
-/// Shared TIE728 SIMD eligibility gate for the FC/GEMM kernel — host-compilable.
-///
-/// Returns `Some((mac_shift, output_channel_div_8, c_div_x_1, use_relu))` when
-/// the params qualify for the reused `dl_tie728_s8_conv2d_11cn` entry point,
-/// `None` otherwise. Single source of truth for both the legacy `fully_connected`
-/// dispatch and the [`PreparedFc`] handle.
-#[inline]
-pub(crate) fn simd_eligible_fc(
-    params: &FullyConnectedParams<'_>,
-    input_dim: i32,
-    output_dim: i32,
-) -> Option<(i32, i32, i32, bool)> {
-    let mult = params.output_multiplier_per_channel;
-    let shift = params.output_shift_per_channel;
-    let mult_uniform = !mult.is_empty()
-        && mult.iter().all(|&m| m == mult[0])
-        && mult[0] == 1 << 30;
-    let shift_uniform = !shift.is_empty() && shift.iter().all(|&s| s == shift[0]);
-    let full_range = params.quantized_activation_min == i8::MIN as i32
-        && params.quantized_activation_max == i8::MAX as i32;
-    let relu_range = params.quantized_activation_min == 0
-        && params.quantized_activation_max == i8::MAX as i32;
-
-    if params.input_offset == 0
-        && params.output_offset == 0
-        && (full_range || relu_range)
-        && mult_uniform
-        && shift_uniform
-        && shift[0] <= 1
-        && input_dim % 16 == 0
-        && input_dim >= 16
-        && output_dim % 16 == 0
-    {
-        let use_relu = relu_range && !full_range;
-        // See conv1x1::simd_eligible_conv1x1 for the mac_shift semantics:
-        // the asm round_result(acc, mac_shift) reproduces the scalar
-        // multiply_by_quantized_multiplier for mult==1<<30 only when
-        // mac_shift == 1 - shift[0].
-        Some((1 - shift[0], output_dim / 16, input_dim / 16 - 1, use_relu))
-    } else {
-        None
-    }
-}
-
 /// Context for the ACCX FC/GEMM dispatch — bundled into one `&mut` arg so the
 /// Xtensa LLVM backend generates a 1-arg call (multi-arg calls are miscompiled
-/// on device; see the `dispatch_fc` inline regression and `ReqCtx`).
+/// on device; see the ACCX ctx refactors in `crate::accx`).
 #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
 pub(crate) struct FcAccxCtx<'a> {
     pub input: &'a [i8],
@@ -262,7 +221,7 @@ pub fn fully_connected(
     let multipliers = params.output_multiplier_per_channel;
     let shifts = params.output_shift_per_channel;
 
-    // ── TIE728 SIMD dispatch (device-only; compiled out entirely on host) ──
+    // ── ACCX SIMD dispatch (device-only; compiled out entirely on host) ──
     // Bespoke ACCX kernel: exact 32-bit dot product per output unit, then a
     // bit-exact TFLite requantize in Rust. Bit-exact vs the scalar path.
     //
@@ -318,144 +277,4 @@ pub fn fully_connected(
     let _ = scratch; // unused by scalar path
 
     Ok(())
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TIE728 SIMD backend — device-only (NEVER compiled on host)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// TIE728 SIMD backend for fully-connected (GEMM).
-///
-/// The GEMM core reuses the 1×1 conv entry point (`dl_tie728_s8_conv2d_11cn`)
-/// since a fully-connected layer is mathematically equivalent to a 1×1 conv
-/// with spatial dimensions H=W=1.
-///
-/// This module is cfg-gated behind `#[cfg(target_arch = "xtensa")]`.
-/// ABI unverified — validate at T5.3 on device.
-#[cfg(target_arch = "xtensa")]
-mod gemm_simd {
-    /// TIE728 FC/GEMM args struct.
-    ///
-    /// Reuses the same args layout as the 1×1 conv2d entry point.
-    /// See `conv1x1.rs` for the canonical Tie728ConvArgs struct and
-    /// the known ABI issues at +76 vs +80 (activation_alpha vs
-    /// activation_alpha_ptr).
-    ///
-    /// ABI unverified — validate at T5.3 on device.
-    #[repr(C)]
-    #[allow(dead_code)]
-    struct Tie728GemmArgs {
-        _pad0: [u8; 48],
-        filter: *const i8,             // +48
-        _pad1: [u8; 12],               // +52..+63
-        mac_shift: i32,                // +64
-        bias: *const i32,              // +68
-        _pad2: [u8; 4],                // +72..+75
-        activation_alpha: i32,         // +76: relu path reads
-        activation_alpha_ptr: *const u8,  // +80: prelu path reads
-        activation_shift: i32,         // +84
-        _pad3: [u8; 8],                // +88..+95
-        output_channel_div_8: i32,     // +96
-        c_div_x_1: i32,               // +100
-        filter_channel_factor: *const i16, // +104
-    }
-
-    // Include the vendored TIE728 shared macros and conv2d entry points.
-    core::arch::global_asm!(
-        include_str!("../src/asm/dl_tie728_s8.S"),
-        include_str!("../src/asm/dl_tie728_s8_conv2d.S"),
-    );
-
-    /// SIMD fully-connected — calls the vendored TIE728 1×1 conv entry point.
-    ///
-    /// An FC layer with input_dim and output_dim is equivalent to a 1×1 conv
-    /// with H=W=1, Cin=input_dim, Cout=output_dim.
-    ///
-    /// # Safety
-    ///
-    /// Calls into foreign assembly via the C ABI. ABI unverified.
-    #[allow(dead_code)]
-    unsafe fn fc_simd_aligned(
-        output: *mut i8,
-        input: *const i8,
-        args: &Tie728GemmArgs,
-    ) {
-        core::arch::asm!(
-            "mov a10, {output}",
-            "mov a11, {input}",
-            "mov a12, {args}",
-            "call8 dl_tie728_s8_conv2d_11cn",
-            output = in(reg) output,
-            input  = in(reg) input,
-            args   = in(reg) args,
-            clobber_abi("C"),
-        );
-    }
-
-    /// SIMD fully-connected with fused ReLU.
-    ///
-    /// # Safety
-    ///
-    /// Same contract as `fc_simd_aligned`.
-    #[allow(dead_code)]
-    unsafe fn fc_simd_relu(
-        output: *mut i8,
-        input: *const i8,
-        args: &Tie728GemmArgs,
-    ) {
-        core::arch::asm!(
-            "mov a10, {output}",
-            "mov a11, {input}",
-            "mov a12, {args}",
-            "call8 dl_tie728_s8_conv2d_11cn_relu",
-            output = in(reg) output,
-            input  = in(reg) input,
-            args   = in(reg) args,
-            clobber_abi("C"),
-        );
-    }
-
-    /// Build a [`Tie728GemmArgs`] and dispatch — called from the public
-    /// scalar `fully_connected` eligibility check in the parent module.
-    ///
-    /// `gemm_simd` is private, so the eligibility-gated caller in
-    /// `fully_connected` cannot reach the entry points directly; this
-    /// wrapper takes plain scalar arguments and builds the struct
-    /// internally.
-    ///
-    /// # Safety
-    ///
-    /// Same safety contract as `fc_simd_aligned` / `fc_simd_relu`.
-    #[allow(clippy::too_many_arguments)]
-    #[inline(never)]
-    pub(super) unsafe fn dispatch_fc(
-        output: *mut i8,
-        input: *const i8,
-        filter: *const i8,
-        bias: *const i32,
-        mac_shift: i32,
-        output_channel_div_8: i32,
-        c_div_x_1: i32,
-        use_relu: bool,
-    ) {
-        // MaybeUninit args build — write ONLY the asm-read fields
-        // (+48/+64/+68/+76/+84/+96/+100/+104), no memset/dead pad stores.
-        let mut args = core::mem::MaybeUninit::<Tie728GemmArgs>::uninit();
-        let p = args.as_mut_ptr();
-        p.cast::<u8>().add(48).cast::<*const i8>().write(filter);
-        p.cast::<u8>().add(64).cast::<i32>().write(mac_shift);
-        p.cast::<u8>().add(68).cast::<*const i32>().write(bias);
-        p.cast::<u8>().add(76).cast::<i32>().write(0);
-        p.cast::<u8>().add(80).cast::<*const u8>().write(core::ptr::null());
-        p.cast::<u8>().add(84).cast::<i32>().write(if use_relu { 0 } else { -1 });
-        p.cast::<u8>().add(96).cast::<i32>().write(output_channel_div_8);
-        p.cast::<u8>().add(100).cast::<i32>().write(c_div_x_1);
-        p.cast::<u8>().add(104).cast::<*const i16>().write(core::ptr::null());
-        let args = args.assume_init_ref();
-        if use_relu {
-            fc_simd_relu(output, input, args);
-        } else {
-            fc_simd_aligned(output, input, args);
-        }
-    }
 }
