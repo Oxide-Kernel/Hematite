@@ -248,6 +248,48 @@ lacks are `—` with the reason, and the exact rows to add are specified in
 - C-side `—` rows are runnable but not yet added; the exact rows to add
   (shapes, args, expected checksums) are in `benchmarks/espdl-baseline/README.md`.
 
+## Zoo-model head-to-head (plan simd-zoo-hardening todo 20)
+
+The A/B/C table above compares three **synthetic** models. This section is
+the real-zoo-model head-to-head: the 6 int8 zoo models timed on the Hematite
+stack (`model_bench`, todo 19, device run — evidence
+`local-notes/evidence/simd-zoo-hardening/task-19-model-bench.log`) vs the standard
+ESP-NN C stack measured under the same conditions.
+
+**Same-conditions rule (plan Metis F8):** identical tflite model file,
+identical input bytes (the deterministic ramp `fill_input_pattern`,
+`input[i]=(i*7+3)&0xFF`, used by both `model_bench` and the C harness),
+identical memory tier (SRAM), identical CPU frequency (240 MHz, boot-asserted)
+and cache config on both stacks. Any row that cannot satisfy this is rendered
+`—` with the reason — never compared with a fabricated number.
+
+**C-side status (enumerated 2026-08-10):** only the synthetic Model C /
+mv2real has a confirmed ESP-NN C baseline (the A/B/C table above, 655,303
+cyc). None of the 6 zoo models has an esp-nn runner in
+`benchmarks/espnn-baseline/main/main.c` (the A/B/C runners are hand-wired
+kernels with generated fill-pattern weights, not tflite-backed models) —
+building those runners + a tflite weight-extraction path is a **separate
+scope decision** (Metis F8), not invented here. The current host has **no
+ESP-IDF toolchain** (`idf.py` absent, `$IDF_PATH` empty), so the C side
+cannot be measured here; the exact rows to add when the toolchain returns are
+specified in `benchmarks/espnn-baseline/README.md` (same pattern as todo 15's
+per-op table).
+
+| Zoo model | Hematite cycles (min/med) | Hematite ms @ 240 MHz | ESP-NN cycles (min/med) | Speedup | Notes |
+|---|---|---|---|---|---|
+| KWS `kws_micro_speech_int8` (1×1960→4) | 13,091,330 / 13,091,344 | 54 / 54 | — | — | C side `—`: no esp-nn runner yet (needs new harness code; feasible when toolchain returns — 18.8 KB model). Hematite 54 ms vs the 7 ms ESP-DL bar: FAIL — feeds todo 21. out_fnv `0x2131fda5` |
+| sine (1→1 smoke) | 536 / 536 | 0 / 0 | — | — | C side `—`: no runner yet (needs new harness code). out_fnv `0x040c5b8c` |
+| hello_world `hello_world_int8` (1→1) | 11,329 / 11,329 | 0 / 0 | — | — | C side `—`: no runner yet (needs new harness code). out_fnv `0xfaf3a2e1` |
+| anomaly_detect `anomaly_detect_int8` (640→640) | 19,669,640 / 19,669,640 | 81 / 81 | — | — | C side `—`: no runner yet; 277 KB model embed is above the ~200 KB app-write ceiling this USB adapter sustained (T16 finding) — verify flash path before trusting a C row. out_fnv `0xe8f86342` |
+| person_detect `person_detect_int8` (96×96×3→2) | SKIP | — | — | — | SKIP on both stacks: Hematite `reason=stack` (generated `predict` allocas ~232 KB vs ~65 KB device stack); C side `—` (no runner; 333 KB weights + tensors exceed SRAM/DRAM budget, no PSRAM to spill into) |
+| mobilenet_v2 `mobilenet_v2_1.0_224_int8` (3×224×224→1000) | SKIP | — | — | — | SKIP on both stacks: `reason=no-psram` (board probe: `PSRAM: 0 bytes`); 3.98 MB model cannot be embedded or held in the 416 KB DRAM |
+
+Reading the table: **every zoo row's C cell is honestly `—`** — the ESP-NN
+C baseline for these models does not exist yet (separate scope decision) and
+the toolchain to build it is absent on this host. Hematite's measured numbers
+stand; the C columns become real numbers when the harness rows in
+`benchmarks/espnn-baseline/README.md` are built and run on this board.
+
 ## Where to look
 
 - ESP-NN model harness: `benchmarks/espnn-baseline/` (`main.c`, vendored
