@@ -120,17 +120,17 @@ static const char *TAG = "espnn-baseline";
 #define MULT_Q30 (1 << 30)
 
 /* ---------------- model A buffers (16-aligned) ---------------- */
-static int8_t __attribute__((aligned(16))) s_in[L1_IN_H * L1_IN_W * L1_IN_C];       /* 16384 */
-static int8_t __attribute__((aligned(16))) s_l1out[L1_OUT_H * L1_OUT_W * L1_OUT_C]; /* 14400 */
-static int8_t __attribute__((aligned(16))) s_l2out[L2_OUT_H * L2_OUT_W * L2_OUT_C]; /* 3600 */
-static int8_t __attribute__((aligned(16))) s_l3out[L3_OUT_H * L3_OUT_W * L3_OUT_C]; /* 7200 */
-static int8_t __attribute__((aligned(16))) s_out[L4_OUT_C];                          /* 16 */
+int8_t __attribute__((aligned(16))) s_in[L1_IN_H * L1_IN_W * L1_IN_C];       /* 16384 */
+int8_t __attribute__((aligned(16))) s_l1out[L1_OUT_H * L1_OUT_W * L1_OUT_C]; /* 14400 */
+int8_t __attribute__((aligned(16))) s_l2out[L2_OUT_H * L2_OUT_W * L2_OUT_C]; /* 3600 */
+int8_t __attribute__((aligned(16))) s_l3out[L3_OUT_H * L3_OUT_W * L3_OUT_C]; /* 7200 */
+int8_t __attribute__((aligned(16))) s_out[L4_OUT_C];                          /* 16 */
 
 static int8_t __attribute__((aligned(16))) s_l1w[L1_OUT_C * 3 * 3 * L1_IN_C]; /* 2304 */
 static int32_t __attribute__((aligned(16))) s_l1b[L1_OUT_C];
 static int8_t __attribute__((aligned(16))) s_l3w[L3_OUT_C * L3_IN_C]; /* 512 */
 static int32_t __attribute__((aligned(16))) s_l3b[L3_OUT_C];
-static int8_t __attribute__((aligned(16))) s_l4w[L4_IN_DIM * L4_OUT_C]; /* 115200 */
+int8_t __attribute__((aligned(16))) s_l4w[L4_IN_DIM * L4_OUT_C]; /* 115200 — also RAM home for zoo padded FC weights (zoo_runners.c) */
 static int32_t __attribute__((aligned(16))) s_l4b[L4_OUT_C];
 
 static int32_t __attribute__((aligned(16))) s_shift[128];
@@ -964,6 +964,8 @@ static void dump_layer_checksums_mv2real(const char *tag)
            (unsigned)fnv1a(c_out, C6_OUT_C));
 }
 
+extern void run_zoo_models(void);
+
 void app_main(void)
 {
     int scratch_size;
@@ -988,6 +990,7 @@ void app_main(void)
     }
     esp_nn_set_conv_scratch_buf(s_scratch);
     esp_nn_set_depthwise_conv_scratch_buf(s_scratch);
+    esp_nn_set_softmax_scratch_buf(s_scratch);
 
     /* ============ MODEL A (4-layer) ============ */
     printf("MODEL A: conv3x3 32x32x16->30x30x16 | maxpool 2x2 | conv1x1 16->32 | fc 7200->16\n");
@@ -1038,6 +1041,8 @@ void app_main(void)
                (unsigned)espnn_c_chk, (unsigned)scalar_c_chk,
                espnn_c_chk == scalar_c_chk ? "MATCH" : "DIFFER");
     }
+
+    run_zoo_models();
 
     printf("=== benchmark complete - ESP-NN halt ===\n");
 

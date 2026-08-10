@@ -290,6 +290,36 @@ the toolchain to build it is absent on this host. Hematite's measured numbers
 stand; the C columns become real numbers when the harness rows in
 `benchmarks/espnn-baseline/README.md` are built and run on this board.
 
+## Zoo-model head-to-head — ESP-NN baselines measured (composed-kernels T0.3)
+
+The rows above were the pre-runner status (all ESP-NN cells `—`). This
+section is the measured head-to-head for the 4 runnable zoo models: the same
+tflite models timed on **both** stacks under the same-conditions rule, using
+the restored `benchmarks/espnn-baseline` zoo runners (`zoo_runners.c`,
+`tools/extract_espnn.py` → `zoo_models/*_model.h`).
+
+**Provenance:** all 4 ESP-NN rows below are **user-verified real-device
+measurements** taken 2026-08-10 on the physical ESP32-S3 (rev v0.2 @ 240 MHz,
+`CONFIG_NN_OPTIMIZED`, standard `espressif/esp-nn` v1.2.5 asm kernels), 1
+warm-up + 10 timed runs, CCOUNT min (median in the `(…)` notes). Hematite
+rows are the pre-optimization `model_bench` numbers from the same period.
+person_detect / mobilenet_v2 are un-runnable on this board for **both**
+stacks (stack budget / no PSRAM) — SKIP on both sides, never fabricated.
+
+| Model | Hematite (now) | ESP-NN | Winner |
+|---|---|---|---|
+| sine (FC 1→1) | 618 cyc | 190 cyc | ESP-NN 3.3x; bit-exact all three stacks (0x040c5b8c) |
+| hello_world (3xFC) | 10,314 cyc | 4,675 cyc | ESP-NN 2.2x |
+| kws (dw dm=8 + FC + softmax) | 12,983,503 cyc / 54 ms | 1,059,889 cyc / 4 ms | ESP-NN 12.3x |
+| anomaly (10xFC) | 28,550,253 cyc / 118 ms | 7,758,145 cyc / 32 ms | ESP-NN 3.7x |
+| person_detect | SKIP (stack) | SKIP | — |
+| mobilenet_v2 | SKIP (no-PSRAM) | SKIP | — |
+
+**These rows set the optimization targets** (composed-kernels plan):
+T3.5 depthwise `dm>1` for kws; T3.6 small-shape FC for sine/hello/anomaly.
+The Hematite "now" column is the pre-optimization baseline; re-run
+measurements wherever the ESP-IDF toolchain is present, never guess numbers.
+
 ## Where to look
 
 - ESP-NN model harness: `benchmarks/espnn-baseline/` (`main.c`, vendored
