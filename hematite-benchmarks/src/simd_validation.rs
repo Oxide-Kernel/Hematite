@@ -239,6 +239,8 @@ const fn bias_pattern<const N: usize>() -> [i32; N] {
 
 const MULT_16: [i32; 16] = [1 << 30; 16];
 const SHIFT_16: [i32; 16] = [0; 16];
+const MULT_8: [i32; 8] = [1 << 30; 8];
+const SHIFT_8: [i32; 8] = [0; 8];
 const MULT_32: [i32; 32] = [1 << 30; 32];
 const SHIFT_32: [i32; 32] = [0; 32];
 const MULT_64: [i32; 64] = [1 << 30; 64];
@@ -561,6 +563,72 @@ fn check_depthwise_dm8_simd_matches_ref() {
     report(&compare("depthwise_12x12x8_dm8", got, want));
 }
 
+// ── Depthwise kws real 10×8 (T3.5b): 49x40x1 -> 25x20x8, stride 2 SAME ─────
+
+const DEPTHWISE_KWS_IN: usize = 49 * 40 * 1;
+const DEPTHWISE_KWS_W: usize = 1 * 10 * 8 * 8;
+const DEPTHWISE_KWS_OUT: usize = 25 * 20 * 8;
+
+fn check_depthwise_kws10x8_simd_matches_ref() {
+    // Buffers carved from the SRAM bench arena — NOT stack locals (see
+    // `arena_carve` for the task-18 OOB device finding).
+    let mut off = 0;
+    // 1960 is not a multiple of 16 — carve 1968 and slice so the arena base
+    // stays 16-aligned for the subsequent carves.
+    let input = &mut arena_carve_i8(&mut off, (DEPTHWISE_KWS_IN + 15) & !15)[..DEPTHWISE_KWS_IN];
+    let weights = arena_carve_i8(&mut off, DEPTHWISE_KWS_W);
+    let want = arena_carve_i8(&mut off, DEPTHWISE_KWS_OUT);
+    let got = arena_carve_i8(&mut off, DEPTHWISE_KWS_OUT);
+    // dm=8 staged path: padded 58x46x16 input (42,688 B) + staged filter
+    // 80x16 (1,280 B) + accs 16x4 + anytap partials 16x4 → 44,096 B.
+    let scratch = arena_carve(&mut off, 65536);
+    fill_pattern_slice(0x4B57_51E5, input);
+    fill_pattern_slice(0x0F8A_5B00, weights);
+    let bias = bias_pattern::<8>();
+    want.fill(0);
+    got.fill(0);
+    scratch.fill(0);
+    let params = DepthwiseConv2DParams {
+        input_shape: [1, 49, 40, 1],
+        filter_shape: [1, 10, 8, 8],
+        output_shape: [1, 25, 20, 8],
+        padding: Padding::Same,
+        stride_width: 2,
+        stride_height: 2,
+        dilation_width_factor: 1,
+        dilation_height_factor: 1,
+        depth_multiplier: 8,
+        input_offset: 128,
+        weights_offset: 0,
+        output_offset: -128,
+        output_multiplier_per_channel: &MULT_8,
+        output_shift_per_channel: &SHIFT_8,
+        quantized_activation_min: 0,
+        quantized_activation_max: 127,
+    };
+
+    hematite_ref::depthwise_conv::depthwise_conv2d(
+        input,
+        weights,
+        &bias,
+        &params,
+        want,
+        scratch,
+    )
+    .expect("harness: ref kws depthwise shape");
+    hematite_s3::depthwise::depthwise_conv2d(
+        input,
+        weights,
+        &bias,
+        &params,
+        got,
+        scratch,
+    )
+    .expect("harness: s3 kws depthwise shape");
+
+    report(&compare("depthwise_kws_49x40x1_10x8_dm8", got, want));
+}
+
 // ── Conv 1x1: 64x1x1x64 (spec.rs EMBER_CONV_1X1_64_PARAMS) ─────────────────
 
 const CONV1X1_IN: usize = 1 * 1 * 64;
@@ -877,6 +945,7 @@ pub fn validate_all() {
     check_softmax_simd_matches_ref();
     check_depthwise_simd_matches_ref();
     check_depthwise_dm8_simd_matches_ref();
+    check_depthwise_kws10x8_simd_matches_ref();
     check_conv1x1_simd_matches_ref();
     check_conv3x3_simd_matches_ref();
     check_fc_simd_matches_ref();

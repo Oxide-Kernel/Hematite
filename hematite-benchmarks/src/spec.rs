@@ -45,6 +45,8 @@ const fn shifts<const N: usize>() -> [i32; N] {
 
 const MULT_3: [i32; 3] = mults::<3>();
 const SHIFT_3: [i32; 3] = shifts::<3>();
+const MULT_8: [i32; 8] = mults::<8>();
+const SHIFT_8: [i32; 8] = shifts::<8>();
 const MULT_12: [i32; 12] = mults::<12>();
 const SHIFT_12: [i32; 12] = shifts::<12>();
 const MULT_16: [i32; 16] = mults::<16>();
@@ -508,6 +510,132 @@ const SIMD_DEPTHWISE_DM8_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseConv2
     quantized_activation_max: 127,
 };
 
+/// T3.5b — the REAL kws depthwise layer (tflite-verified): input
+/// [1,49,40,1], filter [1,10,8,8] (80 taps), output [1,25,20,8] (Relu),
+/// stride 2 SAME, depth_multiplier 8, input_offset +128 (the depthwise input
+/// is the first conv's output with zero point -128 — the Phase-C fold uses
+/// fill -128 which fits in i8). The tap-parameterized anytap SIMD kernel
+/// dispatches this shape in 3 chunked QACC passes (32+32+16 taps; the QACC
+/// 20-bit-lane-safe bound).
+const SIMD_DEPTHWISE_KWS_10X8_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseConv2DParams {
+    input_shape: [1, 49, 40, 1],
+    filter_shape: [1, 10, 8, 8],
+    output_shape: [1, 25, 20, 8],
+    padding: Padding::Same,
+    stride_width: 2,
+    stride_height: 2,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    depth_multiplier: 8,
+    input_offset: 128,
+    weights_offset: 0,
+    output_offset: -128,
+    output_multiplier_per_channel: &MULT_8,
+    output_shift_per_channel: &SHIFT_8,
+    quantized_activation_min: 0,
+    quantized_activation_max: 127,
+};
+
+/// T3.5b — arbitrary 5×5 filter, dm=1 (in_c 8 → out_c 8), stride 1 SAME.
+const SIMD_DEPTHWISE_5X5_DM1_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseConv2DParams {
+    input_shape: [1, 12, 12, 8],
+    filter_shape: [1, 5, 5, 8],
+    output_shape: [1, 12, 12, 8],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    depth_multiplier: 1,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_8,
+    output_shift_per_channel: &SHIFT_8,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// T3.5b — arbitrary 5×5 filter, dm=8 (in_c 1 → out_c 8), stride 1 SAME.
+const SIMD_DEPTHWISE_5X5_DM8_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseConv2DParams {
+    input_shape: [1, 12, 12, 1],
+    filter_shape: [1, 5, 5, 8],
+    output_shape: [1, 12, 12, 8],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    depth_multiplier: 8,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_8,
+    output_shift_per_channel: &SHIFT_8,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// T3.5b — arbitrary 7×7 filter, dm=1 (in_c 8 → out_c 8), stride 2 SAME.
+const SIMD_DEPTHWISE_7X7_DM1_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseConv2DParams {
+    input_shape: [1, 14, 14, 8],
+    filter_shape: [1, 7, 7, 8],
+    output_shape: [1, 7, 7, 8],
+    padding: Padding::Same,
+    stride_width: 2,
+    stride_height: 2,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    depth_multiplier: 1,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_8,
+    output_shift_per_channel: &SHIFT_8,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// T3.5b — arbitrary 7×7 filter, dm=8 (in_c 1 → out_c 8), stride 2 SAME.
+const SIMD_DEPTHWISE_7X7_DM8_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseConv2DParams {
+    input_shape: [1, 14, 14, 1],
+    filter_shape: [1, 7, 7, 8],
+    output_shape: [1, 7, 7, 8],
+    padding: Padding::Same,
+    stride_width: 2,
+    stride_height: 2,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    depth_multiplier: 8,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_8,
+    output_shift_per_channel: &SHIFT_8,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// T3.5b — non-square 3×5 filter, dm=2 (in_c 8 → out_c 16), stride 1 SAME.
+const SIMD_DEPTHWISE_3X5_DM2_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseConv2DParams {
+    input_shape: [1, 12, 12, 8],
+    filter_shape: [1, 3, 5, 16],
+    output_shape: [1, 12, 12, 16],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    depth_multiplier: 2,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
 /// FC with input_dim 256 and output_dim 64 (both %16) — fires the TIE728
 /// `dl_tie728_s8_conv2d_11cn` path (the same entry point conv1x1 uses).
 const SIMD_FC_256X64_PARAMS: FullyConnectedParams<'static> = FullyConnectedParams {
@@ -903,6 +1031,59 @@ pub const fn kernel_specs() -> &'static [KernelSpec] {
                 source: "plan composed-kernels Scope table (user-verified 2026-08-10): kws 12,983,503 → 1,059,889 cyc / 54 → 4 ms (12.3×); ESP-NN-relative bar = beat 1,059,889 cyc / 4 ms. Measured Hematite row lands in T6.x (on-device).",
             }),
             note: "T3.5 depth_multiplier=8 row — the KWS keyword-spotting fan-out shape family (dm=8).",
+        },
+        KernelSpec {
+            name: "depthwise_s8 kws 49x40,1x10x8x8 dm8 S2 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::DepthwiseConv2d,
+            params: KernelParams::Depthwise(&SIMD_DEPTHWISE_KWS_10X8_PARAMS),
+            reference: Some(CompetitorBaseline {
+                name: "ESP-NN optimized (kws real depthwise, s16 path)",
+                cycles: None,
+                target_speedup_x100: None,
+                source: "plan composed-kernels Scope table (user-verified 2026-08-10): kws 12,983,503 → 1,059,889 cyc / 54 → 4 ms (12.3×); ESP-NN-relative bar = beat 1,059,889 cyc / 4 ms. Measured Hematite row lands in T6.x (on-device).",
+            }),
+            note: "T3.5b the REAL kws depthwise (tflite-verified [1,10,8,8], 80 taps, stride 2, dm 8, input_offset +128): the tap-parameterized anytap kernel runs it in 3 chunked QACC passes (32+32+16) — SIMD ENGAGES.",
+        },
+        KernelSpec {
+            name: "depthwise_s8 12x12,8x5x5x8 dm1 S1 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::DepthwiseConv2d,
+            params: KernelParams::Depthwise(&SIMD_DEPTHWISE_5X5_DM1_PARAMS),
+            reference: None,
+            note: "T3.5b arbitrary 5×5 filter, dm=1, stride 1 SAME (25-tap anytap path).",
+        },
+        KernelSpec {
+            name: "depthwise_s8 12x12,1x5x5x8 dm8 S1 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::DepthwiseConv2d,
+            params: KernelParams::Depthwise(&SIMD_DEPTHWISE_5X5_DM8_PARAMS),
+            reference: None,
+            note: "T3.5b arbitrary 5×5 filter, dm=8 fan-out (in_c 1 → out_c 8), stride 1 SAME.",
+        },
+        KernelSpec {
+            name: "depthwise_s8 14x14,8x7x7x8 dm1 S2 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::DepthwiseConv2d,
+            params: KernelParams::Depthwise(&SIMD_DEPTHWISE_7X7_DM1_PARAMS),
+            reference: None,
+            note: "T3.5b arbitrary 7×7 filter, dm=1, stride 2 SAME (49-tap anytap path).",
+        },
+        KernelSpec {
+            name: "depthwise_s8 14x14,1x7x7x8 dm8 S2 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::DepthwiseConv2d,
+            params: KernelParams::Depthwise(&SIMD_DEPTHWISE_7X7_DM8_PARAMS),
+            reference: None,
+            note: "T3.5b arbitrary 7×7 filter, dm=8 fan-out (in_c 1 → out_c 8), stride 2 SAME.",
+        },
+        KernelSpec {
+            name: "depthwise_s8 12x12,8x3x5x16 dm2 S1 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::DepthwiseConv2d,
+            params: KernelParams::Depthwise(&SIMD_DEPTHWISE_3X5_DM2_PARAMS),
+            reference: None,
+            note: "T3.5b non-square 3×5 filter, dm=2 (in_c 8 → out_c 16), stride 1 SAME (15-tap anytap path).",
         },
         KernelSpec {
             name: "max_pool_s8 2x2x16 (SIMD)",
@@ -1951,7 +2132,11 @@ mod tests {
                         (p.input_dim as usize, p.output_dim as usize, 1)
                     }
                     KernelParams::Depthwise(p) => {
-                        (p.input_shape[3] as usize, p.output_shape[3] as usize, 9)
+                        (
+                            p.input_shape[3] as usize,
+                            p.output_shape[3] as usize,
+                            (p.filter_shape[1].max(1) * p.filter_shape[2].max(1)) as usize,
+                        )
                     }
                     _ => continue,
                 };
@@ -2090,6 +2275,7 @@ mod tests {
                         let out_h = p.output_shape[1] as usize;
                         let out_w = p.output_shape[2] as usize;
                         let dm = p.depth_multiplier.max(1) as usize;
+                        let fw = p.filter_shape[2].max(1) as usize;
                         let stride_h = p.stride_height as usize;
                         let stride_w = p.stride_width as usize;
                         let dilated_h = (p.filter_shape[1] - 1) * p.dilation_height_factor + 1;
@@ -2109,7 +2295,7 @@ mod tests {
                                     let ic = oc / dm;
                                     let mut acc: i64 = 0;
                                     for tap in 0..taps {
-                                        let (kh, kw) = (tap / 3, tap % 3);
+                                        let (kh, kw) = (tap / fw, tap % fw);
                                         let ih = (oh * stride_h + kh) as i32 - pad_h as i32;
                                         let iw = (ow * stride_w + kw) as i32 - pad_w as i32;
                                         if ih < 0

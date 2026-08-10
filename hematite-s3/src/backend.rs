@@ -155,9 +155,15 @@ fn conv3x3_scratch_need(params: &Conv2DParams) -> usize {
 /// to `dm` output channels), so the padded channel count is `pad16(out_c)` —
 /// for dm==1 `out_c == input_c` and this equals the historical `pad16(in_c)`.
 /// dm>1 always stages (replication cannot run on the caller's `in_c`-channel
-/// input), so `needs_pad` is forced on for dm>1. Kept in sync with
-/// `depthwise_scratch_need_codegen` (hematite-codegen/src/generate.rs) and the
-/// dispatch's own `need` computation in `depthwise.rs`.
+/// input), so `needs_pad` is forced on for dm>1.
+///
+/// T3.5b — arbitrary filter sizes: the tap-parameterized anytap kernel needs
+/// a `taps * padded_c` padded filter when channel-padding (taps = fh*fw, not
+/// 9), and an extra `padded_c * 4` partial-accumulator buffer on the non-3x3
+/// path (the anytap kernel WRITES per-chunk partials the caller adds into the
+/// running accs — 3x3 keeps writing accs directly). Kept in sync with
+/// `depthwise_scratch_need_codegen` (hematite-codegen/src/generate.rs) and
+/// the dispatch's own `need` computation in `depthwise.rs`.
 #[inline(always)]
 fn depthwise_scratch_need(params: &DepthwiseConv2DParams) -> usize {
     let in_h = params.input_shape[1].max(0) as usize;
@@ -167,6 +173,8 @@ fn depthwise_scratch_need(params: &DepthwiseConv2DParams) -> usize {
     let out_c = params.output_shape[3].max(0) as usize;
     let filter_h = params.filter_shape[1];
     let filter_w = params.filter_shape[2];
+    let is_3x3 = filter_h == 3 && filter_w == 3;
+    let taps = (filter_h.max(0) as usize) * (filter_w.max(0) as usize);
 
     let dilated_filter_h = (filter_h - 1) * params.dilation_height_factor + 1;
     let dilated_filter_w = (filter_w - 1) * params.dilation_width_factor + 1;
@@ -180,12 +188,13 @@ fn depthwise_scratch_need(params: &DepthwiseConv2DParams) -> usize {
     let needs_pad = pad_total_h > 0 || pad_total_w > 0 || needs_channel_pad || dm_gt_1;
 
     let wsum = if params.input_offset != 0 { out_c * 4 } else { 0 };
+    let partials = if is_3x3 { 0 } else { padded_c * 4 };
     if needs_pad {
         let pad_input_len = (in_h + pad_total_h) * (in_w + pad_total_w) * padded_c;
-        let pad_filter_len = if needs_channel_pad { 9 * padded_c } else { 0 };
-        pad_input_len + pad_filter_len + padded_c * 4 + wsum
+        let pad_filter_len = if needs_channel_pad { taps * padded_c } else { 0 };
+        pad_input_len + pad_filter_len + padded_c * 4 + wsum + partials
     } else {
-        out_c * 4 + wsum
+        out_c * 4 + wsum + partials
     }
 }
 
@@ -709,6 +718,33 @@ mod tests {
         let expect3 = (14 * 14 * 16) + (9 * 16) + (16 * 4) + (12 * 4);
         assert_eq!(depthwise_scratch_need(&p3), expect3);
         assert_eq!(S3Backend::depthwise_conv2d_scratch_size(&p3), expect3);
+
+        // T3.5b — arbitrary filter (kws 10×8, dm=8, in_c=1 -> out_c=8,
+        // stride 2 SAME): padded filter uses taps (80) instead of 9, plus the
+        // anytap partial-accumulator buffer (padded_c*4).
+        let p4 = DepthwiseConv2DParams {
+            input_shape: [1, 49, 40, 1],
+            filter_shape: [1, 10, 8, 8],
+            output_shape: [1, 25, 20, 8],
+            padding: hematite_core::op_params::Padding::Same,
+            stride_width: 2,
+            stride_height: 2,
+            dilation_width_factor: 1,
+            dilation_height_factor: 1,
+            depth_multiplier: 8,
+            input_offset: 0,
+            weights_offset: 0,
+            output_offset: 0,
+            output_multiplier_per_channel: &[0; 8],
+            output_shift_per_channel: &[0; 8],
+            quantized_activation_min: -128,
+            quantized_activation_max: 127,
+        };
+        // padded_h 58, padded_w 46, padded_c 16; staged filter 80*16; accs 16*4;
+        // partials 16*4.
+        let expect4 = (58 * 46 * 16) + (80 * 16) + (16 * 4) + (16 * 4);
+        assert_eq!(depthwise_scratch_need(&p4), expect4);
+        assert_eq!(S3Backend::depthwise_conv2d_scratch_size(&p4), expect4);
     }
 
     /// T3.6 — the FC padded-path scratch need formula must match the dispatch

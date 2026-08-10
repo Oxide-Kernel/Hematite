@@ -675,7 +675,11 @@ fn conv3x3_scratch_need_codegen(
 /// T3.5 — depth_multiplier > 1: the kernel consumes `out_c`-channel vectors
 /// and the dispatch stages a REPLICATED input, so the padded channel count is
 /// `pad16(out_c)` (== `pad16(in_c)` for dm==1) and dm>1 always forces the
-/// staged path. Keep in sync with `hematite-s3/src/backend.rs`.
+/// staged path.
+///
+/// T3.5b — arbitrary filter sizes: the padded filter uses `taps = fh*fw`
+/// rows (not 9), and the non-3x3 anytap path needs an extra `pad16(out_c)*4`
+/// partial-accumulator buffer. Keep in sync with `hematite-s3/src/backend.rs`.
 #[allow(clippy::too_many_arguments)]
 pub fn depthwise_scratch_need_codegen(
     in_h: usize,
@@ -693,6 +697,8 @@ pub fn depthwise_scratch_need_codegen(
     depth_multiplier: i32,
     input_offset: i32,
 ) -> usize {
+    let is_3x3 = filter_h == 3 && filter_w == 3;
+    let taps = (filter_h.max(0) as usize) * (filter_w.max(0) as usize);
     let dilated_filter_h = (filter_h - 1) * dil_h + 1;
     let dilated_filter_w = (filter_w - 1) * dil_w + 1;
     let pad_total_h =
@@ -705,12 +711,13 @@ pub fn depthwise_scratch_need_codegen(
     let needs_pad =
         pad_total_h > 0 || pad_total_w > 0 || needs_channel_pad || depth_multiplier > 1;
     let wsum = if input_offset != 0 { out_c * 4 } else { 0 };
+    let partials = if is_3x3 { 0 } else { padded_c * 4 };
     if needs_pad {
         let pad_input_len = (in_h + pad_total_h) * (in_w + pad_total_w) * padded_c;
-        let pad_filter_len = if needs_channel_pad { 9 * padded_c } else { 0 };
-        pad_input_len + pad_filter_len + padded_c * 4 + wsum
+        let pad_filter_len = if needs_channel_pad { taps * padded_c } else { 0 };
+        pad_input_len + pad_filter_len + padded_c * 4 + wsum + partials
     } else {
-        out_c * 4 + wsum
+        out_c * 4 + wsum + partials
     }
 }
 
@@ -2006,11 +2013,11 @@ mod tests {
         b
     }
 
-    /// Cross-crate scratch parity (T3.5 / T1.4 gate): the macro-time mirror
-    /// `depthwise_scratch_need_codegen` must equal the runtime
-    /// `S3Backend::depthwise_conv2d_scratch_size` for the dm>1 fan-out shapes
-    /// (and the dm==1 corpus). The runtime formula is canonical — a mismatch
-    /// is a mirror bug.
+    /// Cross-crate scratch parity (T3.5 / T3.5b / T1.4 gate): the macro-time
+    /// mirror `depthwise_scratch_need_codegen` must equal the runtime
+    /// `S3Backend::depthwise_conv2d_scratch_size` for the dm>1 fan-out shapes,
+    /// the dm==1 corpus, AND arbitrary filter sizes (3×3, 5×5, 7×7, kws 10×8)
+    /// — the runtime formula is canonical; a mismatch is a mirror bug.
     #[test]
     fn depthwise_scratch_mirror_matches_s3_backend() {
         use hematite_core::op_params::{DepthwiseConv2DParams, Padding};
@@ -2022,15 +2029,18 @@ mod tests {
             in_c: i32,
             spatial: i32,
             input_offset: i32,
+            fh: i32,
+            fw: i32,
+            stride: i32,
         ) -> DepthwiseConv2DParams<'static> {
             let out_c = in_c * dm;
             DepthwiseConv2DParams {
                 input_shape: [1, spatial, spatial, in_c],
-                filter_shape: [1, 3, 3, out_c],
+                filter_shape: [1, fh, fw, out_c],
                 output_shape: [1, spatial, spatial, out_c],
                 padding: Padding::Same,
-                stride_width: 1,
-                stride_height: 1,
+                stride_width: stride,
+                stride_height: stride,
                 dilation_width_factor: 1,
                 dilation_height_factor: 1,
                 depth_multiplier: dm,
@@ -2070,7 +2080,7 @@ mod tests {
             for &in_c in &[1, 3, 8, 16, 32] {
                 for &spatial in &[8, 12, 14] {
                     for &offset in &[0, -3] {
-                        let p = params(dm, in_c, spatial, offset);
+                        let p = params(dm, in_c, spatial, offset, 3, 3, 1);
                         let mirror = codegen_need(&p);
                         let runtime = S3Backend::depthwise_conv2d_scratch_size(&p);
                         assert_eq!(
@@ -2083,7 +2093,28 @@ mod tests {
                 }
             }
         }
-        assert!(checked >= 32, "parity matrix did not expand");
+        // T3.5b — arbitrary filters (5×5, 7×7, kws 10×8) × dm {1,8} ×
+        // strides {1,2}, with and without input_offset.
+        for &(fh, fw) in &[(5, 5), (7, 7), (10, 8)] {
+            for &dm in &[1, 8] {
+                for &in_c in &[1, 8] {
+                    for &stride in &[1, 2] {
+                        for &offset in &[0, 3, 128] {
+                            let p = params(dm, in_c, 14, offset, fh, fw, stride);
+                            let mirror = codegen_need(&p);
+                            let runtime = S3Backend::depthwise_conv2d_scratch_size(&p);
+                            assert_eq!(
+                                mirror, runtime,
+                                "depthwise fh={fh} fw={fw} dm={dm} in_c={in_c} stride={stride} \
+                                 offset={offset}: codegen mirror {mirror} != S3Backend need {runtime}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 192, "parity matrix did not expand ({checked})");
     }
 
     /// Cross-crate scratch parity (T3.6): the macro-time mirror

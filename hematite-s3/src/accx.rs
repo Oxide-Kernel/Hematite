@@ -351,6 +351,7 @@ mod device {
     global_asm!(include_str!("asm/s8_accx_conv3x3.S"));
     global_asm!(include_str!("asm/s8_requantize.S"));
     global_asm!(include_str!("asm/s8_accx_depthwise.S"));
+    global_asm!(include_str!("asm/s8_accx_depthwise_anytap.S"));
 
     /// One input vector → `out_c` raw int32 accumulators.
     ///
@@ -456,6 +457,49 @@ mod device {
             in("a13") in_c,
             in("a14") out_c,
             in("a15") row_delta,
+            clobber_abi("C"),
+        );
+    }
+
+    /// T3.5b — tap-parameterized depthwise kernel args. `repr(C)` with the
+    /// exact byte offsets `s8_accx_depthwise_anytap.S` reads (0/4/8/.../32).
+    ///
+    /// `input` is the address of THIS pass's starting tap (the Rust caller
+    /// pre-adds the row/col tap offset); `filter` is `filter + tap_start*out_c`;
+    /// `taps` is 1..=32 (the QACC 20-bit-lane-safe chunk bound — see the
+    /// `.S` header); `filter_w` is the row-advance period; `col_start` is the
+    /// column of the first tap within its filter row (for chunk boundaries
+    /// that fall mid-row).
+    #[repr(C)]
+    pub struct AnyTapCtx {
+        pub input: *const i8,
+        pub filter: *const i8,
+        pub acc_out: *mut i32,
+        pub in_c: u32,
+        pub out_c: u32,
+        pub row_delta: u32,
+        pub taps: u32,
+        pub filter_w: u32,
+        pub col_start: u32,
+    }
+
+    /// One ≤32-tap QACC pass for arbitrary-filter depthwise → `out_c` raw
+    /// int32 partial accumulators (Rust adds them into its running i32 accs).
+    ///
+    /// # Safety
+    /// `ctx` must point at a valid [`AnyTapCtx`]; `input`/`filter`
+    /// 16-byte aligned, `acc_out` 16-byte aligned (the kernel VSTs 128-bit
+    /// vectors), `in_c % 16 == 0`, `out_c % 16 == 0`, `out_c >= 16`,
+    /// buffers sized, `taps` in 1..=32.
+    pub unsafe fn accx_depthwise_anytap(ctx: *const AnyTapCtx) {
+        asm!(
+            "call8 s8_accx_depthwise_anytap",
+            in("a10") ctx,
+            out("a11") _,
+            out("a12") _,
+            out("a13") _,
+            out("a14") _,
+            out("a15") _,
             clobber_abi("C"),
         );
     }
