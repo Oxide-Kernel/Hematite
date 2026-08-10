@@ -1223,6 +1223,18 @@ fn fused_conv2d_scratch_need_codegen(
     }
 }
 
+/// Scratch bytes for a composed pool-with-fold group (`fused_pool_with_fold`,
+/// T2.4): the fold staging region — `num_elements` (flat_len of the fold
+/// input = the pool input flat count) padded up to the pool SIMD kernel's
+/// 16-byte multiple. The pool consumes no scratch on either side.
+/// Mirrors `hematite_s3::backend::fused_pool_with_fold_scratch_need`.
+/// `emit_fused_pool_fold` reports this value, so a composed group never
+/// under-sizes scratch vs the runtime decomposition (which materializes the
+/// fold into exactly `num_elements` bytes).
+fn fused_pool_fold_scratch_need_codegen(num_elements: usize) -> usize {
+    pad16(num_elements)
+}
+
 fn emit_op(
     model: &ParsedModel,
     storage: &[Storage],
@@ -2502,7 +2514,11 @@ fn emit_fused_pool_fold(
     Ok(OpEmission {
         consts,
         call,
-        scratch: num_elements.max(0) as usize,
+        // T2.4 — the composed need is the fold staging region padded to the
+        // pool SIMD kernel's 16-byte multiple (the pool itself consumes no
+        // scratch on either side), via the explicit mirror so the T1.4 parity
+        // test can assert the composed value directly.
+        scratch: fused_pool_fold_scratch_need_codegen(num_elements.max(0) as usize),
     })
 }
 
@@ -3372,12 +3388,14 @@ mod tests {
     }
 
     use hematite_core::op_params::{
-        Conv2DParams, DepthwiseConv2DParams, FusedConvParams, FullyConnectedParams, Padding,
-        SoftmaxParams,
+        Conv2DParams, DepthwiseConv2DParams, FoldedPoolParams, FusedConvParams,
+        FullyConnectedParams, Padding, SoftmaxParams,
     };
     use hematite_benchmarks::spec::KernelParams;
     use hematite_core::KernelBackend;
-    use hematite_s3::backend::{fc_scratch_need, fused_conv2d_scratch_need, S3Backend};
+    use hematite_s3::backend::{
+        fc_scratch_need, fused_conv2d_scratch_need, fused_pool_with_fold_scratch_need, S3Backend,
+    };
 
     // ── T1.4 — scratch parity: codegen mirrors vs S3Backend runtime ──────
     //
@@ -3617,6 +3635,34 @@ mod tests {
         *checked += 1;
     }
 
+    /// T2.4 — the pool-fold mirror must equal the runtime composed need, and
+    /// that must equal the fold staging bytes (`num_elements`) padded to the
+    /// pool SIMD kernel's 16-byte multiple + the pool's own need (0). This
+    /// is the same equality `composed_scratch_parity` asserts over its grid.
+    fn check_fused_pool(p: &FoldedPoolParams<'_>, checked: &mut usize) {
+        let fold_n = match &p.fold {
+            Some(f) => f.num_elements.max(0) as usize,
+            None => {
+                (p.pool.input_shape[1].max(0) as usize)
+                    * (p.pool.input_shape[2].max(0) as usize)
+                    * (p.pool.input_shape[3].max(0) as usize)
+            }
+        };
+        let runtime = fused_pool_with_fold_scratch_need(p);
+        let mirror = fused_pool_fold_scratch_need_codegen(fold_n);
+        assert_eq!(
+            mirror, runtime,
+            "fused_pool_with_fold in={:?}: codegen mirror {mirror} != S3Backend fused need {runtime}",
+            p.pool.input_shape
+        );
+        assert_eq!(
+            runtime,
+            pad16(fold_n),
+            "fused_pool_with_fold need {runtime} != fold staging pad16({fold_n})"
+        );
+        *checked += 1;
+    }
+
     /// T1.4 — corpus-wide scratch parity sweep. Every mirror fn is asserted
     /// equal to the runtime S3Backend formula over (a) every machine-readable
     /// row of the per-kernel benchmark corpus (`hematite_benchmarks::spec::
@@ -3675,9 +3721,13 @@ mod tests {
                     check_fused_conv(p, &mut checked);
                     n_fused += 1;
                 }
+                KernelParams::FusedPool(p) => {
+                    check_fused_pool(p, &mut checked);
+                    n_fused += 1;
+                }
             }
         }
-        assert!(n_conv >= 8 && n_dw >= 13 && n_fc >= 7 && n_sm >= 1 && n_pool >= 3 && n_fused >= 1,
+        assert!(n_conv >= 8 && n_dw >= 13 && n_fc >= 7 && n_sm >= 1 && n_pool >= 3 && n_fused >= 2,
             "corpus shrank unexpectedly: conv={n_conv} dw={n_dw} fc={n_fc} softmax={n_sm} pool={n_pool} fused={n_fused} scratch-free={n_scratch_free}");
 
         // (b) widened grids (spec-corpus families + corner cases).
@@ -3772,7 +3822,8 @@ mod tests {
     ///   output register-held) — asserted via the explicit
     ///   `fused_conv2d_scratch_need_codegen` mirror below.
     /// * `fused_pool_with_fold` — `emit_fused_pool_fold` reports
-    ///   `scratch: num_elements` (flat_len of the fold input = in_h·in_w·in_c);
+    ///   `scratch: fused_pool_fold_scratch_need_codegen(num_elements)` (the
+    ///   fold staging region, `pad16` of flat_len(fold input));
     ///   the decomposition (hematite-ref/src/fused.rs) materializes the
     ///   absorbed fold into exactly `num_elements` scratch bytes and the pool
     ///   then needs 0 more (s3 pool ignores scratch). Composed need ==
@@ -3809,17 +3860,22 @@ mod tests {
             );
         }
 
-        // fused_pool_with_fold: codegen num_elements vs decomposition sum.
+        // fused_pool_with_fold: codegen pad16(num_elements) vs decomposition
+        // sum (fold staging pad16 + pool need 0). Every grid shape has
+        // num_elements % 16 == 0, so pad16 is identity here — the assertion
+        // stays meaningful because the mirror is the value `emit_fused_pool_fold`
+        // reports, and the RHS is the decomposition's real consumption.
         for &(h, w, c) in &[(4, 4, 16), (8, 16, 8), (16, 40, 1), (7, 7, 1280), (12, 12, 12), (32, 32, 3)] {
             let num_elements = h * w * c; // emit_fused_pool_fold: flat_len(fold input)
-            let fold_need = num_elements; // decomposition: fold materialization
+            let composed_need = fused_pool_fold_scratch_need_codegen(num_elements);
+            let fold_need = pad16(num_elements); // decomposition: fold materialization
             let pool_need = 0; // pool consumes no scratch on either side
             assert!(
-                num_elements >= fold_need + pool_need,
-                "fused_pool_with_fold {h}x{w}x{c}: composed need {num_elements} < decomposition sum {}",
+                composed_need >= fold_need + pool_need,
+                "fused_pool_with_fold {h}x{w}x{c}: composed need {composed_need} < decomposition sum {}",
                 fold_need + pool_need
             );
-            assert_eq!(num_elements, fold_need + pool_need);
+            assert_eq!(composed_need, fold_need + pool_need);
         }
     }
 

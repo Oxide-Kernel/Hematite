@@ -6,7 +6,7 @@
 //!
 //! # What is fused here
 //!
-//! Two composed kernels live in this module:
+//! Three composed kernels live in this module:
 //!
 //! * [`fused_conv2d`](Self::fused_conv2d) (T2.2) — conv → residual-ADD →
 //!   activation as ONE kernel call. On real silicon the anchor conv runs
@@ -28,6 +28,15 @@
 //!   fixed-point sequence of the per-op kernel the decomposition would run,
 //!   NEVER materialized to memory), and the final i8 chunk is vector-stored
 //!   to `dst`. Zero intermediate stores.
+//! * [`fused_pool_with_fold`](Self::fused_pool_with_fold) (T2.4) — pool +
+//!   MUL/SUB input fold + activation epilogue as ONE kernel call. On real
+//!   silicon, when the anchor pool passes the existing pool SIMD gate AND
+//!   the fold is in the provably-exact subset ([`fused_pool_fold_simd_eligible`]),
+//!   the fold materializes into scratch (per-op `mul`/`sub`, SIMD when the
+//!   fold's own elementwise gates hold), the pool SIMD kernel reads the
+//!   staged scratch directly, and the activation epilogue is applied
+//!   register-held in place. Every other group falls back to the
+//!   decomposition.
 //!
 //! # Bit-exact contract
 //!
@@ -56,12 +65,18 @@
 //!   tensors) in place. The decomposition forwards no scratch either (the
 //!   per-op elementwise/activation kernels take `&mut []`). See `backend.rs
 //!   ::fused_elementwise_chain_scratch_need` (== 0, asserted by tests).
+//! * `fused_pool_with_fold` needs the fold staging region (the fold output
+//!   tensor bytes, `num_elements`, padded up to the pool SIMD kernel's
+//!   16-byte multiple) — the pool itself consumes no scratch on either side.
+//!   See `backend.rs ::fused_pool_with_fold_scratch_need`.
 
 use hematite_core::op_params::{
     ActivationEpilogueParams, ActivationParams, ComposedActivation, ElementwiseChainParams,
     ElementwiseChainStep, ElementwiseKind, ElementwiseParams, FoldedPoolParams, FusedConvParams,
-    PoolKind,
+    PoolInputFold, PoolKind,
 };
+#[cfg(test)]
+use hematite_core::op_params::PoolParams;
 use hematite_core::{FusedKernelBackend, KernelBackend, KernelError};
 #[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
 use hematite_int8::{multiply_by_quantized_multiplier, saturating_cast};
@@ -199,6 +214,80 @@ fn req(acc: i32, mult: i32, shift: i32) -> i32 {
     }
 }
 
+/// Apply ONE absorbed trailing activation to a single i32 value, returning
+/// the requantized result (NOT yet saturating-cast — the caller stores it).
+///
+/// This is the `fused_epilogue`'s Stage 3, factored out so the pool-fold
+/// epilogue (T2.4) reuses the exact same register math instead of
+/// re-implementing it. Bit-exact vs the per-op activation kernels
+/// (`apply_activation` forwards to `backend.relu`/`relu6`/`hard_swish`) for
+/// every kind — proven by the T2.2 epilogue tests for the conv anchor and by
+/// the pool-fold golden matrix for the pool anchor.
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+#[inline]
+fn composed_activation_apply(
+    kind: ComposedActivation,
+    input_offset: i32,
+    output_offset: i32,
+    output_multiplier: i32,
+    output_shift: i32,
+    act_max: i32,
+    v: i32,
+) -> i32 {
+    match kind {
+        ComposedActivation::None => v,
+        ComposedActivation::Relu => {
+            let val = v + input_offset;
+            let act = val.max(0);
+            req(act, output_multiplier, output_shift) + output_offset
+        }
+        ComposedActivation::Relu6 => {
+            let val = v + input_offset;
+            clamp(val, 0, act_max) + output_offset
+        }
+        ComposedActivation::HardSwish => {
+            // The DOWNGRADED s3 formula (activations.rs): integer rational
+            // x·ReLU6(x+3)/6 with ±3 correction — NO fixed-point. Xtensa
+            // has no SIMD integer division, so this per-lane scalar tail is
+            // bit-exact vs the s3 scalar `hard_swish`.
+            let x = v + input_offset;
+            let relu6_arg = clamp(x + 3, 0, 6);
+            let product = x * relu6_arg;
+            let result = if product >= 0 {
+                (product + 3) / 6
+            } else {
+                (product - 3) / 6
+            };
+            result + output_offset
+        }
+    }
+}
+
+/// Apply the absorbed trailing activation epilogue IN PLACE over a whole
+/// tensor, register-held (`composed_activation_apply` per element) — the
+/// pool-fold SIMD path's epilogue. Identity (`None`) short-circuits.
+///
+/// Bit-exact vs `apply_activation` (the per-op kernels) by construction —
+/// the same per-element math, same `saturating_cast`.
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+fn apply_composed_activation_inplace(a: &ActivationEpilogueParams, buf: &mut [i8]) {
+    if a.kind == ComposedActivation::None {
+        return;
+    }
+    for v in buf.iter_mut() {
+        let r = composed_activation_apply(
+            a.kind,
+            a.input_offset,
+            a.output_offset,
+            a.output_multiplier,
+            a.output_shift,
+            a.quantized_activation_max,
+            i32::from(*v),
+        );
+        *v = saturating_cast(r);
+    }
+}
+
 /// Apply the fused epilogue to one output pixel's i32 accumulators (already
 /// folded for `input_offset`), writing `accs.len()` elements to
 /// `output[out_base ..]`.
@@ -250,34 +339,18 @@ pub(crate) fn fused_epilogue(
             v = clamp(scaled + fp.out_offset, i8::MIN as i32, i8::MAX as i32);
         }
 
-        // Stage 3 — the absorbed trailing activation epilogue, in place.
-        v = match fp.act_kind {
-            ComposedActivation::None => v,
-            ComposedActivation::Relu => {
-                let val = v + fp.act_input_offset;
-                let act = val.max(0);
-                req(act, fp.act_mult, fp.act_shift) + fp.act_output_offset
-            }
-            ComposedActivation::Relu6 => {
-                let val = v + fp.act_input_offset;
-                clamp(val, 0, fp.act_max) + fp.act_output_offset
-            }
-            ComposedActivation::HardSwish => {
-                // The DOWNGRADED s3 formula (activations.rs): integer rational
-                // x·ReLU6(x+3)/6 with ±3 correction — NO fixed-point. Xtensa
-                // has no SIMD integer division, so this per-lane scalar tail is
-                // bit-exact vs the s3 scalar `hard_swish`.
-                let x = v + fp.act_input_offset;
-                let relu6_arg = clamp(x + 3, 0, 6);
-                let product = x * relu6_arg;
-                let result = if product >= 0 {
-                    (product + 3) / 6
-                } else {
-                    (product - 3) / 6
-                };
-                result + fp.act_output_offset
-            }
-        };
+        // Stage 3 — the absorbed trailing activation epilogue, in place
+        // (the factored [`composed_activation_apply`] — shared with the
+        // T2.4 pool-fold epilogue).
+        v = composed_activation_apply(
+            fp.act_kind,
+            fp.act_input_offset,
+            fp.act_output_offset,
+            fp.act_mult,
+            fp.act_shift,
+            fp.act_max,
+            v,
+        );
 
         output[out_base + oc] = saturating_cast(v);
     }
@@ -575,6 +648,120 @@ fn fused_elementwise_chain_simd(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Fused pool-with-fold (T2.4) — the fold SIMD eligibility gate
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The fused `fused_pool_with_fold` SIMD path materializes the absorbed fold
+// into scratch (the per-op `mul`/`sub`, which SIMD-dispatches when the fold's
+// own elementwise gates hold), runs the EXISTING pool SIMD kernel reading the
+// staged scratch directly, and applies the activation epilogue register-held
+// (`apply_composed_activation_inplace`). It engages ONLY when every stage is
+// bit-exact under the established per-op gates:
+
+/// Fold-level SIMD eligibility: the absorbed MUL/SUB fold's materialization
+/// is bit-exact under the per-op elementwise SIMD gates (T2.4 provably-exact
+/// subset — "single-rounding-equivalent" folds only).
+///
+/// * MUL fold — `simd_eligible_mul`: zero offsets, full-range clamp,
+///   `output_multiplier == 1<<30`, `output_shift <= 1` — the raw-product +
+///   power-of-two-shift form whose output is bit-exact vs the scalar kernel.
+/// * SUB fold — `simd_eligible_add_sub`: zero offsets, full-range clamp,
+///   `left_shift <= 0`, identity `(1<<30, 1)` pairs everywhere — the raw
+///   int8-subtract form.
+///
+/// Any other fold (non-identity quant-affine MUL scale, two-stage TFLM SUB
+/// rounding with `left_shift = 20`, non-zero zero points) is NOT proven
+/// single-rounding-exact and falls back to the decomposition — the unfused
+/// per-op sequence, always correct.
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+fn fold_simd_exact(fold: &PoolInputFold<'_>) -> bool {
+    let ep = fold_elementwise_params(fold);
+    match fold.builtin {
+        18 /* MUL */ => simd_eligible_mul(&ep).is_some(),
+        41 /* SUB */ => simd_eligible_add_sub(&ep),
+        _ => false,
+    }
+}
+
+/// Pool-fold SIMD eligibility: the anchor pool passes the existing pool SIMD
+/// gate (`simd_eligible_pool` — 2×2/stride-2/pad-0, channels % 16, full-range
+/// clamp, the only shapes the TIE728 `*_22c1` kernels are bit-exact for) AND
+/// the fold is in the provably-exact subset ([`fold_simd_exact`]).
+///
+/// Host-compilable so the unit tests can pin WHICH composed groups engage.
+/// When `params.fold` is `None` only the pool gate applies (a plain
+/// pool+activation composed call — trivially exact).
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+fn fused_pool_fold_simd_eligible(params: &FoldedPoolParams<'_>) -> bool {
+    if crate::pool::simd_eligible_pool(&params.pool).is_none() {
+        return false;
+    }
+    match &params.fold {
+        None => true,
+        Some(fold) => fold_simd_exact(fold),
+    }
+}
+
+/// Attempt the fused SIMD path for `fused_pool_with_fold`, returning
+/// `Ok(true)` when handled and `Ok(false)` when ineligible (the trait method
+/// falls through to the per-op decomposition).
+///
+/// Engagement: [`fused_pool_fold_simd_eligible`] (pool gate + provably-exact
+/// fold subset) and the fold staging fits in `scratch`. The fold materializes
+/// into scratch (`scratch_as_i8` — the per-op `mul`/`sub`, which SIMD-engage
+/// through the elementwise gates when eligible and aligned), the pool reads
+/// the staged scratch through the EXISTING pool SIMD dispatch (its own
+/// alignment check gates the final scalar-vs-SIMD split), and the activation
+/// epilogue is applied register-held in place. The decomposition is
+/// functionally identical but keeps the activation as a separate per-op
+/// kernel call; both are bit-exact.
+#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+fn fused_pool_with_fold_simd(
+    backend: &mut S3Backend,
+    src: &[i8],
+    params: &FoldedPoolParams<'_>,
+    dst: &mut [i8],
+    scratch: &mut [u8],
+) -> Result<bool, KernelError> {
+    if !fused_pool_fold_simd_eligible(params) {
+        return Ok(false);
+    }
+    let n = match &params.fold {
+        Some(fold) => fold.num_elements as usize,
+        None => (params.pool.input_shape[1] as usize)
+            * (params.pool.input_shape[2] as usize)
+            * (params.pool.input_shape[3] as usize),
+    };
+    if scratch.len() < n {
+        return Err(KernelError::ScratchTooSmall);
+    }
+
+    let intermediate: &[i8] = match &params.fold {
+        Some(fold) => {
+            let buf = unsafe { scratch_as_i8(&mut scratch[..n]) };
+            let ep = fold_elementwise_params(fold);
+            match fold.builtin {
+                18 /* MUL */ => backend.mul(src, fold.operand_data, &ep, buf)?,
+                41 /* SUB */ => backend.sub(src, fold.operand_data, &ep, buf)?,
+                _ => return Ok(false),
+            }
+            buf
+        }
+        None => src,
+    };
+
+    match params.pool_kind {
+        PoolKind::Average => backend.average_pool_2d(intermediate, &params.pool, dst)?,
+        PoolKind::Max => backend.max_pool_2d(intermediate, &params.pool, dst)?,
+    }
+
+    // Activation epilogue — register-held in place, the factored
+    // `fused_epilogue` Stage-3 math (bit-exact vs `apply_activation`).
+    apply_composed_activation_inplace(&params.activation, dst);
+    Ok(true)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Fallback decomposition (host, QEMU, and ineligible device shapes)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -598,6 +785,28 @@ unsafe fn alias_input<'b>(buf: &mut [i8]) -> &'b [i8] {
 /// is only used as scratch between the fold op and the pool.
 unsafe fn scratch_as_i8<'b>(buf: &mut [u8]) -> &'b mut [i8] {
     core::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut i8, buf.len())
+}
+
+/// Build the `ElementwiseParams` for an absorbed pool input fold (MUL/SUB),
+/// exactly as the decomposition forwards them to the per-op `mul`/`sub`
+/// kernels (full-range clamp — the fold output feeds the pool raw). Shared by
+/// the decomposition and the SIMD eligibility predicate.
+fn fold_elementwise_params(fold: &PoolInputFold<'_>) -> ElementwiseParams {
+    ElementwiseParams {
+        num_elements: fold.num_elements,
+        input1_offset: -(fold.input_zero_point as i32),
+        input2_offset: -(fold.operand_zero_point as i32),
+        output_offset: fold.output_zero_point as i32,
+        output_multiplier: fold.output_multiplier,
+        output_shift: fold.output_shift,
+        left_shift: fold.left_shift,
+        input1_multiplier: fold.input1_multiplier,
+        input1_shift: fold.input1_shift,
+        input2_multiplier: fold.input2_multiplier,
+        input2_shift: fold.input2_shift,
+        quantized_activation_min: i8::MIN as i32,
+        quantized_activation_max: i8::MAX as i32,
+    }
 }
 
 /// Build the `ElementwiseParams` for one chain step (Add / Mul / Sub).
@@ -824,6 +1033,17 @@ impl FusedKernelBackend for S3Backend {
         dst: &mut [i8],
         scratch: &mut [u8],
     ) -> Result<(), KernelError> {
+        // Fused SIMD (device-only; QEMU-gated). On any ineligible group
+        // (non-SIMD pool shape, fold outside the provably-exact subset,
+        // misaligned pointers) the dispatch returns Ok(false) and we fall
+        // through to the decomposition — always bit-exact.
+        #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+        {
+            if fused_pool_with_fold_simd(self, src, params, dst, scratch)? {
+                return Ok(());
+            }
+        }
+
         let intermediate: &[i8] = match &params.fold {
             Some(fold) => {
                 let n = fold.num_elements as usize;
@@ -831,21 +1051,7 @@ impl FusedKernelBackend for S3Backend {
                     return Err(KernelError::ScratchTooSmall);
                 }
                 let buf = unsafe { scratch_as_i8(&mut scratch[..n]) };
-                let ep = ElementwiseParams {
-                    num_elements: fold.num_elements,
-                    input1_offset: -(fold.input_zero_point as i32),
-                    input2_offset: -(fold.operand_zero_point as i32),
-                    output_offset: fold.output_zero_point as i32,
-                    output_multiplier: fold.output_multiplier,
-                    output_shift: fold.output_shift,
-                    left_shift: fold.left_shift,
-                    input1_multiplier: fold.input1_multiplier,
-                    input1_shift: fold.input1_shift,
-                    input2_multiplier: fold.input2_multiplier,
-                    input2_shift: fold.input2_shift,
-                    quantized_activation_min: i8::MIN as i32,
-                    quantized_activation_max: i8::MAX as i32,
-                };
+                let ep = fold_elementwise_params(fold);
                 match fold.builtin {
                     18 /* MUL */ => self.mul(src, fold.operand_data, &ep, buf)?,
                     41 /* SUB */ => self.sub(src, fold.operand_data, &ep, buf)?,
@@ -1384,5 +1590,191 @@ mod tests {
             steps: &steps,
         };
         assert_eq!(crate::backend::fused_elementwise_chain_scratch_need(&params), 0);
+    }
+
+    // ── T2.4 — fused pool-with-fold ──────────────────────────────────────
+
+    /// The canonical SIMD-eligible pool anchor (2×2/stride-2/pad-0, channels
+    /// % 16, full-range clamp — exactly `simd_eligible_pool`'s contract).
+    fn test_pool_params() -> PoolParams {
+        use hematite_core::op_params::FusedActivation;
+        PoolParams {
+            input_shape: [1, 4, 4, 16],
+            output_shape: [1, 2, 2, 16],
+            filter_width: 2,
+            filter_height: 2,
+            stride_width: 2,
+            stride_height: 2,
+            padding: Padding::Same,
+            activation: FusedActivation::None,
+            quantized_activation_min: i8::MIN as i32,
+            quantized_activation_max: i8::MAX as i32,
+        }
+    }
+
+    /// One fold with explicit quant params.
+    #[allow(clippy::too_many_arguments)]
+    fn test_fold(
+        builtin: i32,
+        operand: &'static [i8],
+        input_zp: i64,
+        operand_zp: i64,
+        out_zp: i64,
+        left_shift: i32,
+        om: i32,
+        os: i32,
+        i1m: i32,
+        i1s: i32,
+        i2m: i32,
+        i2s: i32,
+    ) -> PoolInputFold<'static> {
+        PoolInputFold {
+            builtin,
+            operand_data: operand,
+            operand_zero_point: operand_zp,
+            input_zero_point: input_zp,
+            output_zero_point: out_zp,
+            folded_scale: 1.0,
+            left_shift,
+            output_multiplier: om,
+            output_shift: os,
+            input1_multiplier: i1m,
+            input1_shift: i1s,
+            input2_multiplier: i2m,
+            input2_shift: i2s,
+            num_elements: 256,
+        }
+    }
+
+    /// An identity MUL fold (the `simd_eligible_mul` contract: zero offsets,
+    /// full-range clamp, `(1<<30, shift<=1)` output pair) — SIMD-engages.
+    fn identity_mul_fold(operand: &'static [i8]) -> PoolInputFold<'static> {
+        test_fold(18, operand, 0, 0, 0, 0, 1 << 30, 0, 0, 0, 0, 0)
+    }
+
+    /// A NON-identity MUL fold (a real scale change — two-stage rounding) —
+    /// falls back to the decomposition.
+    fn non_identity_mul_fold(operand: &'static [i8]) -> PoolInputFold<'static> {
+        test_fold(18, operand, 5, -3, 1, 0, 1_717_986_918, -3, 0, 0, 0, 0)
+    }
+
+    /// An identity SUB fold (the `simd_eligible_add_sub` contract: zero
+    /// offsets, `left_shift <= 0`, identity `(1<<30, 1)` pairs everywhere) —
+    /// SIMD-engages.
+    fn identity_sub_fold(operand: &'static [i8]) -> PoolInputFold<'static> {
+        test_fold(41, operand, 0, 0, 0, 0, 1 << 30, 1, 1 << 30, 1, 1 << 30, 1)
+    }
+
+    /// A NON-identity SUB fold (the two-stage TFLM Add rounding with
+    /// `left_shift = 20`) — falls back to the decomposition.
+    fn non_identity_sub_fold(operand: &'static [i8]) -> PoolInputFold<'static> {
+        test_fold(41, operand, 5, -3, 1, 20, 1_342_177_280, -18, 1 << 30, 0, 1_288_490_189, -1)
+    }
+
+    fn folded_params(fold: Option<PoolInputFold<'static>>, act: ComposedActivation) -> FoldedPoolParams<'static> {
+        FoldedPoolParams {
+            pool: test_pool_params(),
+            pool_kind: PoolKind::Average,
+            fold,
+            activation: ActivationEpilogueParams {
+                kind: act,
+                input_offset: -5,
+                output_offset: 2,
+                output_multiplier: 1_342_177_280,
+                output_shift: 1,
+                quantized_activation_min: 0,
+                quantized_activation_max: 127,
+            },
+        }
+    }
+
+    /// The T2-gate must engage the fused SIMD path ONLY for the provably-exact
+    /// subset: pool gate + identity-quant-affine MUL/SUB folds. Everything
+    /// else (non-identity folds, non-SIMD pool shapes) falls back.
+    #[test]
+    fn fused_pool_fold_simd_eligibility_gate_expectations() {
+        let operand: &'static [i8] = Box::leak(vec![0i8; 256].into_boxed_slice());
+
+        // No fold, SIMD-eligible pool → ELIGIBLE (plain pool+activation).
+        assert!(fused_pool_fold_simd_eligible(&folded_params(None, ComposedActivation::Relu)));
+
+        // Identity MUL fold → ELIGIBLE.
+        assert!(fused_pool_fold_simd_eligible(&folded_params(
+            Some(identity_mul_fold(operand)),
+            ComposedActivation::None,
+        )), "identity MUL fold must SIMD-engage");
+
+        // Identity SUB fold → ELIGIBLE.
+        assert!(fused_pool_fold_simd_eligible(&folded_params(
+            Some(identity_sub_fold(operand)),
+            ComposedActivation::None,
+        )), "identity SUB fold must SIMD-engage");
+
+        // NON-identity MUL fold (real scale change) → INELIGIBLE — not
+        // proven single-rounding-exact, falls back to the decomposition.
+        assert!(!fused_pool_fold_simd_eligible(&folded_params(
+            Some(non_identity_mul_fold(operand)),
+            ComposedActivation::None,
+        )), "non-identity MUL fold must fall back");
+
+        // NON-identity SUB fold (two-stage TFLM rounding, left_shift 20)
+        // → INELIGIBLE.
+        assert!(!fused_pool_fold_simd_eligible(&folded_params(
+            Some(non_identity_sub_fold(operand)),
+            ComposedActivation::None,
+        )), "non-identity SUB fold must fall back");
+
+        // An unsupported fold builtin → INELIGIBLE.
+        assert!(!fused_pool_fold_simd_eligible(&folded_params(
+            Some(test_fold(3, operand, 0, 0, 0, 0, 1 << 30, 0, 0, 0, 0, 0)),
+            ComposedActivation::None,
+        )), "unknown fold builtin must fall back");
+
+        // A NON-SIMD pool shape (channels 8) rejects even an identity fold.
+        let mut p = folded_params(Some(identity_mul_fold(operand)), ComposedActivation::None);
+        p.pool.input_shape = [1, 4, 4, 8];
+        p.pool.output_shape = [1, 2, 2, 8];
+        assert!(!fused_pool_fold_simd_eligible(&p), "non-%16 pool must fall back");
+    }
+
+    /// The register-held activation epilogue (the SIMD path's tail) must be
+    /// bit-exact vs `apply_activation` (the decomposition's per-op kernels)
+    /// for every absorbed activation kind.
+    #[test]
+    fn fused_pool_fold_activation_epilogue_matches_per_op_kernels() {
+        for (kind, label) in [
+            (ComposedActivation::None, "none"),
+            (ComposedActivation::Relu, "relu"),
+            (ComposedActivation::Relu6, "relu6"),
+            (ComposedActivation::HardSwish, "hard_swish"),
+        ] {
+            let a = folded_params(None, kind).activation;
+            let data: Vec<i8> = (0..64).map(|i| ((i as i64 * 29) % 251 - 125) as i8).collect();
+            let mut reg = data.clone();
+            apply_composed_activation_inplace(&a, &mut reg);
+            let mut per_op = data;
+            apply_activation(&mut S3Backend, kind, &activation_params(&a), &mut per_op)
+                .expect("per-op activation runs");
+            assert_eq!(reg, per_op, "{label}: register epilogue != per-op kernel");
+        }
+    }
+
+    /// The composed scratch need = fold staging bytes padded to the pool
+    /// SIMD kernel's 16-byte multiple (+ the pool's own need, 0).
+    #[test]
+    fn fused_pool_with_fold_scratch_need_formula() {
+        let operand: &'static [i8] = Box::leak(vec![0i8; 256].into_boxed_slice());
+        let mut p = folded_params(Some(identity_mul_fold(operand)), ComposedActivation::None);
+        assert_eq!(crate::backend::fused_pool_with_fold_scratch_need(&p), 256);
+
+        // Non-multiple-of-16 fold staging pads up: 100 → 112.
+        let mut fold = identity_mul_fold(operand);
+        fold.num_elements = 100;
+        p.fold = Some(fold);
+        assert_eq!(crate::backend::fused_pool_with_fold_scratch_need(&p), 112);
+
+        // No fold → no staging (the pool reads src in place).
+        p.fold = None;
+        assert_eq!(crate::backend::fused_pool_with_fold_scratch_need(&p), 0);
     }
 }

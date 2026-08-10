@@ -29,8 +29,8 @@
 use hematite_core::op_params::{
     ActivationEpilogueParams, ActivationParams, ComposedActivation, Conv2DParams,
     DepthwiseConv2DParams, ElementwiseChainParams, ElementwiseChainStep, ElementwiseKind,
-    ElementwiseParams, FusedConvParams, FullyConnectedParams,
-    FusedActivation, Padding, PoolParams, ResidualAddParams, SoftmaxParams,
+    ElementwiseParams, FoldedPoolParams, FusedConvParams, FullyConnectedParams,
+    FusedActivation, Padding, PoolInputFold, PoolKind, PoolParams, ResidualAddParams, SoftmaxParams,
 };
 use hematite_core::KernelError;
 
@@ -106,6 +106,10 @@ pub enum OpKind {
     /// Composed elementwise chain (T2.3) — N steps, each step's own
     /// requantize preserved, register-held between steps on the SIMD path.
     FusedElementwiseChain,
+    /// Composed pool + MUL/SUB input fold + activation epilogue (T2.4) — the
+    /// anchor pool's own shape; the fold operand is a const tensor embedded
+    /// in the params.
+    FusedPoolFold,
 }
 
 /// A documented competitor / acceptance baseline for a row.
@@ -136,6 +140,7 @@ pub enum KernelParams {
     Elementwise(&'static ElementwiseParams),
     FusedConv(&'static FusedConvParams<'static>),
     FusedChain(&'static ElementwiseChainParams<'static>),
+    FusedPool(&'static FoldedPoolParams<'static>),
 }
 
 /// A single per-kernel benchmark row.
@@ -1093,6 +1098,68 @@ const FUSED_CHAIN_4OP_PARAMS: ElementwiseChainParams<'static> = ElementwiseChain
     steps: &FUSED_CHAIN_4OP_STEPS,
 };
 
+// ── Composed pool-with-fold row (T2.4) ───────────────────────────────────────
+//
+// The `fused_pool_with_fold` composed kernel: anchor pool + absorbed MUL/SUB
+// input fold materialized into scratch + activation epilogue. The row uses an
+// IDENTITY MUL fold — zero offsets, full-range clamp, `(1<<30, 0)` output
+// pair — which is in the provably-exact subset (`fused::fold_simd_exact`), so
+// on device the fold SIMD-engages via the elementwise gates and the pool SIMD
+// reads the staged scratch directly (`fused::fused_pool_fold_simd_eligible`).
+
+/// Anchor pool for the composed pool-fold row — 2×2/stride-2/SAME, channels
+/// % 16, full-range clamp: exactly `pool::simd_eligible_pool`'s contract.
+const FUSED_POOL_ANCHOR: PoolParams = PoolParams {
+    input_shape: [1, 4, 4, 16],
+    output_shape: [1, 2, 2, 16],
+    filter_width: 2,
+    filter_height: 2,
+    stride_width: 2,
+    stride_height: 2,
+    padding: Padding::Same,
+    activation: FusedActivation::None,
+    quantized_activation_min: i8::MIN as i32,
+    quantized_activation_max: i8::MAX as i32,
+};
+
+/// Deterministic const fold operand (LCG, full int8 range) — a model constant
+/// tensor, embedded in the params const (same as the fused-conv residual).
+const FOLD_OPERAND_256: [i8; 256] = chain_operand::<256>(0xF00D_CAFE);
+
+/// Identity MUL fold (the `simd_eligible_mul` gate's contract) — in the
+/// provably-exact T2.4 subset, so this group SIMD-engages on device.
+const FUSED_POOL_MUL_FOLD: PoolInputFold<'static> = PoolInputFold {
+    builtin: 18,
+    operand_data: &FOLD_OPERAND_256,
+    operand_zero_point: 0,
+    input_zero_point: 0,
+    output_zero_point: 0,
+    folded_scale: 1.0,
+    left_shift: 0,
+    output_multiplier: 1 << 30,
+    output_shift: 0,
+    input1_multiplier: 0,
+    input1_shift: 0,
+    input2_multiplier: 0,
+    input2_shift: 0,
+    num_elements: 256,
+};
+
+const FUSED_POOL_FOLD_PARAMS: FoldedPoolParams<'static> = FoldedPoolParams {
+    pool: FUSED_POOL_ANCHOR,
+    pool_kind: PoolKind::Average,
+    fold: Some(FUSED_POOL_MUL_FOLD),
+    activation: ActivationEpilogueParams {
+        kind: ComposedActivation::Relu,
+        input_offset: -5,
+        output_offset: 2,
+        output_multiplier: 1_342_177_280,
+        output_shift: 1,
+        quantized_activation_min: 0,
+        quantized_activation_max: 127,
+    },
+};
+
 /// The full per-kernel benchmark table (order = report row order).
 pub const fn kernel_specs() -> &'static [KernelSpec] {
     &[
@@ -1414,6 +1481,14 @@ pub const fn kernel_specs() -> &'static [KernelSpec] {
             note: "Composed elementwise chain (add+relu+mul+hard_swish, non-identity scales, n=256). On device today this chain runs the decomposition (hard_swish has no SIMD yet, T3.2 — chains SIMD-engage only when EVERY step is identity-eligible). The chain-runtime < sum-of-per-op-runtimes measurement is T6.x.",
         },
         KernelSpec {
+            name: "fused_pool_s8 4x4x16 avg+mulfold+relu (T2.4)",
+            tier: MemoryTier::Sram,
+            op: OpKind::FusedPoolFold,
+            params: KernelParams::FusedPool(&FUSED_POOL_FOLD_PARAMS),
+            reference: None,
+            note: "Composed avg-pool + identity MUL input fold + ReLU epilogue (T2.4). The fold is in the provably-exact subset (zero offsets, (1<<30, 0) output pair) so on device the fold SIMD-engages via the elementwise gates and the pool SIMD reads the staged scratch directly.",
+        },
+        KernelSpec {
             name: "softmax_s8 1x1000 (SIMD)",
             tier: MemoryTier::Sram,
             op: OpKind::Softmax,
@@ -1576,6 +1651,31 @@ pub fn layout(spec: &KernelSpec) -> SpecLayout {
             output_len: p.num_elements as usize,
             transform_len: 0,
         },
+        // The composed pool-fold consumes the anchor pool's input and produces
+        // the pool output shape. The fold operand is a const tensor embedded
+        // in the params — no buffer region needed (same as the fused-conv
+        // residual and the chain operands).
+        KernelParams::FusedPool(p) => SpecLayout {
+            input_len: shape_product(&p.pool.input_shape),
+            weights_len: 0,
+            bias_len: 0,
+            output_len: shape_product(&p.pool.output_shape),
+            transform_len: 0,
+        },
+    }
+}
+
+/// Scratch bytes a spec's kernel needs at runtime (host tests allocate
+/// exactly this much). 0 for every row except the composed pool-fold, whose
+/// decomposition stages the absorbed fold into scratch
+/// (`fused_pool_with_fold_scratch_need` — the codegen `emit_fused_pool_fold`
+/// value).
+pub fn spec_scratch_need(spec: &KernelSpec) -> usize {
+    match &spec.params {
+        KernelParams::FusedPool(p) => {
+            hematite_s3::backend::fused_pool_with_fold_scratch_need(p)
+        }
+        _ => 0,
     }
 }
 
@@ -1798,6 +1898,13 @@ pub fn run_kernel(spec: &KernelSpec, bufs: &mut SpecBufs<'_>, scratch: &mut [u8]
                 &mut backend, bufs.input, p, bufs.output,
             )
         }
+        OpKind::FusedPoolFold => {
+            let p = params_fused_pool(spec);
+            let mut backend = hematite_s3::backend::S3Backend;
+            hematite_core::FusedKernelBackend::fused_pool_with_fold(
+                &mut backend, bufs.input, p, bufs.output, scratch,
+            )
+        }
     }
 }
 
@@ -1991,6 +2098,16 @@ fn run_kernel_scalar(
                 &mut backend, bufs.input, p, bufs.output,
             )
         }
+        OpKind::FusedPoolFold => {
+            let p = match spec.params {
+                KernelParams::FusedPool(p) => p,
+                _ => return Err(KernelError::Unsupported),
+            };
+            let mut backend = hematite_s3::backend::S3Backend;
+            hematite_core::FusedKernelBackend::fused_pool_with_fold(
+                &mut backend, bufs.input, p, bufs.output, scratch,
+            )
+        }
     }
 }
 
@@ -2074,6 +2191,13 @@ pub fn prepare_kernel(spec: &KernelSpec) -> Result<PreparedKernel, KernelError> 
             KernelParams::FusedChain(_) => Ok(PreparedKernel::Scalar),
             _ => Err(KernelError::Unsupported),
         },
+        // The fused pool-fold has no prepared handle either: `fused_pool_with_fold`
+        // internally dispatches the fold elementwise SIMD + the pool SIMD (via
+        // S3Backend), so the Scalar slot runs the public trait method.
+        OpKind::FusedPoolFold => match spec.params {
+            KernelParams::FusedPool(_) => Ok(PreparedKernel::Scalar),
+            _ => Err(KernelError::Unsupported),
+        },
         OpKind::Softmax => Ok(PreparedKernel::Scalar),
     }
 }
@@ -2143,6 +2267,14 @@ fn params_fused_chain(spec: &KernelSpec) -> &'static ElementwiseChainParams<'sta
     }
 }
 
+#[cfg(target_arch = "xtensa")]
+fn params_fused_pool(spec: &KernelSpec) -> &'static FoldedPoolParams<'static> {
+    match spec.params {
+        KernelParams::FusedPool(p) => p,
+        _ => panic!("spec.op fused_pool_with_fold requires KernelParams::FusedPool"),
+    }
+}
+
 /// Dispatch a spec through the matching `hematite-ref` scalar kernel — the
 /// column-1 baseline, measured on device (never a pre-filled number).
 #[cfg(target_arch = "xtensa")]
@@ -2208,6 +2340,13 @@ pub fn run_ref_kernel(
             let mut backend = hematite_ref::RefBackend;
             hematite_core::FusedKernelBackend::fused_elementwise_chain(
                 &mut backend, bufs.input, p, bufs.output,
+            )
+        }
+        OpKind::FusedPoolFold => {
+            let p = params_fused_pool(spec);
+            let mut backend = hematite_ref::RefBackend;
+            hematite_core::FusedKernelBackend::fused_pool_with_fold(
+                &mut backend, bufs.input, p, bufs.output, scratch,
             )
         }
     }
@@ -2318,6 +2457,16 @@ mod tests {
                     &mut backend, bufs.input, p, bufs.output,
                 )
             }
+            OpKind::FusedPoolFold => {
+                let p = match spec.params {
+                    KernelParams::FusedPool(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                let mut backend = hematite_s3::backend::S3Backend;
+                hematite_core::FusedKernelBackend::fused_pool_with_fold(
+                    &mut backend, bufs.input, p, bufs.output, scratch,
+                )
+            }
         };
         let out_after = bufs.output.to_vec();
         bufs.output.copy_from_slice(&out);
@@ -2422,6 +2571,16 @@ mod tests {
                     &mut backend, bufs.input, p, bufs.output,
                 )
             }
+            OpKind::FusedPoolFold => {
+                let p = match spec.params {
+                    KernelParams::FusedPool(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                let mut backend = hematite_ref::RefBackend;
+                hematite_core::FusedKernelBackend::fused_pool_with_fold(
+                    &mut backend, bufs.input, p, bufs.output, scratch,
+                )
+            }
         };
         let out_after = bufs.output.to_vec();
         bufs.output.copy_from_slice(&out);
@@ -2446,7 +2605,7 @@ mod tests {
             let mut bias = vec![0i32; lay.bias_len];
             let mut output = vec![0i8; lay.output_len];
             let mut transformed = vec![0i8; lay.transform_len];
-            let mut scratch = vec![0u8; 0];
+            let mut scratch = vec![0u8; spec_scratch_need(spec)];
             {
                 let mut bufs = SpecBufs {
                     input: &mut input,
@@ -2479,7 +2638,7 @@ mod tests {
             let mut bias = vec![0i32; lay.bias_len];
             let mut output = vec![0i8; lay.output_len];
             let mut transformed = vec![0i8; lay.transform_len];
-            let mut scratch = vec![0u8; 0];
+            let mut scratch = vec![0u8; spec_scratch_need(spec)];
             {
                 let mut bufs = SpecBufs {
                     input: &mut input,
@@ -2526,7 +2685,7 @@ mod tests {
             let mut bias = vec![0i32; lay.bias_len];
             let mut output = vec![0i8; lay.output_len];
             let mut transformed = vec![0i8; lay.transform_len];
-            let mut scratch = vec![0u8; 0];
+            let mut scratch = vec![0u8; spec_scratch_need(spec)];
             {
                 let mut bufs = SpecBufs {
                     input: &mut input,
@@ -2789,7 +2948,7 @@ mod tests {
             let lay = layout(spec);
             let mut bufs = carve_into(&mut arena, &lay).expect("arena must hold every spec");
             fill_pattern(&mut bufs);
-            let mut scratch = [0u8; 0];
+            let mut scratch = vec![0u8; spec_scratch_need(spec)];
             assert!(
                 run_s3(spec, &mut bufs, &mut scratch).is_ok(),
                 "{}: carved buffers rejected by s3 kernel",

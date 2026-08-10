@@ -46,7 +46,7 @@
 
 use hematite_core::op_params::{
     ActivationParams, ConcatParams, Conv2DParams, DepthwiseConv2DParams,
-    ElementwiseChainParams, ElementwiseParams, FusedConvParams, FullyConnectedParams, GruParams,
+    ElementwiseChainParams, ElementwiseParams, FoldedPoolParams, FusedConvParams, FullyConnectedParams, GruParams,
     LstmParams, MatMulParams, PadParams, PoolParams, QuantParam, ReduceParams,
     ReshapeParams, ResizeNearestParams, SliceParams, SoftmaxParams,
     SplitParams, SvdfParams, TransposeParams,
@@ -233,6 +233,27 @@ pub fn fused_conv2d_scratch_need(params: &FusedConvParams<'_>) -> usize {
 #[inline(always)]
 pub fn fused_elementwise_chain_scratch_need(_params: &ElementwiseChainParams<'_>) -> usize {
     0
+}
+
+/// Scratch bytes needed by the composed `fused_pool_with_fold` (T2.4): the
+/// fold staging region — the fold output tensor bytes (`num_elements`, the
+/// fold input = pool input flat count) padded up to the pool SIMD kernel's
+/// 16-byte multiple — plus the pool's own scratch need (0: the s3 pool
+/// kernels ignore scratch). No fold → 0 (the pool reads `src` in place).
+///
+/// The decomposition (hematite-ref/src/fused.rs) materializes the absorbed
+/// fold into exactly `num_elements` scratch bytes and the pool then needs 0
+/// more; the `pad16` gives the TIE728 `*_22c1` input-pointer alignment head
+/// room so a 16-aligned scratch base keeps the staged fold SIMD-readable.
+///
+/// Kept in sync with `fused_pool_fold_scratch_need_codegen`
+/// (hematite-codegen/src/generate.rs) — the T1.4 parity invariant.
+#[inline(always)]
+pub fn fused_pool_with_fold_scratch_need(params: &FoldedPoolParams<'_>) -> usize {
+    match &params.fold {
+        Some(fold) => pad16(fold.num_elements.max(0) as usize),
+        None => 0,
+    }
 }
 
 impl KernelBackend for S3Backend {

@@ -91,8 +91,9 @@
 use hematite_core::op_params::{
     ActivationEpilogueParams, ActivationParams, ComposedActivation, Conv2DParams,
     DepthwiseConv2DParams, ElementwiseChainParams, ElementwiseChainStep, ElementwiseKind,
-    ElementwiseParams, FusedConvParams, FullyConnectedParams,
-    FusedActivation, Padding, PoolParams, ReduceParams, ResidualAddParams, SoftmaxParams,
+    ElementwiseParams, FoldedPoolParams, FusedConvParams, FullyConnectedParams,
+    FusedActivation, Padding, PoolInputFold, PoolKind, PoolParams, ReduceParams,
+    ResidualAddParams, SoftmaxParams,
 };
 use hematite_core::FusedKernelBackend;
 
@@ -1014,6 +1015,83 @@ fn check_fused_chain_simd_matches_ref() {
     report(&compare("fused_chain_add_relu_256", got, want));
 }
 
+// ── Fused pool-with-fold (T2.4): avg-pool + MUL fold + relu epilogue ─────────
+
+fn check_fused_pool_fold_simd_matches_ref() {
+    // Buffers carved from the SRAM bench arena — NOT stack locals (same as
+    // the other fused checks). The fold is IDENTITY-eligible (zero offsets,
+    // `(1<<30, 0)` output pair — `fused::fold_simd_exact`) and the pool is
+    // SIMD-eligible (2×2/stride-2, channels % 16, full-range clamp), so the
+    // composed SIMD path ENGAGES on device: the fold SIMD-engages via the
+    // elementwise gates into the staged scratch and the pool SIMD reads it
+    // directly (16-aligned arena carve).
+    const IN: usize = 4 * 4 * 16;
+    const OUT: usize = 2 * 2 * 16;
+    let mut off = 0;
+    let input = arena_carve_i8(&mut off, IN);
+    let operand = arena_carve_i8(&mut off, IN);
+    let want = arena_carve_i8(&mut off, OUT);
+    let got = arena_carve_i8(&mut off, OUT);
+    let scratch = arena_carve(&mut off, 256);
+    fill_pattern_slice(0xC0FF_EE11, input);
+    fill_pattern_slice(0xABAD_1DEA, operand);
+    want.fill(0);
+    got.fill(0);
+    scratch.fill(0);
+
+    let params = FoldedPoolParams {
+        pool: PoolParams {
+            input_shape: [1, 4, 4, 16],
+            output_shape: [1, 2, 2, 16],
+            filter_width: 2,
+            filter_height: 2,
+            stride_width: 2,
+            stride_height: 2,
+            padding: Padding::Same,
+            activation: FusedActivation::None,
+            quantized_activation_min: i8::MIN as i32,
+            quantized_activation_max: i8::MAX as i32,
+        },
+        pool_kind: PoolKind::Average,
+        fold: Some(PoolInputFold {
+            builtin: 18,
+            operand_data: operand,
+            operand_zero_point: 0,
+            input_zero_point: 0,
+            output_zero_point: 0,
+            folded_scale: 1.0,
+            left_shift: 0,
+            output_multiplier: 1 << 30,
+            output_shift: 0,
+            input1_multiplier: 0,
+            input1_shift: 0,
+            input2_multiplier: 0,
+            input2_shift: 0,
+            num_elements: 256,
+        }),
+        activation: ActivationEpilogueParams {
+            kind: ComposedActivation::Relu,
+            input_offset: -5,
+            output_offset: 2,
+            output_multiplier: 1_342_177_280,
+            output_shift: 1,
+            quantized_activation_min: 0,
+            quantized_activation_max: 127,
+        },
+    };
+
+    let mut ref_backend = hematite_ref::RefBackend;
+    ref_backend
+        .fused_pool_with_fold(input, &params, want, scratch)
+        .expect("harness: ref fused pool-fold shape");
+    let mut s3_backend = hematite_s3::backend::S3Backend;
+    s3_backend
+        .fused_pool_with_fold(input, &params, got, scratch)
+        .expect("harness: s3 fused pool-fold shape");
+
+    report(&compare("fused_pool_avg_mulfold_relu", got, want));
+}
+
 fn check_fc_small_simd_matches_ref() {
     let shapes: [((usize, usize, i32), &'static str); 7] = [
         ((1, 1, 0), "fc_small_1x1"),      // sine-family
@@ -1111,5 +1189,6 @@ pub fn validate_all() {
     check_mean_simd_matches_ref();
     check_fused_conv2d_simd_matches_ref();
     check_fused_chain_simd_matches_ref();
+    check_fused_pool_fold_simd_matches_ref();
     crate::firmware::uart0_log!("=== SIMD CORRECTNESS DONE ===");
 }
