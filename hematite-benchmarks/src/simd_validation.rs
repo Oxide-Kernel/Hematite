@@ -190,6 +190,39 @@ struct Aligned<const N: usize>([i8; N]);
 #[repr(align(16))]
 struct AlignedBytes<const N: usize>([u8; N]);
 
+/// Carve `len` bytes from the SRAM bench arena at `*off`, advancing `*off`.
+///
+/// The conv/softmax/depthwise/fc checks' buffers live here — NOT on the
+/// stack. With all 18 checks inlined, validate_all's frame pushes SP into
+/// the arena's top bytes; a stack-local buffer whose slot straddles the
+/// arena end writes pattern bytes past it into bss, clobbering the defmt
+/// `RTT_ENCODER.taken` flag ("defmt logger taken reentrantly" — task-8/18
+/// device findings). The arena is unused during validation (the kernel
+/// benches carve it afterwards).
+///
+/// SAFETY: single-threaded firmware; each check carves once, sequentially.
+/// The base is 16-aligned; callers whose kernels require 16-aligned inputs
+/// must keep `*off` at a multiple of 16 (all check carve sizes are).
+fn arena_carve(off: &mut usize, len: usize) -> &'static mut [u8] {
+    // SAFETY: single-threaded firmware; sequential check execution; the
+    // returned slice aliases arena memory only for the current check's
+    // lifetime, matching the accepted conv3x3 carve pattern.
+    unsafe {
+        let arena = &mut *core::ptr::addr_of_mut!(crate::firmware::SRAM_ARENA);
+        let p = arena.0.as_mut_ptr().add(*off);
+        *off += len;
+        core::slice::from_raw_parts_mut(p, len)
+    }
+}
+
+/// i8 variant of [`arena_carve`] — kernels take `&mut [i8]` tensors.
+fn arena_carve_i8(off: &mut usize, len: usize) -> &'static mut [i8] {
+    // SAFETY: same contract as `arena_carve`; the carve base is 16-aligned
+    // and every check carve size is a multiple of 16, so the i8 re-interpret
+    // is alignment-preserving.
+    unsafe { core::slice::from_raw_parts_mut(arena_carve(off, len).as_mut_ptr().cast(), len) }
+}
+
 /// Deterministic per-channel bias fill (non-zero, small enough to keep the
 /// i32 accumulators far from overflow; identical inputs for both kernels).
 const fn bias_pattern<const N: usize>() -> [i32; N] {
@@ -366,10 +399,21 @@ fn check_relu_simd_matches_ref() {
 // ── Softmax: 1x1000 (spec.rs SOFTMAX_1X1000_PARAMS) ─────────────────────────
 
 fn check_softmax_simd_matches_ref() {
-    let input = Aligned(make_pattern::<1000>(0x50F7_4A11));
-    let mut want = Aligned([0i8; 1000]);
-    let mut got = Aligned([0i8; 1000]);
-    let mut scratch = AlignedBytes([0u8; 4000]);
+    // Buffers carved from the SRAM bench arena (unused during validation) —
+    // NOT stack locals: with all 18 checks inlined, validate_all's frame
+    // pushes SP into the arena's top bytes and a stack-local buffer whose
+    // slot straddles the arena end writes pattern bytes past it into the bss
+    // region where the defmt RTT_ENCODER.taken flag lives (device finding,
+    // task 18 — the same fix class as the conv3x3 carve in task 8).
+    let mut off = 0;
+    let input = arena_carve_i8(&mut off, 1000);
+    let want = arena_carve_i8(&mut off, 1000);
+    let got = arena_carve_i8(&mut off, 1000);
+    let scratch = arena_carve(&mut off, 4000);
+    input.copy_from_slice(&make_pattern::<1000>(0x50F7_4A11));
+    want.fill(0);
+    got.fill(0);
+    scratch.fill(0);
     let params = SoftmaxParams {
         num_rows: 1,
         row_size: 1000,
@@ -382,12 +426,12 @@ fn check_softmax_simd_matches_ref() {
         quantized_activation_max: 127,
     };
 
-    hematite_ref::softmax::softmax(&input.0, &params, &mut want.0, &mut scratch.0)
+    hematite_ref::softmax::softmax(input, &params, want, scratch)
         .expect("harness: ref softmax shape");
-    hematite_s3::softmax::softmax(&input.0, &params, &mut got.0, &mut scratch.0)
+    hematite_s3::softmax::softmax(input, &params, got, scratch)
         .expect("harness: s3 softmax shape");
 
-    report(&compare("softmax_1x1000", &got.0, &want.0));
+    report(&compare("softmax_1x1000", got, want));
 }
 
 // ── Depthwise: 12x12x16 stride-2 SAME (spec.rs SIMD_DEPTHWISE_S2_SAME_PARAMS) ─
@@ -397,12 +441,20 @@ const DEPTHWISE_W: usize = 1 * 3 * 3 * 16;
 const DEPTHWISE_OUT: usize = 6 * 6 * 16;
 
 fn check_depthwise_simd_matches_ref() {
-    let input = Aligned(make_pattern::<DEPTHWISE_IN>(0xD3A7_51E5));
-    let weights = Aligned(make_pattern::<DEPTHWISE_W>(0xBEE5_7EED));
+    // Buffers carved from the SRAM bench arena — NOT stack locals (see
+    // `arena_carve` for the task-18 OOB device finding).
+    let mut off = 0;
+    let input = arena_carve_i8(&mut off, DEPTHWISE_IN);
+    let weights = arena_carve_i8(&mut off, DEPTHWISE_W);
+    let want = arena_carve_i8(&mut off, DEPTHWISE_OUT);
+    let got = arena_carve_i8(&mut off, DEPTHWISE_OUT);
+    let scratch = arena_carve(&mut off, 4096);
+    input.copy_from_slice(&make_pattern::<DEPTHWISE_IN>(0xD3A7_51E5));
+    weights.copy_from_slice(&make_pattern::<DEPTHWISE_W>(0xBEE5_7EED));
     let bias = bias_pattern::<16>();
-    let mut want = Aligned([0i8; DEPTHWISE_OUT]);
-    let mut got = Aligned([0i8; DEPTHWISE_OUT]);
-    let mut scratch = AlignedBytes([0u8; 4096]);
+    want.fill(0);
+    got.fill(0);
+    scratch.fill(0);
     let params = DepthwiseConv2DParams {
         input_shape: [1, 12, 12, 16],
         filter_shape: [1, 3, 3, 16],
@@ -423,25 +475,25 @@ fn check_depthwise_simd_matches_ref() {
     };
 
     hematite_ref::depthwise_conv::depthwise_conv2d(
-        &input.0,
-        &weights.0,
+        input,
+        weights,
         &bias,
         &params,
-        &mut want.0,
-        &mut scratch.0,
+        want,
+        scratch,
     )
     .expect("harness: ref depthwise shape");
     hematite_s3::depthwise::depthwise_conv2d(
-        &input.0,
-        &weights.0,
+        input,
+        weights,
         &bias,
         &params,
-        &mut got.0,
-        &mut scratch.0,
+        got,
+        scratch,
     )
     .expect("harness: s3 depthwise shape");
 
-    report(&compare("depthwise_12x12x16_s2", &got.0, &want.0));
+    report(&compare("depthwise_12x12x16_s2", got, want));
 }
 
 // ── Conv 1x1: 64x1x1x64 (spec.rs EMBER_CONV_1X1_64_PARAMS) ─────────────────
@@ -451,12 +503,20 @@ const CONV1X1_W: usize = 64 * 1 * 1 * 64;
 const CONV1X1_OUT: usize = 1 * 1 * 64;
 
 fn check_conv1x1_simd_matches_ref() {
-    let input = Aligned(make_pattern::<CONV1X1_IN>(0xC0FF_EE11));
-    let weights = Aligned(make_pattern::<CONV1X1_W>(0x1CE5_51CE));
+    // Buffers carved from the SRAM bench arena — NOT stack locals (see
+    // `arena_carve` for the task-18 OOB device finding).
+    let mut off = 0;
+    let input = arena_carve_i8(&mut off, CONV1X1_IN);
+    let weights = arena_carve_i8(&mut off, CONV1X1_W);
+    let want = arena_carve_i8(&mut off, CONV1X1_OUT);
+    let got = arena_carve_i8(&mut off, CONV1X1_OUT);
+    let scratch = arena_carve(&mut off, 512);
+    input.copy_from_slice(&make_pattern::<CONV1X1_IN>(0xC0FF_EE11));
+    weights.copy_from_slice(&make_pattern::<CONV1X1_W>(0x1CE5_51CE));
     let bias = bias_pattern::<64>();
-    let mut want = Aligned([0i8; CONV1X1_OUT]);
-    let mut got = Aligned([0i8; CONV1X1_OUT]);
-    let mut scratch = AlignedBytes([0u8; 512]);
+    want.fill(0);
+    got.fill(0);
+    scratch.fill(0);
     let params = Conv2DParams {
         input_shape: [1, 1, 1, 64],
         filter_shape: [64, 1, 1, 64],
@@ -475,26 +535,12 @@ fn check_conv1x1_simd_matches_ref() {
         quantized_activation_max: 127,
     };
 
-    hematite_ref::conv::conv2d(
-        &input.0,
-        &weights.0,
-        &bias,
-        &params,
-        &mut want.0,
-        &mut scratch.0,
-    )
-    .expect("harness: ref conv1x1 shape");
-    hematite_s3::conv1x1::conv2d_1x1(
-        &input.0,
-        &weights.0,
-        &bias,
-        &params,
-        &mut got.0,
-        &mut scratch.0,
-    )
-    .expect("harness: s3 conv1x1 shape");
+    hematite_ref::conv::conv2d(input, weights, &bias, &params, want, scratch)
+        .expect("harness: ref conv1x1 shape");
+    hematite_s3::conv1x1::conv2d_1x1(input, weights, &bias, &params, got, scratch)
+        .expect("harness: s3 conv1x1 shape");
 
-    report(&compare("conv1x1_64x1x1x64", &got.0, &want.0));
+    report(&compare("conv1x1_64x1x1x64", got, want));
 }
 
 // ── Conv 3x3: 16x16x32 SAME (spec.rs SIMD_CONV3X3_SAME_PARAMS) ─────────────
@@ -580,12 +626,20 @@ fn check_conv3x3_simd_matches_ref() {
 const FC_W: usize = 64 * 256;
 
 fn check_fc_simd_matches_ref() {
-    let input = Aligned(make_pattern::<256>(0xFAC1_5ED7));
-    let weights = Aligned(make_pattern::<FC_W>(0xD07_5C0DE));
+    // Buffers carved from the SRAM bench arena — NOT stack locals (see
+    // `arena_carve` for the task-18 OOB device finding).
+    let mut off = 0;
+    let input = arena_carve_i8(&mut off, 256);
+    let weights = arena_carve_i8(&mut off, FC_W);
+    let want = arena_carve_i8(&mut off, 64);
+    let got = arena_carve_i8(&mut off, 64);
+    let scratch = arena_carve(&mut off, 512);
+    input.copy_from_slice(&make_pattern::<256>(0xFAC1_5ED7));
+    weights.copy_from_slice(&make_pattern::<FC_W>(0xD07_5C0DE));
     let bias = bias_pattern::<64>();
-    let mut want = Aligned([0i8; 64]);
-    let mut got = Aligned([0i8; 64]);
-    let mut scratch = AlignedBytes([0u8; 512]);
+    want.fill(0);
+    got.fill(0);
+    scratch.fill(0);
     let params = FullyConnectedParams {
         input_dim: 256,
         output_dim: 64,
@@ -599,25 +653,18 @@ fn check_fc_simd_matches_ref() {
     };
 
     hematite_ref::fully_connected::fully_connected(
-        &input.0,
-        &weights.0,
+        input,
+        weights,
         &bias,
         &params,
-        &mut want.0,
-        &mut scratch.0,
+        want,
+        scratch,
     )
     .expect("harness: ref fc shape");
-    hematite_s3::gemm::fully_connected(
-        &input.0,
-        &weights.0,
-        &bias,
-        &params,
-        &mut got.0,
-        &mut scratch.0,
-    )
-    .expect("harness: s3 fc shape");
+    hematite_s3::gemm::fully_connected(input, weights, &bias, &params, got, scratch)
+        .expect("harness: s3 fc shape");
 
-    report(&compare("fc_256x64", &got.0, &want.0));
+    report(&compare("fc_256x64", got, want));
 }
 
 // ── Mean: [1,2,2,4] over H,W axes → [1,1,1,4] ──────────────────────────────
@@ -650,6 +697,12 @@ fn check_mean_simd_matches_ref() {
     hematite_s3::reductions::mean(&input.0, &params, &mut got.0)
         .expect("harness: s3 mean shape");
 
+    let simd = if hematite_s3::reductions::mean_took_simd() {
+        "SIMD"
+    } else {
+        "scalar"
+    };
+    crate::firmware::uart0_log!("simd mean path: {}", simd);
     report(&compare("mean_hw_2x2x4", &got.0, &want.0));
 }
 
