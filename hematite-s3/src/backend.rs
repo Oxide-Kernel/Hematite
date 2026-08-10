@@ -46,8 +46,8 @@
 
 use hematite_core::op_params::{
     ActivationParams, ConcatParams, Conv2DParams, DepthwiseConv2DParams,
-    ElementwiseParams, FusedConvParams, FullyConnectedParams, GruParams, LstmParams,
-    MatMulParams, PadParams, PoolParams, QuantParam, ReduceParams,
+    ElementwiseChainParams, ElementwiseParams, FusedConvParams, FullyConnectedParams, GruParams,
+    LstmParams, MatMulParams, PadParams, PoolParams, QuantParam, ReduceParams,
     ReshapeParams, ResizeNearestParams, SliceParams, SoftmaxParams,
     SplitParams, SvdfParams, TransposeParams,
 };
@@ -215,6 +215,24 @@ fn depthwise_scratch_need(params: &DepthwiseConv2DParams) -> usize {
 #[inline(always)]
 pub fn fused_conv2d_scratch_need(params: &FusedConvParams<'_>) -> usize {
     S3Backend::conv2d_scratch_size(&params.conv)
+}
+
+/// Scratch bytes needed by the composed `fused_elementwise_chain` SIMD path
+/// (T2.3): **ZERO**.
+///
+/// The fused chain keeps the running value in i32 register lanes between
+/// steps (never materialized) and reads the step operands (model constant
+/// tensors) in place — nothing is staged. The decomposition forwards no
+/// scratch either (the per-op elementwise/activation kernels take
+/// `&mut []`), so `0 == 0` is the parity invariant asserted by
+/// `tests/fused_chain_golden.rs::fused_elementwise_chain_needs_no_scratch`.
+///
+/// No codegen mirror exists because the codegen chain emitter already reports
+/// the literal `0` (`emit_fused_chain` → `scratch: 0`), so the mirror would
+/// be `0 == 0` by construction.
+#[inline(always)]
+pub fn fused_elementwise_chain_scratch_need(_params: &ElementwiseChainParams<'_>) -> usize {
+    0
 }
 
 impl KernelBackend for S3Backend {

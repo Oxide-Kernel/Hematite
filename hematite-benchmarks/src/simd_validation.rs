@@ -90,7 +90,8 @@
 
 use hematite_core::op_params::{
     ActivationEpilogueParams, ActivationParams, ComposedActivation, Conv2DParams,
-    DepthwiseConv2DParams, ElementwiseParams, FusedConvParams, FullyConnectedParams,
+    DepthwiseConv2DParams, ElementwiseChainParams, ElementwiseChainStep, ElementwiseKind,
+    ElementwiseParams, FusedConvParams, FullyConnectedParams,
     FusedActivation, Padding, PoolParams, ReduceParams, ResidualAddParams, SoftmaxParams,
 };
 use hematite_core::FusedKernelBackend;
@@ -940,6 +941,79 @@ fn check_fused_conv2d_simd_matches_ref() {
     report(&compare("fused_conv1x1_residual_relu", got, want));
 }
 
+// ── Fused elementwise chain (T2.3): add + relu, register-held SIMD ───────────
+
+fn check_fused_chain_simd_matches_ref() {
+    // Buffers carved from the SRAM bench arena — NOT stack locals (see
+    // `arena_carve` for the task-18 OOB device finding). The chain is
+    // IDENTITY-eligible (zero offsets, identity quant pairs) so the fused
+    // chain SIMD path ENGAGES on device; the operand is 16-aligned so the
+    // operand-chunk loads satisfy the alignment gate.
+    let mut off = 0;
+    let input = arena_carve_i8(&mut off, 256);
+    let operand = arena_carve_i8(&mut off, 256);
+    let want = arena_carve_i8(&mut off, 256);
+    let got = arena_carve_i8(&mut off, 256);
+    fill_pattern_slice(0xC0FF_EE11, input);
+    fill_pattern_slice(0xABAD_1DEA, operand);
+    want.fill(0);
+    got.fill(0);
+
+    // Step 0: identity ADD (src + operand, saturating i8) — the
+    // `simd_eligible_add_sub` gate's exact contract. Step 1: identity ReLU —
+    // the `relu_simd_eligible_params` gate's exact contract. Every step is
+    // SIMD-eligible, so the register-held chain path engages on device.
+    let steps: [ElementwiseChainStep<'_>; 2] = [
+        ElementwiseChainStep {
+            kind: ElementwiseKind::Add,
+            operand: Some(operand),
+            input1_offset: 0,
+            input2_offset: 0,
+            output_offset: 0,
+            output_multiplier: 1 << 30,
+            output_shift: 1,
+            left_shift: 0,
+            input1_multiplier: 1 << 30,
+            input1_shift: 1,
+            input2_multiplier: 1 << 30,
+            input2_shift: 1,
+            quantized_activation_min: i8::MIN as i32,
+            quantized_activation_max: i8::MAX as i32,
+        },
+        ElementwiseChainStep {
+            kind: ElementwiseKind::Relu,
+            operand: None,
+            input1_offset: 0,
+            input2_offset: 0,
+            output_offset: 0,
+            output_multiplier: 1 << 30,
+            output_shift: 1,
+            left_shift: 0,
+            input1_multiplier: 0,
+            input1_shift: 0,
+            input2_multiplier: 0,
+            input2_shift: 0,
+            quantized_activation_min: 0,
+            quantized_activation_max: 127,
+        },
+    ];
+    let params = ElementwiseChainParams {
+        num_elements: 256,
+        steps: &steps,
+    };
+
+    let mut ref_backend = hematite_ref::RefBackend;
+    ref_backend
+        .fused_elementwise_chain(input, &params, want)
+        .expect("harness: ref fused chain shape");
+    let mut s3_backend = hematite_s3::backend::S3Backend;
+    s3_backend
+        .fused_elementwise_chain(input, &params, got)
+        .expect("harness: s3 fused chain shape");
+
+    report(&compare("fused_chain_add_relu_256", got, want));
+}
+
 fn check_fc_small_simd_matches_ref() {
     let shapes: [((usize, usize, i32), &'static str); 7] = [
         ((1, 1, 0), "fc_small_1x1"),      // sine-family
@@ -1012,7 +1086,7 @@ fn check_fc_small_simd_matches_ref() {
 /// or a fixed QEMU build.
 pub fn validate_all() {
     crate::firmware::uart0_log!(
-        "=== SIMD CORRECTNESS (elementwise + pool + relu/softmax/depthwise/conv/fc/mean, vs hematite-ref) ==="
+        "=== SIMD CORRECTNESS (elementwise + pool + relu/softmax/depthwise/conv/fc/mean/fused, vs hematite-ref) ==="
     );
     run_elementwise_check::<16>(ElemOp::Add, "add_n16");
     run_elementwise_check::<32>(ElemOp::Add, "add_n32");
@@ -1036,5 +1110,6 @@ pub fn validate_all() {
     check_fc_small_simd_matches_ref();
     check_mean_simd_matches_ref();
     check_fused_conv2d_simd_matches_ref();
+    check_fused_chain_simd_matches_ref();
     crate::firmware::uart0_log!("=== SIMD CORRECTNESS DONE ===");
 }

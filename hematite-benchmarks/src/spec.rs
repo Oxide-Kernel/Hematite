@@ -28,7 +28,8 @@
 
 use hematite_core::op_params::{
     ActivationEpilogueParams, ActivationParams, ComposedActivation, Conv2DParams,
-    DepthwiseConv2DParams, ElementwiseParams, FusedConvParams, FullyConnectedParams,
+    DepthwiseConv2DParams, ElementwiseChainParams, ElementwiseChainStep, ElementwiseKind,
+    ElementwiseParams, FusedConvParams, FullyConnectedParams,
     FusedActivation, Padding, PoolParams, ResidualAddParams, SoftmaxParams,
 };
 use hematite_core::KernelError;
@@ -102,6 +103,9 @@ pub enum OpKind {
     /// Composed CONV_2D + residual-ADD + activation epilogue (T2.2) — the
     /// anchor conv's own shape; the epilogue reads the residual const tensor.
     FusedConv2d,
+    /// Composed elementwise chain (T2.3) — N steps, each step's own
+    /// requantize preserved, register-held between steps on the SIMD path.
+    FusedElementwiseChain,
 }
 
 /// A documented competitor / acceptance baseline for a row.
@@ -131,6 +135,7 @@ pub enum KernelParams {
     Activation(&'static ActivationParams<'static>),
     Elementwise(&'static ElementwiseParams),
     FusedConv(&'static FusedConvParams<'static>),
+    FusedChain(&'static ElementwiseChainParams<'static>),
 }
 
 /// A single per-kernel benchmark row.
@@ -979,6 +984,115 @@ const FUSED_CONV3X3_RESIDUAL_HSWISH_PARAMS: FusedConvParams<'static> = FusedConv
     },
 };
 
+// ── Composed fused elementwise-chain row (T2.3) ──────────────────────────────
+//
+// The `fused_elementwise_chain` composed kernel: N elementwise steps, each
+// step's own requantize preserved (steps are NEVER collapsed). Quant pairs
+// are scale-derived exactly as the T1.2 emitter derives them (StepRequantize):
+// add/sub use the two-stage TFLM Add rounding (left_shift 20, input_i =
+// QuantizeMultiplier(s_i/twice_max), output =
+// QuantizeMultiplier(twice_max/(2^20·s_out))); mul uses the single product
+// requantize QuantizeMultiplier(s_in1·s_in2/s_out); activations use their
+// output ratio. Every scale here is non-identity, so the chain's per-step
+// roundings are exercised. On device TODAY this row runs the decomposition
+// (the hard_swish step has no SIMD yet, T3.2 — chains SIMD-engage only when
+// EVERY step is identity-eligible, see `fused::chain_simd_eligible`); the
+// chain-runtime < sum-of-per-op-runtimes measurement is T6.x.
+
+/// Deterministic const chain operand pattern (LCG, full int8 range) — model
+/// constant tensors, embedded in the params const (same as the fused-conv
+/// residual).
+const fn chain_operand<const N: usize>(seed: u64) -> [i8; N] {
+    let mut out = [0i8; N];
+    let mut x = seed;
+    let mut i = 0;
+    while i < N {
+        x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        out[i] = (x >> 33) as i8;
+        i += 1;
+    }
+    out
+}
+
+const CHAIN_OPERAND_A: [i8; 256] = chain_operand::<256>(0x0BAD_F00D);
+const CHAIN_OPERAND_B: [i8; 256] = chain_operand::<256>(0xDEAD_BEEF);
+
+/// The plan's canonical 4-op chain: add + relu + mul + hard_swish over 256
+/// elements, every step with NON-identity scales/offsets (add: input1
+/// 0.5/input2 0.3/output 0.4, zps 5/-3/1; relu: 0.4→0.2, zp 1→2; mul:
+/// 0.2·0.05→0.1, zps -2/0→-3; hard_swish: 0.1→0.03, zp 3→1).
+const FUSED_CHAIN_4OP_STEPS: [ElementwiseChainStep<'static>; 4] = [
+    ElementwiseChainStep {
+        kind: ElementwiseKind::Add,
+        operand: Some(&CHAIN_OPERAND_A),
+        input1_offset: -5,
+        input2_offset: 3,
+        output_offset: 1,
+        output_multiplier: 1_342_177_280,
+        output_shift: -18,
+        left_shift: 20,
+        input1_multiplier: 1 << 30,
+        input1_shift: 0,
+        input2_multiplier: 1_288_490_189,
+        input2_shift: -1,
+        quantized_activation_min: i8::MIN as i32,
+        quantized_activation_max: i8::MAX as i32,
+    },
+    ElementwiseChainStep {
+        kind: ElementwiseKind::Relu,
+        operand: None,
+        input1_offset: -1,
+        input2_offset: 0,
+        output_offset: 2,
+        output_multiplier: 1_073_741_824,
+        output_shift: 2,
+        left_shift: 0,
+        input1_multiplier: 0,
+        input1_shift: 0,
+        input2_multiplier: 0,
+        input2_shift: 0,
+        quantized_activation_min: 0,
+        quantized_activation_max: 127,
+    },
+    ElementwiseChainStep {
+        kind: ElementwiseKind::Mul,
+        operand: Some(&CHAIN_OPERAND_B),
+        input1_offset: 2,
+        input2_offset: 0,
+        output_offset: -3,
+        output_multiplier: 1_717_986_918,
+        output_shift: -3,
+        left_shift: 0,
+        input1_multiplier: 0,
+        input1_shift: 0,
+        input2_multiplier: 0,
+        input2_shift: 0,
+        quantized_activation_min: i8::MIN as i32,
+        quantized_activation_max: i8::MAX as i32,
+    },
+    ElementwiseChainStep {
+        kind: ElementwiseKind::HardSwish,
+        operand: None,
+        input1_offset: -3,
+        input2_offset: 0,
+        output_offset: 1,
+        output_multiplier: 1_789_569_707,
+        output_shift: 2,
+        left_shift: 0,
+        input1_multiplier: 0,
+        input1_shift: 0,
+        input2_multiplier: 0,
+        input2_shift: 0,
+        quantized_activation_min: 0,
+        quantized_activation_max: 127,
+    },
+];
+
+const FUSED_CHAIN_4OP_PARAMS: ElementwiseChainParams<'static> = ElementwiseChainParams {
+    num_elements: 256,
+    steps: &FUSED_CHAIN_4OP_STEPS,
+};
+
 /// The full per-kernel benchmark table (order = report row order).
 pub const fn kernel_specs() -> &'static [KernelSpec] {
     &[
@@ -1292,6 +1406,14 @@ pub const fn kernel_specs() -> &'static [KernelSpec] {
             note: "Composed 3x3 conv (non-%16 channels → channel-padded staging) + residual-ADD + HardSwish epilogue (downgraded integer formula).",
         },
         KernelSpec {
+            name: "fused_chain_s8 4op add+relu+mul+hardswish (T2.3)",
+            tier: MemoryTier::Sram,
+            op: OpKind::FusedElementwiseChain,
+            params: KernelParams::FusedChain(&FUSED_CHAIN_4OP_PARAMS),
+            reference: None,
+            note: "Composed elementwise chain (add+relu+mul+hard_swish, non-identity scales, n=256). On device today this chain runs the decomposition (hard_swish has no SIMD yet, T3.2 — chains SIMD-engage only when EVERY step is identity-eligible). The chain-runtime < sum-of-per-op-runtimes measurement is T6.x.",
+        },
+        KernelSpec {
             name: "softmax_s8 1x1000 (SIMD)",
             tier: MemoryTier::Sram,
             op: OpKind::Softmax,
@@ -1440,6 +1562,18 @@ pub fn layout(spec: &KernelSpec) -> SpecLayout {
             weights_len: shape_product(&p.conv.filter_shape),
             bias_len: p.conv.filter_shape[0] as usize,
             output_len: shape_product(&p.conv.output_shape),
+            transform_len: 0,
+        },
+        // The fused elementwise chain consumes a single flat int8 input
+        // (`src`, `num_elements` elements) and produces `num_elements` i8
+        // outputs. The step operands are model constant tensors embedded in
+        // the params — no buffer region needed (same as the fused-conv
+        // residual).
+        KernelParams::FusedChain(p) => SpecLayout {
+            input_len: p.num_elements as usize,
+            weights_len: 0,
+            bias_len: 0,
+            output_len: p.num_elements as usize,
             transform_len: 0,
         },
     }
@@ -1657,6 +1791,13 @@ pub fn run_kernel(spec: &KernelSpec, bufs: &mut SpecBufs<'_>, scratch: &mut [u8]
                 &mut backend, bufs.input, bufs.weights, bufs.bias, p, bufs.output, scratch,
             )
         }
+        OpKind::FusedElementwiseChain => {
+            let p = params_fused_chain(spec);
+            let mut backend = hematite_s3::backend::S3Backend;
+            hematite_core::FusedKernelBackend::fused_elementwise_chain(
+                &mut backend, bufs.input, p, bufs.output,
+            )
+        }
     }
 }
 
@@ -1840,6 +1981,16 @@ fn run_kernel_scalar(
                 &mut backend, bufs.input, bufs.weights, bufs.bias, p, bufs.output, scratch,
             )
         }
+        OpKind::FusedElementwiseChain => {
+            let p = match spec.params {
+                KernelParams::FusedChain(p) => p,
+                _ => return Err(KernelError::Unsupported),
+            };
+            let mut backend = hematite_s3::backend::S3Backend;
+            hematite_core::FusedKernelBackend::fused_elementwise_chain(
+                &mut backend, bufs.input, p, bufs.output,
+            )
+        }
     }
 }
 
@@ -1916,6 +2067,13 @@ pub fn prepare_kernel(spec: &KernelSpec) -> Result<PreparedKernel, KernelError> 
             KernelParams::FusedConv(_) => Ok(PreparedKernel::Scalar),
             _ => Err(KernelError::Unsupported),
         },
+        // The fused chain has no prepared handle either: `fused_elementwise_chain`
+        // internally dispatches the register-held chain SIMD path (via
+        // S3Backend), so the Scalar slot runs the public trait method.
+        OpKind::FusedElementwiseChain => match spec.params {
+            KernelParams::FusedChain(_) => Ok(PreparedKernel::Scalar),
+            _ => Err(KernelError::Unsupported),
+        },
         OpKind::Softmax => Ok(PreparedKernel::Scalar),
     }
 }
@@ -1977,6 +2135,14 @@ fn params_fused_conv(spec: &KernelSpec) -> &'static FusedConvParams<'static> {
     }
 }
 
+#[cfg(target_arch = "xtensa")]
+fn params_fused_chain(spec: &KernelSpec) -> &'static ElementwiseChainParams<'static> {
+    match spec.params {
+        KernelParams::FusedChain(p) => p,
+        _ => panic!("spec.op fused_elementwise_chain requires KernelParams::FusedChain"),
+    }
+}
+
 /// Dispatch a spec through the matching `hematite-ref` scalar kernel — the
 /// column-1 baseline, measured on device (never a pre-filled number).
 #[cfg(target_arch = "xtensa")]
@@ -2035,6 +2201,13 @@ pub fn run_ref_kernel(
             let mut backend = hematite_ref::RefBackend;
             hematite_core::FusedKernelBackend::fused_conv2d(
                 &mut backend, bufs.input, bufs.weights, bufs.bias, p, bufs.output, scratch,
+            )
+        }
+        OpKind::FusedElementwiseChain => {
+            let p = params_fused_chain(spec);
+            let mut backend = hematite_ref::RefBackend;
+            hematite_core::FusedKernelBackend::fused_elementwise_chain(
+                &mut backend, bufs.input, p, bufs.output,
             )
         }
     }
@@ -2135,6 +2308,16 @@ mod tests {
                     &mut backend, bufs.input, bufs.weights, bufs.bias, p, bufs.output, scratch,
                 )
             }
+            OpKind::FusedElementwiseChain => {
+                let p = match spec.params {
+                    KernelParams::FusedChain(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                let mut backend = hematite_s3::backend::S3Backend;
+                hematite_core::FusedKernelBackend::fused_elementwise_chain(
+                    &mut backend, bufs.input, p, bufs.output,
+                )
+            }
         };
         let out_after = bufs.output.to_vec();
         bufs.output.copy_from_slice(&out);
@@ -2227,6 +2410,16 @@ mod tests {
                 let mut backend = hematite_ref::RefBackend;
                 hematite_core::FusedKernelBackend::fused_conv2d(
                     &mut backend, bufs.input, bufs.weights, bufs.bias, p, bufs.output, scratch,
+                )
+            }
+            OpKind::FusedElementwiseChain => {
+                let p = match spec.params {
+                    KernelParams::FusedChain(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                let mut backend = hematite_ref::RefBackend;
+                hematite_core::FusedKernelBackend::fused_elementwise_chain(
+                    &mut backend, bufs.input, p, bufs.output,
                 )
             }
         };

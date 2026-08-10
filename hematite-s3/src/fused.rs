@@ -1,47 +1,61 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Hematite Contributors.
 //
-//! [`FusedKernelBackend`] for [`S3Backend`] — the composed conv kernel (T2.2).
+//! [`FusedKernelBackend`] for [`S3Backend`] — the composed kernels (T2.2 +
+//! T2.3).
 //!
 //! # What is fused here
 //!
-//! `fused_conv2d` executes conv → residual-ADD → activation as ONE kernel
-//! call. On real silicon the anchor conv runs through the existing ACCX SIMD
-//! dispatch (`conv1x1_accx_dispatch` / `conv3x3_accx_dispatch` — the two
-//! conv-family paths reachable from a [`FusedConvParams`] anchor; the trait's
-//! anchor type is `Conv2DParams`, so a DEPTHWISE/FULLY_CONNECTED anchor never
-//! reaches this entry) into the i32 accumulator, and the residual-ADD +
-//! activation epilogue runs per element WITHOUT materializing the conv output
-//! to memory — the conv output i8 value is held in a register and fed
-//! straight into the two-stage TFLM Add rounding.
+//! Two composed kernels live in this module:
+//!
+//! * [`fused_conv2d`](Self::fused_conv2d) (T2.2) — conv → residual-ADD →
+//!   activation as ONE kernel call. On real silicon the anchor conv runs
+//!   through the existing ACCX SIMD dispatch (`conv1x1_accx_dispatch` /
+//!   `conv3x3_accx_dispatch` — the two conv-family paths reachable from a
+//!   [`FusedConvParams`] anchor; the trait's anchor type is `Conv2DParams`,
+//!   so a DEPTHWISE/FULLY_CONNECTED anchor never reaches this entry) into
+//!   the i32 accumulator, and the residual-ADD + activation epilogue runs
+//!   per element WITHOUT materializing the conv output to memory — the conv
+//!   output i8 value is held in a register and fed straight into the
+//!   two-stage TFLM Add rounding.
+//! * [`fused_elementwise_chain`](Self::fused_elementwise_chain) (T2.3) — N
+//!   elementwise steps as ONE kernel call, with each step's own requantize
+//!   preserved. On real silicon, when EVERY step is SIMD-eligible under the
+//!   per-step gates, the chain runs in ONE pass over `num_elements`: 16-wide
+//!   chunks are vector-loaded from `src`, the running value stays in i32
+//!   REGISTER lanes between steps (each step's per-op requantize applied in
+//!   the lanes via the host-compilable [`chain_step_apply`] — the exact
+//!   fixed-point sequence of the per-op kernel the decomposition would run,
+//!   NEVER materialized to memory), and the final i8 chunk is vector-stored
+//!   to `dst`. Zero intermediate stores.
 //!
 //! # Bit-exact contract
 //!
-//! The reference decomposition (`hematite-ref/src/fused.rs`) is THE oracle:
-//! `conv2d` writes the i8 anchor output, then `add` applies the two-stage
-//! TFLM Add rounding, then the activation epilogue. The fused SIMD epilogue
-//! ([`fused_epilogue`]) reproduces that EXACT fixed-point sequence per
-//! element — including the conv's own clamp + saturating_cast (the add's
-//! input1 is the *i8* conv output value, so a clamped/saturated conv output
-//! propagates), the per-input `multiplier/shift` single roundings, the
-//! left_shift, the final requantize, and the activation epilogue. On any
-//! ineligible path the trait method falls back to the decomposition through
-//! the existing `S3Backend` per-op methods — so the trait method is ALWAYS
-//! correct (host, QEMU, and ineligible device shapes all take the fallback).
+//! The reference decomposition (`hematite-ref/src/fused.rs`) is THE oracle.
+//! The fused SIMD epilogue math reproduces the EXACT per-op fixed-point
+//! sequences per element. On any ineligible path the trait methods fall back
+//! to the decomposition through the existing `S3Backend` per-op methods — so
+//! the trait methods are ALWAYS correct (host, QEMU, and ineligible device
+//! shapes all take the fallback).
 //!
 //! # QEMU gating
 //!
-//! The SIMD dispatch is `#[cfg(all(target_arch = "xtensa", not(feature =
-//! "qemu")))]` — the same gate the conv-family dispatches use (QEMU's TIE728
-//! emulation is broken). Under `qemu` and on host the trait method runs the
-//! decomposition, bit-exact.
+//! Both SIMD dispatches are `#[cfg(all(target_arch = "xtensa", not(feature
+//! = "qemu")))]` — the same gate the conv-family dispatches use (QEMU's
+//! TIE728 emulation is broken). Under `qemu` and on host the trait methods
+//! run the decomposition, bit-exact.
 //!
 //! # Scratch
 //!
-//! The fused path needs no scratch beyond the anchor conv's own need
-//! (`S3Backend::conv2d_scratch_size`): the residual tensor is read in place
-//! and the conv output is register-held. See `backend.rs
-//! ::fused_conv2d_scratch_need`.
+//! * `fused_conv2d` needs no scratch beyond the anchor conv's own need
+//!   (`S3Backend::conv2d_scratch_size`): the residual tensor is read in
+//!   place and the conv output is register-held. See `backend.rs
+//!   ::fused_conv2d_scratch_need`.
+//! * `fused_elementwise_chain` needs ZERO scratch: the chain keeps the
+//!   running value in register lanes and reads step operands (model constant
+//!   tensors) in place. The decomposition forwards no scratch either (the
+//!   per-op elementwise/activation kernels take `&mut []`). See `backend.rs
+//!   ::fused_elementwise_chain_scratch_need` (== 0, asserted by tests).
 
 use hematite_core::op_params::{
     ActivationEpilogueParams, ActivationParams, ComposedActivation, ElementwiseChainParams,
@@ -51,6 +65,11 @@ use hematite_core::op_params::{
 use hematite_core::{FusedKernelBackend, KernelBackend, KernelError};
 #[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
 use hematite_int8::{multiply_by_quantized_multiplier, saturating_cast};
+
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+use crate::activations::relu_simd_eligible_params;
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+use crate::elementwise::{simd_eligible_add_sub, simd_eligible_mul};
 
 use crate::backend::S3Backend;
 
@@ -265,6 +284,151 @@ pub(crate) fn fused_epilogue(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Fused elementwise chain (T2.3) — the register-held chain math
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Compiled on the device (used by the fused chain dispatch below) and under
+// `#[cfg(test)]` on host (used by the unit tests); never compiled into host
+// release builds. This is the T2.3 analog of `fused_epilogue`: the exact
+// fixed-point sequence of every per-op kernel the decomposition runs,
+// reproduced per step on the running i32 value.
+
+/// Apply ONE chain step to the running i8-range i32 value, returning the
+/// step's output as an i8-range i32 (never an i8, so the caller holds it in
+/// register lanes between steps).
+///
+/// Mirrors the EXACT sequence of the per-op s3 scalar kernel the
+/// decomposition forwards to (`add`/`mul`/`sub` in elementwise.rs, `relu`/
+/// `relu6`/`hard_swish` in activations.rs), including the step's own
+/// requantize (input1/input2/output multipliers+shifts, left_shift, offsets,
+/// quantized-range clamp) and the final `saturating_cast` — so the running
+/// value is always i8-range, exactly as the decomposition's `dst[i]` would be.
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+#[inline]
+fn chain_step_apply(step: &ElementwiseChainStep<'_>, running: i32, operand: i8) -> i32 {
+    match step.kind {
+        ElementwiseKind::Add | ElementwiseKind::Sub => {
+            let mut val1 = running + step.input1_offset;
+            let mut val2 = i32::from(operand) + step.input2_offset;
+            let shift_factor = if step.left_shift >= 0 {
+                1i32 << step.left_shift
+            } else {
+                1
+            };
+            val1 *= shift_factor;
+            val2 *= shift_factor;
+            if step.input1_multiplier != 1i32 << 30 || step.input1_shift != 1 {
+                val1 = multiply_by_quantized_multiplier(
+                    val1, step.input1_multiplier, step.input1_shift);
+            }
+            if step.input2_multiplier != 1i32 << 30 || step.input2_shift != 1 {
+                val2 = multiply_by_quantized_multiplier(
+                    val2, step.input2_multiplier, step.input2_shift);
+            }
+            let raw = if step.kind == ElementwiseKind::Add {
+                val1 + val2
+            } else {
+                val1 - val2
+            };
+            let scaled = multiply_by_quantized_multiplier(raw, step.output_multiplier, step.output_shift);
+            let with_offset = scaled + step.output_offset;
+            i32::from(saturating_cast(clamp(
+                with_offset,
+                step.quantized_activation_min,
+                step.quantized_activation_max,
+            )))
+        }
+        ElementwiseKind::Mul => {
+            let val1 = running + step.input1_offset;
+            let val2 = i32::from(operand) + step.input2_offset;
+            let product = val1 * val2;
+            let scaled = multiply_by_quantized_multiplier(product, step.output_multiplier, step.output_shift);
+            let with_offset = scaled + step.output_offset;
+            i32::from(saturating_cast(clamp(
+                with_offset,
+                step.quantized_activation_min,
+                step.quantized_activation_max,
+            )))
+        }
+        ElementwiseKind::Relu => {
+            let val = running + step.input1_offset;
+            let act = val.max(0);
+            let scaled = multiply_by_quantized_multiplier(act, step.output_multiplier, step.output_shift);
+            i32::from(saturating_cast(scaled + step.output_offset))
+        }
+        ElementwiseKind::Relu6 => {
+            // The s3 relu6 kernel clamps to `quantized_six`; the S3Backend
+            // adapter forwards `quantized_activation_max` as that bound.
+            let val = running + step.input1_offset;
+            let act = clamp(val, 0, step.quantized_activation_max);
+            i32::from(saturating_cast(act + step.output_offset))
+        }
+        ElementwiseKind::HardSwish => {
+            // The DOWNGRADED s3 formula (activations.rs): integer rational
+            // x·ReLU6(x+3)/6 with ±3 round-half-away correction.
+            let x = running + step.input1_offset;
+            let relu6_arg = clamp(x + 3, 0, 6);
+            let product = x * relu6_arg;
+            let result = if product >= 0 {
+                (product + 3) / 6
+            } else {
+                (product - 3) / 6
+            };
+            i32::from(saturating_cast(result + step.output_offset))
+        }
+    }
+}
+
+/// Execute the ENTIRE chain on one element's src i8 value, register-held.
+///
+/// Bit-exact vs the `RefBackend` decomposition by construction: every step
+/// applies the exact per-op kernel sequence ([`chain_step_apply`]) and the
+/// running value between steps is the decomposition's `dst[i]` i8 value as
+/// an i32. Used by the host unit tests to prove the register math equals the
+/// decomposition, and by the device dispatch's chunk loop.
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+#[inline]
+fn fused_chain_element(params: &ElementwiseChainParams<'_>, src_val: i8, element: usize) -> i8 {
+    let mut running = i32::from(src_val);
+    for step in params.steps.iter() {
+        let operand = step.operand.map_or(0, |op| op[element]);
+        running = chain_step_apply(step, running, operand);
+    }
+    running as i8
+}
+
+/// Chain-level SIMD-eligibility gate (host-compilable so the unit tests can
+/// prove WHICH chains engage).
+///
+/// The fused chain SIMD path engages ONLY when EVERY step is SIMD-eligible
+/// under the per-step gates: `simd_eligible_add_sub` / `simd_eligible_mul`
+/// (elementwise.rs — the gates that prove the raw TIE728 add/sub/mul kernels
+/// bit-exact vs the scalar per-op kernels) and `relu_simd_eligible_params`
+/// (activations.rs). Relu6 and HardSwish have no SIMD kernels yet (T3.2) — a
+/// chain containing either falls back to the decomposition. An Add/Mul/Sub
+/// step must carry its operand (the same invariant the decomposition
+/// `expect`s). Therefore, TODAY, a chain SIMD-engages only when every step is
+/// an identity-quant-affine Add/Sub/Mul or an identity-param Relu.
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+fn chain_simd_eligible(params: &ElementwiseChainParams<'_>) -> bool {
+    if params.steps.is_empty() {
+        return false;
+    }
+    params.steps.iter().all(|step| match step.kind {
+        ElementwiseKind::Add | ElementwiseKind::Sub => {
+            step.operand.is_some()
+                && simd_eligible_add_sub(&step_elementwise_params(step, params.num_elements))
+        }
+        ElementwiseKind::Mul => {
+            step.operand.is_some()
+                && simd_eligible_mul(&step_elementwise_params(step, params.num_elements)).is_some()
+        }
+        ElementwiseKind::Relu => relu_simd_eligible_params(&step_activation_params(step)),
+        ElementwiseKind::Relu6 | ElementwiseKind::HardSwish => false,
+    })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Device fused-ACCX dispatch — NEVER compiled on host or under `feature="qemu"`.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -329,6 +493,85 @@ fn fused_conv2d_accx(
         };
         crate::conv3x3::conv3x3_accx_dispatch(&mut accx_ctx, Some(&fp))
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Device fused elementwise-chain dispatch — NEVER compiled on host or under
+// `feature="qemu"`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Attempt the fused SIMD path for `fused_elementwise_chain`, returning
+/// `Ok(true)` when handled and `Ok(false)` when ineligible (the trait method
+/// falls through to the per-op decomposition).
+///
+/// The chain runs in ONE pass over `num_elements`: 16-element chunks are
+/// vector-loaded from `src`, the running value stays in i32 REGISTER lanes
+/// between steps (each step's own requantize applied in the lanes via
+/// [`chain_step_apply`] — the decomposition's per-op sequence, never
+/// materialized to memory), and the final i8 chunk is vector-stored to `dst`.
+/// Zero intermediate stores.
+///
+/// Engagement: EVERY step must pass its per-step SIMD gate
+/// ([`chain_simd_eligible`]), `num_elements % 16 == 0`, and every tensor
+/// pointer 16-byte aligned. Relu6/HardSwish steps (no SIMD yet, T3.2) and
+/// mixed-eligibility chains fall back to the decomposition — always bit-exact.
+#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+fn fused_elementwise_chain_simd(
+    src: &[i8],
+    params: &ElementwiseChainParams<'_>,
+    dst: &mut [i8],
+) -> Result<bool, KernelError> {
+    let n = params.num_elements as usize;
+    // Length validation — mirrors the decomposition's per-op shape checks
+    // (each per-op kernel rejects non-`num_elements` slices with
+    // ShapeMismatch before writing anything).
+    if src.len() != n || dst.len() != n {
+        return Err(KernelError::ShapeMismatch);
+    }
+    for step in params.steps.iter() {
+        if let Some(op) = step.operand {
+            if op.len() != n {
+                return Err(KernelError::ShapeMismatch);
+            }
+        }
+    }
+
+    if n == 0 || n % 16 != 0 || !chain_simd_eligible(params) {
+        return Ok(false);
+    }
+    if (src.as_ptr() as usize) % 16 != 0 || (dst.as_mut_ptr() as usize) % 16 != 0 {
+        return Ok(false);
+    }
+    for step in params.steps.iter() {
+        if let Some(op) = step.operand {
+            if (op.as_ptr() as usize) % 16 != 0 {
+                return Ok(false);
+            }
+        }
+    }
+
+    let n_chunks = n / 16;
+    for chunk in 0..n_chunks {
+        let base = chunk * 16;
+        // Vector-load step 0's input1 (src) into the running i32 lanes.
+        let mut lanes = [0i32; 16];
+        for l in 0..16 {
+            lanes[l] = i32::from(src[base + l]);
+        }
+        // Steps in sequence; the running value stays in the i32 lanes.
+        for step in params.steps.iter() {
+            let operand_chunk: Option<&[i8]> = step.operand.map(|op| &op[base..base + 16]);
+            for l in 0..16 {
+                let operand = operand_chunk.map_or(0, |c| c[l]);
+                lanes[l] = chain_step_apply(step, lanes[l], operand);
+            }
+        }
+        // Vector-store the final i8 chunk to dst.
+        for l in 0..16 {
+            dst[base + l] = saturating_cast(lanes[l]);
+        }
+    }
+    Ok(true)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -525,6 +768,16 @@ impl FusedKernelBackend for S3Backend {
         params: &ElementwiseChainParams,
         dst: &mut [i8],
     ) -> Result<(), KernelError> {
+        // Fused SIMD chain (device-only; QEMU-gated). On any ineligible chain
+        // (host, QEMU, non-%16 length, relu6/hard_swish or mixed-eligibility
+        // steps, misaligned tensors) the dispatch returns Ok(false) and we
+        // fall through to the decomposition — always bit-exact.
+        #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+        {
+            if fused_elementwise_chain_simd(src, params, dst)? {
+                return Ok(());
+            }
+        }
         for (idx, step) in params.steps.iter().enumerate() {
             let input1 = if idx == 0 {
                 src
@@ -615,6 +868,7 @@ impl FusedKernelBackend for S3Backend {
 #[cfg(test)]
 mod tests {
     extern crate alloc;
+    use alloc::boxed::Box;
     use alloc::vec;
     use alloc::vec::Vec;
     use super::*;
@@ -822,5 +1076,313 @@ mod tests {
         }
 
         assert_eq!(fused, decomposed, "no-residual relu6 epilogue must match");
+    }
+
+    // ── T2.3 — fused elementwise chain ────────────────────────────────────
+
+    /// One chain step with explicit quant params (mirrors the field layout of
+    /// `ElementwiseChainStep`).
+    #[allow(clippy::too_many_arguments)]
+    fn test_step(
+        kind: ElementwiseKind,
+        operand: Option<&'static [i8]>,
+        input1_offset: i32,
+        input2_offset: i32,
+        output_offset: i32,
+        output_multiplier: i32,
+        output_shift: i32,
+        left_shift: i32,
+        input1_multiplier: i32,
+        input1_shift: i32,
+        input2_multiplier: i32,
+        input2_shift: i32,
+        quantized_activation_min: i32,
+        quantized_activation_max: i32,
+    ) -> ElementwiseChainStep<'static> {
+        ElementwiseChainStep {
+            kind,
+            operand,
+            input1_offset,
+            input2_offset,
+            output_offset,
+            output_multiplier,
+            output_shift,
+            left_shift,
+            input1_multiplier,
+            input1_shift,
+            input2_multiplier,
+            input2_shift,
+            quantized_activation_min,
+            quantized_activation_max,
+        }
+    }
+
+    /// The identity add/sub step (the SIMD-eligible form).
+    fn identity_add_step(operand: Option<&'static [i8]>) -> ElementwiseChainStep<'static> {
+        test_step(
+            ElementwiseKind::Add,
+            operand,
+            0, 0, 0,
+            1 << 30, 1,
+            0,
+            1 << 30, 1,
+            1 << 30, 1,
+            i8::MIN as i32, i8::MAX as i32,
+        )
+    }
+
+    /// A NON-identity add step — same two-stage TFLM Add rounding shape the
+    /// golden matrix uses (input2 scale 0.3 vs input1 0.5, output 0.4).
+    fn non_identity_add_step(operand: Option<&'static [i8]>) -> ElementwiseChainStep<'static> {
+        test_step(
+            ElementwiseKind::Add,
+            operand,
+            -5, 3, 1,
+            1_342_177_280, -18, // QuantizeMultiplier(2·max/(2^20·0.4))
+            20,
+            1 << 30, 0, // input1 = QuantizeMultiplier(0.5/1.0)
+            1_288_490_189, -1, // input2 = QuantizeMultiplier(0.3/1.0)
+            i8::MIN as i32, i8::MAX as i32,
+        )
+    }
+
+    /// The identity relu step (SIMD-eligible).
+    fn identity_relu_step() -> ElementwiseChainStep<'static> {
+        test_step(
+            ElementwiseKind::Relu,
+            None,
+            0, 0, 0,
+            1 << 30, 1,
+            0,
+            0, 0,
+            0, 0,
+            0, 127,
+        )
+    }
+
+    /// A non-identity relu step (output ratio 0.5/0.4, zp offsets).
+    fn non_identity_relu_step() -> ElementwiseChainStep<'static> {
+        test_step(
+            ElementwiseKind::Relu,
+            None,
+            -1, 0, 2,
+            1_342_177_280, 1,
+            0,
+            0, 0,
+            0, 0,
+            0, 127,
+        )
+    }
+
+    /// The identity mul step (output pair (1<<30, 0) — SIMD-eligible).
+    fn identity_mul_step(operand: Option<&'static [i8]>) -> ElementwiseChainStep<'static> {
+        test_step(
+            ElementwiseKind::Mul,
+            operand,
+            0, 0, 0,
+            1 << 30, 0,
+            0,
+            0, 0,
+            0, 0,
+            i8::MIN as i32, i8::MAX as i32,
+        )
+    }
+
+    /// A hard_swish step (NEVER SIMD-eligible today — T3.2).
+    fn hard_swish_step() -> ElementwiseChainStep<'static> {
+        test_step(
+            ElementwiseKind::HardSwish,
+            None,
+            -3, 0, -1,
+            0, 0,
+            0,
+            0, 0,
+            0, 0,
+            0, 127,
+        )
+    }
+
+    /// The register-held chain math must be bit-exact vs the full trait
+    /// method's decomposition (host → per-op scalar kernels) for the same
+    /// params — the on-device SIMD path's arithmetic, proven on host.
+    fn assert_register_math_matches(params: &ElementwiseChainParams<'_>, src: &[i8]) {
+        let mut decomposed = vec![0i8; src.len()];
+        let mut backend = S3Backend;
+        backend
+            .fused_elementwise_chain(src, params, &mut decomposed)
+            .expect("decomposition runs");
+        let mut fused = vec![0i8; src.len()];
+        for (i, &s) in src.iter().enumerate() {
+            fused[i] = fused_chain_element(params, s, i);
+        }
+        assert_eq!(
+            fused, decomposed,
+            "register-held chain must equal the decomposition element-for-element"
+        );
+    }
+
+    #[test]
+    fn fused_chain_register_math_matches_decomposition_bit_exact() {
+        let src: Vec<i8> = (0..256).map(|i| ((i as i64 * 37) % 251 - 125) as i8).collect();
+        let op_a: &'static [i8] = Box::leak(
+            (0..256).map(|i| ((i as i64 * 11) % 199 - 99) as i8).collect::<Vec<_>>().into_boxed_slice(),
+        );
+        let op_b: &'static [i8] = Box::leak(
+            (0..256).map(|i| ((i as i64 * 29) % 217 - 108) as i8).collect::<Vec<_>>().into_boxed_slice(),
+        );
+
+        // (a) the plan's canonical 4-op chain: add + relu + mul + hard_swish,
+        //     all NON-identity scales.
+        let steps: Vec<ElementwiseChainStep<'static>> = vec![
+            non_identity_add_step(Some(op_a)),
+            non_identity_relu_step(),
+            identity_mul_step(Some(op_b)),
+            hard_swish_step(),
+        ];
+        let params = ElementwiseChainParams {
+            num_elements: 256,
+            steps: &steps,
+        };
+        assert_register_math_matches(&params, &src);
+
+        // (b) a 2-op add + relu chain with non-identity offsets.
+        let steps: Vec<ElementwiseChainStep<'static>> =
+            vec![non_identity_add_step(Some(op_a)), non_identity_relu_step()];
+        let params = ElementwiseChainParams {
+            num_elements: 256,
+            steps: &steps,
+        };
+        assert_register_math_matches(&params, &src);
+
+        // (c) a mul + hard_swish chain.
+        let steps: Vec<ElementwiseChainStep<'static>> =
+            vec![identity_mul_step(Some(op_b)), hard_swish_step()];
+        let params = ElementwiseChainParams {
+            num_elements: 256,
+            steps: &steps,
+        };
+        assert_register_math_matches(&params, &src);
+
+        // (d) a chain containing a relu6 step (register math handles it even
+        //     though the SIMD gate refuses the chain today).
+        let steps: Vec<ElementwiseChainStep<'static>> = vec![
+            non_identity_add_step(Some(op_a)),
+            test_step(
+                ElementwiseKind::Relu6,
+                None,
+                -1, 0, 2,
+                0, 0,
+                0,
+                0, 0,
+                0, 0,
+                0, 24, // quantized six
+            ),
+        ];
+        let params = ElementwiseChainParams {
+            num_elements: 256,
+            steps: &steps,
+        };
+        assert_register_math_matches(&params, &src);
+    }
+
+    /// The chain-level SIMD-eligibility gate must engage ONLY for all-eligible
+    /// chains (identity-quant-affine add/sub/mul + identity relu), and refuse
+    /// relu6/hard_swish chains, non-identity chains, operand-less binary
+    /// steps, and empty chains.
+    #[test]
+    fn chain_simd_eligibility_gate_expectations() {
+        let op_a: &'static [i8] = Box::leak(vec![0i8; 256].into_boxed_slice());
+
+        // All-identity add + relu → ELIGIBLE (this is what SIMD-engages today).
+        let steps: Vec<ElementwiseChainStep<'static>> =
+            vec![identity_add_step(Some(op_a)), identity_relu_step()];
+        let params = ElementwiseChainParams {
+            num_elements: 256,
+            steps: &steps,
+        };
+        assert!(chain_simd_eligible(&params), "identity add+relu must be eligible");
+
+        // All-identity add + mul + relu → ELIGIBLE.
+        let steps: Vec<ElementwiseChainStep<'static>> = vec![
+            identity_add_step(Some(op_a)),
+            identity_mul_step(Some(op_a)),
+            identity_relu_step(),
+        ];
+        let params = ElementwiseChainParams {
+            num_elements: 256,
+            steps: &steps,
+        };
+        assert!(chain_simd_eligible(&params), "identity add+mul+relu must be eligible");
+
+        // ANY hard_swish step → INELIGIBLE (no SIMD yet, T3.2).
+        let steps: Vec<ElementwiseChainStep<'static>> = vec![
+            identity_add_step(Some(op_a)),
+            identity_relu_step(),
+            hard_swish_step(),
+        ];
+        let params = ElementwiseChainParams {
+            num_elements: 256,
+            steps: &steps,
+        };
+        assert!(!chain_simd_eligible(&params), "chain with hard_swish must fall back");
+
+        // ANY relu6 step → INELIGIBLE.
+        let steps: Vec<ElementwiseChainStep<'static>> = vec![
+            identity_add_step(Some(op_a)),
+            test_step(
+                ElementwiseKind::Relu6, None,
+                0, 0, 0,
+                0, 0,
+                0,
+                0, 0,
+                0, 0,
+                0, 24,
+            ),
+        ];
+        let params = ElementwiseChainParams {
+            num_elements: 256,
+            steps: &steps,
+        };
+        assert!(!chain_simd_eligible(&params), "chain with relu6 must fall back");
+
+        // A NON-identity add step (offsets / scales) → INELIGIBLE.
+        let steps: Vec<ElementwiseChainStep<'static>> =
+            vec![non_identity_add_step(Some(op_a)), identity_relu_step()];
+        let params = ElementwiseChainParams {
+            num_elements: 256,
+            steps: &steps,
+        };
+        assert!(!chain_simd_eligible(&params), "non-identity chain must fall back");
+
+        // A binary step WITHOUT its operand → INELIGIBLE (the decomposition
+        // would `expect`-panic; the fused path must not silently compute).
+        let steps: Vec<ElementwiseChainStep<'static>> =
+            vec![identity_add_step(None), identity_relu_step()];
+        let params = ElementwiseChainParams {
+            num_elements: 256,
+            steps: &steps,
+        };
+        assert!(!chain_simd_eligible(&params), "operand-less add must fall back");
+
+        // An EMPTY chain → INELIGIBLE.
+        let steps: Vec<ElementwiseChainStep<'static>> = Vec::new();
+        let params = ElementwiseChainParams {
+            num_elements: 256,
+            steps: &steps,
+        };
+        assert!(!chain_simd_eligible(&params), "empty chain must fall back");
+    }
+
+    /// The composed chain needs no scratch (0 == 0 on both the SIMD path and
+    /// the decomposition).
+    #[test]
+    fn fused_chain_scratch_need_is_zero() {
+        let steps: Vec<ElementwiseChainStep<'static>> =
+            vec![identity_add_step(Some(Box::leak(vec![0i8; 256].into_boxed_slice())))];
+        let params = ElementwiseChainParams {
+            num_elements: 256,
+            steps: &steps,
+        };
+        assert_eq!(crate::backend::fused_elementwise_chain_scratch_need(&params), 0);
     }
 }

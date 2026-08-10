@@ -3663,9 +3663,12 @@ mod tests {
                     checked += 1;
                     n_pool += 1;
                 }
-                KernelParams::Activation(_) | KernelParams::Elementwise(_) => {
-                    // relu/add/mul/sub: codegen emits scratch 0; the trait has
-                    // no scratch method for them (runtime 0). No mirror exists.
+                KernelParams::Activation(_) | KernelParams::Elementwise(_) | KernelParams::FusedChain(_) => {
+                    // relu/add/mul/sub + the composed elementwise chain: codegen
+                    // emits scratch 0 (emit_fused_chain → `scratch: 0`); the trait
+                    // has no scratch method for them (runtime 0). No mirror exists —
+                    // the T2.3 chain needs zero scratch on both the SIMD path
+                    // (register-held running value) and the decomposition.
                     n_scratch_free += 1;
                 }
                 KernelParams::FusedConv(p) => {
