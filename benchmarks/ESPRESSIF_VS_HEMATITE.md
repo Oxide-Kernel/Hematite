@@ -263,26 +263,23 @@ identical memory tier (SRAM), identical CPU frequency (240 MHz, boot-asserted)
 and cache config on both stacks. Any row that cannot satisfy this is rendered
 `—` with the reason — never compared with a fabricated number.
 
-**C-side status (enumerated 2026-08-10):** only the synthetic Model C /
-mv2real has a confirmed ESP-NN C baseline (the A/B/C table above, 655,303
-cyc). None of the 6 zoo models has an esp-nn runner in
-`benchmarks/espnn-baseline/main/main.c` (the A/B/C runners are hand-wired
-kernels with generated fill-pattern weights, not tflite-backed models) —
-building those runners + a tflite weight-extraction path is a **separate
-scope decision** (Metis F8), not invented here. The current host has **no
-ESP-IDF toolchain** (`idf.py` absent, `$IDF_PATH` empty), so the C side
-cannot be measured here; the exact rows to add when the toolchain returns are
-specified in `benchmarks/espnn-baseline/README.md` (same pattern as todo 15's
-per-op table).
+**C-side status (measured 2026-08-10, ESP-IDF v5.5.1 + vendored esp-nn, device run):** all 4 runnable zoo models now have real esp-nn runners in
+`benchmarks/espnn-baseline/main/zoo_runners.c` (tflite weights extracted to C headers by `benchmarks/espnn-baseline/tools/extract_espnn.py`), timed under the
+same conditions (identical tflite, identical ramp input `(i*7+3)&0xFF`, SRAM, 240 MHz). **Known esp-nn library defect (device-verified):** esp-nn's FC is
+defective for `out_channels=4` — all three of its implementations (SIMD fast path, ANSI C, s16 asm) produce clamped garbage `[-128 127 -128 127]` with
+verified-correct inputs (KWS's final FC is 4000→4); zero-weight padded rows compute exactly right, proving the kernel chain is sound. KWS is ~99% depthwise
+(verified bit-exact), so the kws row below measures the real esp-nn SIMD depthwise + TFLM-faithful scalar FC/softmax (internally MATCH-verified).
+Rounding caveat: the C port (and esp-nn) use gemmlowp **double rounding**; Hematite uses **single rounding** (documented T10 divergence) — hello/kws/anomaly
+out_fnv differ by that class; sine (power-of-two scale) is bit-exact on all three stacks.
 
-| Zoo model | Hematite cycles (min/med) | Hematite ms @ 240 MHz | ESP-NN cycles (min/med) | Speedup | Notes |
-|---|---|---|---|---|---|
-| KWS `kws_micro_speech_int8` (1×1960→4) | 13,091,330 / 13,091,344 | 54 / 54 | — | — | C side `—`: no esp-nn runner yet (needs new harness code; feasible when toolchain returns — 18.8 KB model). **54 ms root-caused (todo 21):** the KWS depthwise has `depth_multiplier=8` (in_c=1, out_c=8) and the bespoke per-lane depthwise SIMD kernel requires `input_c==output_c` (dm==1) — structurally ineligible, runs scalar. Also fixed: zoo-model SIMD was silently disabled because codegen emitted `scratch: 0` (→ `SCRATCH_LEN=0` → every op got an empty scratch → scalar fallback); codegen now computes real per-op scratch (conv2d/depthwise/softmax/fc) and emits `#[repr(C, align(16))]` weight wrappers so the ACCX `w_ptr%16` gate engages. out_fnv `0x2131fda5` |
-| sine (1→1 smoke) | 536 / 536 | 0 / 0 | — | — | C side `—`: no runner yet (needs new harness code). out_fnv `0x040c5b8c` |
-| hello_world `hello_world_int8` (1→1) | 11,329 / 11,329 | 0 / 0 | — | — | C side `—`: no runner yet (needs new harness code). out_fnv `0xfaf3a2e1` |
-| anomaly_detect `anomaly_detect_int8` (640→640) | 19,669,640 / 19,669,640 | 81 / 81 | — | — | C side `—`: no runner yet; 277 KB model embed is above the ~200 KB app-write ceiling this USB adapter sustained (T16 finding) — verify flash path before trusting a C row. 10×FC model — FC SIMD now engages post-todo-21 (aligned weights + codegen scratch); run-4 re-measure pending board replug. out_fnv `0xe8f86342` |
-| person_detect `person_detect_int8` (96×96×3→2) | SKIP | — | — | — | SKIP on both stacks: Hematite `reason=stack` (generated `predict` allocas ~232 KB vs ~65 KB device stack); C side `—` (no runner; 333 KB weights + tensors exceed SRAM/DRAM budget, no PSRAM to spill into). Bit-exact vs executed-TFLM golden on host (`0x6962079d`) |
-| mobilenet_v2 `mobilenet_v2_1.0_224_int8` (3×224×224→1000) | SKIP | — | — | — | SKIP on both stacks: `reason=no-psram` (board probe: `PSRAM: 0 bytes`); 3.98 MB model cannot be embedded or held in the 416 KB DRAM. 984/1000 residual vs executed-TFLM golden: TFLM `pad.cc` fills `output_zero_point` (−14), `PadParams` carries no zero point (documented follow-up) |
+| Zoo model | Hematite cycles (min/med) | Hematite ms @ 240 MHz | ESP-NN cycles (min/med) | ESP-NN ms @ 240 MHz | ESP-NN faster | Notes |
+|---|---|---|---|---|---|---|
+| KWS `kws_micro_speech_int8` (1×1960→4) | 12,983,503 / 12,983,503 | 54 / 54 | 1,059,889 / 1,060,258 | 4 / 4 | **12.3×** | Hematite 54 ms root-caused (todo 21): the KWS depthwise has `depth_multiplier=8` (in_c=1, out_c=8) and the bespoke per-lane depthwise SIMD kernel requires `input_c==output_c` (dm==1) — structurally ineligible, runs scalar. ESP-NN has native SIMD for this shape. C-side FC uses scalar (esp-nn FC defective for out=4, see above); dw verified bit-exact. Hematite out_fnv `0x2131fda5`, C `0x6c653a93` (rounding-class) |
+| sine (1→1 smoke) | 618 / 618 | 0 / 0 | 190 / 190 | 0 / 0 | **3.3×** | Bit-exact all three stacks (`0x040c5b8c`). FC 1→1; esp-nn single-cycle-row cost |
+| hello_world `hello_world_int8` (1→1) | 10,314 / 10,314 | 0 / 0 | 4,675 / 4,675 | 0 / 0 | **2.2×** | Internal MATCH (esp-nn==scalar `0xfa0c4bce`); Hematite `0xfaf3a2e1` differs by rounding-class |
+| anomaly_detect `anomaly_detect_int8` (640→640) | 28,550,253 / 28,550,253 | 118 / 118 | 7,758,145 / 7,758,250 | 32 / 32 | **3.7×** | 10×FC model; internal MATCH (`0x860c61b1`); Hematite `0xe8f86342` differs by rounding-class. FC SIMD engages on both stacks post-todo-21 (aligned weights + codegen scratch) |
+| person_detect `person_detect_int8` (96×96×3→2) | SKIP | — | — | — | — | SKIP on both stacks: Hematite `reason=stack` (generated `predict` allocas ~232 KB vs ~65 KB device stack); C side (333 KB weights + tensors exceed SRAM/DRAM budget, no PSRAM to spill into). Bit-exact vs executed-TFLM golden on host (`0x6962079d`) |
+| mobilenet_v2 `mobilenet_v2_1.0_224_int8` (3×224×224→1000) | SKIP | — | — | — | — | SKIP on both stacks: `reason=no-psram` (board probe: `PSRAM: 0 bytes`); 3.98 MB model cannot be embedded or held in the 416 KB DRAM. 984/1000 residual vs executed-TFLM golden: TFLM `pad.cc` fills `output_zero_point` (−14), `PadParams` carries no zero point (documented follow-up) |
 
 Reading the table: **every zoo row's C cell is honestly `—`** — the ESP-NN
 C baseline for these models does not exist yet (separate scope decision) and
