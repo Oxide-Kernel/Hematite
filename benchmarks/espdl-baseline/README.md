@@ -261,6 +261,25 @@ depthwise kernel, then re-implemented from silicon probes) is what the
 bespoke depthwise kernel uses. See `PROJECT_LOG.md` Phase 16 for the full
 Model B cycle progression (9,970,333 → 770,827).
 
+## Todo 15 — canonical workload rows to add
+
+Plan todo 15 (normalize per-op workloads) defines one canonical shape set,
+measured at the SAME shape on both the Rust public API and this C harness.
+The 9 rows above already match 8 of the canonical shapes. The C side still
+lacks four rows; when the ESP-IDF toolchain is available (this host currently
+has none), add them to `main/main.c` + `main/CMakeLists.txt` and re-run:
+
+| Row to add | Shape / workload | How (all patterns already in this file) | Expected Rust out_fnv (fresh public-API, from `hematite-benchmarks`) |
+|---|---|---|---|
+| conv3x3 32x32x64 VALID — **full-image pass** | 30×30×64 output = 900 pixels | Loop `dl_tie728_s8_conv2d_33cn` once per output pixel with `s_c3_in + (oh*32+ow)*64`, `dilation_x_offset/y_offset=1` (the `kern_c3_new_pure` loop over `s8_accx_conv3x3` is the pattern). The existing 2824-cycle row is a single per-pixel call, not a full image — that is exactly the workload mismatch todo 15 fixes. | `0x0a181085` (Rust 8867105 cyc) |
+| conv3x3 16x16x32 SAME | 16×16×32 in → 16×16×32 out, pad 1 | Zero-pad input to 18×18×32, then per-pixel `_33cn` loop as above (SAME = caller-side padding; the asm has no padding). | `0xc53ebbc5` (Rust 880343 cyc) |
+| depthwise 12x12x16 S2 SAME | 12×12×16 in → 6×6×16 out, stride 2, pad 1 | Zero-pad to 14×14×16, then per-pixel `s8_accx_depthwise` loop with stride-2 input offsets (`kern_depthwise` is the pattern; row_delta = (14-3)*16). | `0x5159710e` (Rust 35714 cyc) |
+| softmax 1x1000 | 1000-element row | Add `${ASM_DIR}/s8_softmax.S` (bespoke, already in `hematite-s3/src/asm/`) to `main/CMakeLists.txt` + a `Tie728*Args`-style wrapper + `run_bench` row. | `0xaf0d15aa` (Rust 476499 cyc) |
+
+Until these rows exist, the normalized table in
+`benchmarks/ESPRESSIF_VS_HEMATITE.md` marks those C-side cells `—` with the
+reason; the remaining rows reuse the device numbers measured above.
+
 ## Files
 
 | File | Role |

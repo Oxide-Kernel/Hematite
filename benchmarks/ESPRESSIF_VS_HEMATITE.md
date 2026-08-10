@@ -199,6 +199,55 @@ Espressif checksums diverge from the scalar reference because those kernels
 saturate their QACC lanes (see below). Hematite's weighted-op SIMD output is
 bit-exact vs the scalar reference on every row.
 
+## Normalized per-op comparison (same canonical shapes on both stacks)
+
+The table above mixed workloads: Hematite measured the full public API while
+the Espressif conv3x3 row was a single per-pixel call. This section fixes that
+(plan todo 15, Wave 5): **one canonical shape set, measured at the SAME shape
+on both sides**, Rust public API vs raw vendored C asm.
+
+Canonical shapes: `conv1x1 64x1x1x64`; `conv3x3 32x32x64 VALID` +
+`16x16x32 SAME`; `fc 256x64`; `depthwise 12x12x16 S2 SAME`; `max/avg_pool
+2x2x16`; `relu 256`; `add/mul/sub 256`; `softmax 1x1000` — exactly the
+`SIMD_*` rows in `hematite-benchmarks/src/spec.rs` `kernel_specs()`.
+
+Methodology (identical on both stacks): ESP32-S3 rev v0.2 @ 240 MHz, CCOUNT
+cycle counter, 1 untimed warm-up + N=10 timed runs, min + median, same
+deterministic fill pattern. Rust = `hematite-benchmarks` firmware public API
+(fresh device run 2026-08-10, HEAD `33d498a`, evidence
+`local-notes/evidence/simd-zoo-hardening/task-15-normalized.log`). C = raw vendored
+TIE728 entry from the `espdl-baseline` harness (existing device tables,
+`bench10`/`bench11b` — the ESP-IDF toolchain is not on the current host, so
+the C column reuses the documented device numbers; rows the harness still
+lacks are `—` with the reason, and the exact rows to add are specified in
+`benchmarks/espdl-baseline/README.md`).
+
+| Operation (canonical shape) | Rust public-API cyc (min/med) | Rust out_fnv(ref/s3) | C raw-asm cyc (min/med) | C-side note |
+|---|---|---|---|---|
+| conv1x1 64x1x1x64 | 4269 / 4296 | `0x0bea8225`/`0x0bea8225` | 472 / 472 | shape match; raw `_11cn` entry |
+| conv3x3 32x32x64 VALID | 8867105 / 8867106 | `0x0a181085`/`0x0a181085` | 2824 / 2824 | ⚠️ per-pixel call: `_33cn` computes ONE output pixel per call; a full-image C pass (900 px) is not yet measured |
+| conv3x3 16x16x32 SAME | 880343 / 880343 | `0xc53ebbc5`/`0xc53ebbc5` | — | no C row yet: `_33cn` is pad-0 per-pixel; SAME needs a caller-side zero-pad loop |
+| fc 256x64 | 8344 / 8371 | `0x32e35185`/`0x32e35185` | 1288 / 1288 | shape match; raw `_11cn` entry |
+| depthwise 12x12x16 S2 SAME | 35714 / 35714 | `0x5159710e`/`0x5159710e` | — | no C row yet: harness has only 7x7x32 stride-1 depthwise; the S2-SAME canonical shape is not added |
+| max_pool 2x2x16 | 33240 / 33253 | `0x651bfdc5`/`0x651bfdc5` | 1396 / 1396 | shape match; raw `_22c1` entry |
+| avg_pool 2x2x16 | 29225 / 29225 | `0xb8a6ddc5`/`0xb8a6ddc5` | 7181 / 7181 | shape match; raw `_22c1` entry (C-SIMD out ≠ ref — documented pool fixed-point semantics) |
+| relu 256 | 358 / 358 | `0x6c620b3d`/`0x6c620b3d` | 175 / 175 | shape match; raw `_relu_11c` entry |
+| add 256 | 477 / 490 | `0x14834bbb`/`0x14834bbb` | 167 / 167 | shape match; raw `_add_w1_16_w2_16` entry |
+| mul 256 | 851 / 879 | `0xd3c0a7f1`/`0xd3c0a7f1` | 539 / 539 | shape match; raw `_mul_w1_16_w2_16` entry |
+| sub 256 | 555 / 556 | `0x62d74671`/`0x62d74671` | 265 / 265 | shape match; raw `_sub_w1_16_w2_16` entry |
+| softmax 1x1000 | 476499 / 476499 | `0xaf0d15aa`/`0xaf0d15aa` | — | no C row yet: the C harness has no softmax entry (`s8_softmax.S` is not in `main/CMakeLists.txt`) |
+
+- On every weighted row the Rust output is **bit-exact vs the scalar ref**
+  (`out_fnv(ref/s3)` equal) — the ACCX kernels' contract. Pool rows output the
+  ref checksum on this firmware; the pool-SIMD vs ref ±1 delta is the
+  documented known-delta tracked by plan todo 17 (not altered here).
+- The residual Rust-vs-C gap on matching rows is the Rust public-API wrapper
+  (slice validation + SIMD eligibility gate + args build + requantize
+  epilogue) over the **same kernels** — see the prepared-path table in the
+  `espdl-baseline` README for the wrapper-gap closure.
+- C-side `—` rows are runnable but not yet added; the exact rows to add
+  (shapes, args, expected checksums) are in `benchmarks/espdl-baseline/README.md`.
+
 ## Where to look
 
 - ESP-NN model harness: `benchmarks/espnn-baseline/` (`main.c`, vendored
