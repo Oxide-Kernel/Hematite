@@ -76,16 +76,26 @@ pub(crate) fn accx_eligible_3x3(input_c: usize, out_c: usize) -> bool {
     input_c >= 1 && out_c >= 1
 }
 
-/// Host-compilable eligibility for the bespoke QACC depthwise kernel.
+/// Depth-multiplier-aware eligibility for the bespoke QACC depthwise kernel
+/// (T3.5 — depth_multiplier > 1, filter 3×3).
 ///
-/// Any `input_c >= 1` is accepted: when `input_c % 16 != 0` the dispatch
-/// zero-pads the input and filter channel dimensions in scratch up to the
-/// next multiple of 16 (the kernel VLDs 16-channel vectors and loops
-/// `out_c / 16` groups), so the `% 16` requirement is lifted here. Depthwise
-/// per-lane semantics require `out_c == input_c` (dm == 1).
+/// Any `input_c >= 1` is accepted: when the channel count is not a multiple
+/// of 16 the dispatch zero-pads the input and filter channel dimensions in
+/// scratch up to the next multiple of 16 (the kernel VLDs 16-channel vectors
+/// and loops `out_c / 16` groups). For `dm > 1` the dispatch stages a
+/// *replicated* input (each input channel `i` fanned out to `dm` output
+/// channels `i*dm .. i*dm+dm`, each with its own filter row) so the
+/// silicon-proven dm==1 kernel contract (`acc[oc]` reads lane `oc` of the
+/// staged input and filter) applies directly. The fan-out shape invariant
+/// `out_c == input_c * dm` must hold (dm==1 ⇒ `out_c == input_c`).
 #[inline]
-pub(crate) fn accx_eligible_depthwise(input_c: usize, out_c: usize) -> bool {
-    input_c >= 1 && out_c >= 1 && input_c == out_c
+pub(crate) fn accx_eligible_depthwise_dm(
+    input_c: usize,
+    out_c: usize,
+    depth_multiplier: i32,
+) -> bool {
+    let dm = depth_multiplier.max(1) as usize;
+    input_c >= 1 && out_c >= 1 && out_c == input_c * dm
 }
 
 /// Compute per-output-channel weight sums into `out`.

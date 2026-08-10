@@ -126,11 +126,19 @@ fn conv3x3_scratch_need(params: &Conv2DParams) -> usize {
 /// (`depthwise_accx_dispatch`): a padded input copy, a padded filter copy
 /// (only when channel-padding), the accumulator buffer, and the optional
 /// weight-sum buffer.
+///
+/// T3.5 — depth_multiplier > 1: the kernel consumes `out_c`-channel vectors
+/// and the dispatch stages a REPLICATED input (each input channel fanned out
+/// to `dm` output channels), so the padded channel count is `pad16(out_c)` —
+/// for dm==1 `out_c == input_c` and this equals the historical `pad16(in_c)`.
+/// dm>1 always stages (replication cannot run on the caller's `in_c`-channel
+/// input), so `needs_pad` is forced on for dm>1. Kept in sync with
+/// `depthwise_scratch_need_codegen` (hematite-codegen/src/generate.rs) and the
+/// dispatch's own `need` computation in `depthwise.rs`.
 #[inline(always)]
 fn depthwise_scratch_need(params: &DepthwiseConv2DParams) -> usize {
     let in_h = params.input_shape[1].max(0) as usize;
     let in_w = params.input_shape[2].max(0) as usize;
-    let in_c = params.input_shape[3].max(0) as usize;
     let out_h = params.output_shape[1].max(0) as usize;
     let out_w = params.output_shape[2].max(0) as usize;
     let out_c = params.output_shape[3].max(0) as usize;
@@ -143,9 +151,10 @@ fn depthwise_scratch_need(params: &DepthwiseConv2DParams) -> usize {
         ((out_h as i32 - 1) * params.stride_height + dilated_filter_h - in_h as i32).max(0) as usize;
     let pad_total_w =
         ((out_w as i32 - 1) * params.stride_width + dilated_filter_w - in_w as i32).max(0) as usize;
-    let padded_c = pad16(in_c);
-    let needs_channel_pad = padded_c != in_c;
-    let needs_pad = pad_total_h > 0 || pad_total_w > 0 || needs_channel_pad;
+    let padded_c = pad16(out_c);
+    let needs_channel_pad = padded_c != out_c;
+    let dm_gt_1 = params.depth_multiplier > 1;
+    let needs_pad = pad_total_h > 0 || pad_total_w > 0 || needs_channel_pad || dm_gt_1;
 
     let wsum = if params.input_offset != 0 { out_c * 4 } else { 0 };
     if needs_pad {
@@ -630,5 +639,52 @@ mod tests {
         p11.filter_shape = [64, 1, 1, 32];
         assert_eq!(conv1x1_scratch_need(&p11), 64 * 4 + 64 * 4);
         assert_eq!(S3Backend::conv2d_scratch_size(&p11), 64 * 4 + 64 * 4);
+    }
+
+    #[test]
+    fn depthwise_dm_gt1_scratch_need_matches_kernel_formula() {
+        // dm=2, 3×3 SAME, in_c=8 -> out_c=16 (kws-style fan-out). dm>1 forces
+        // the staged path: padded input 14×14×16, no channel pad (16 % 16 == 0),
+        // accs 16×4, no wsum (input_offset 0).
+        let p = DepthwiseConv2DParams {
+            input_shape: [1, 12, 12, 8],
+            filter_shape: [1, 3, 3, 16],
+            output_shape: [1, 12, 12, 16],
+            padding: hematite_core::op_params::Padding::Same,
+            stride_width: 1,
+            stride_height: 1,
+            dilation_width_factor: 1,
+            dilation_height_factor: 1,
+            depth_multiplier: 2,
+            input_offset: 0,
+            weights_offset: 0,
+            output_offset: 0,
+            output_multiplier_per_channel: &[0; 16],
+            output_shift_per_channel: &[0; 16],
+            quantized_activation_min: -128,
+            quantized_activation_max: 127,
+        };
+        let expect = (14 * 14 * 16) + 0 + (16 * 4);
+        assert_eq!(depthwise_scratch_need(&p), expect);
+        assert_eq!(S3Backend::depthwise_conv2d_scratch_size(&p), expect);
+
+        // dm=4, in_c=3 -> out_c=12 (non-%16): staged filter 9×16 + channel pad.
+        let mut p2 = p;
+        p2.input_shape = [1, 12, 12, 3];
+        p2.filter_shape = [1, 3, 3, 12];
+        p2.output_shape = [1, 12, 12, 12];
+        p2.depth_multiplier = 4;
+        p2.output_multiplier_per_channel = &[0; 12];
+        p2.output_shift_per_channel = &[0; 12];
+        let expect2 = (14 * 14 * 16) + (9 * 16) + (16 * 4);
+        assert_eq!(depthwise_scratch_need(&p2), expect2);
+        assert_eq!(S3Backend::depthwise_conv2d_scratch_size(&p2), expect2);
+
+        // Non-zero input_offset adds the per-channel weight-sum buffer.
+        let mut p3 = p2;
+        p3.input_offset = -3;
+        let expect3 = (14 * 14 * 16) + (9 * 16) + (16 * 4) + (12 * 4);
+        assert_eq!(depthwise_scratch_need(&p3), expect3);
+        assert_eq!(S3Backend::depthwise_conv2d_scratch_size(&p3), expect3);
     }
 }

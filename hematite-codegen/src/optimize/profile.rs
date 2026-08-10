@@ -480,21 +480,33 @@ fn approx_simd(model: &ParsedModel<'_>, g: &FusedGroup) -> (SimdEst, &'static st
         }
         DEPTHWISE_CONV_2D => {
             let anchor = &model.ops()[g.anchor_op_index];
-            let w = anchor.inputs.get(1).and_then(|&t| model.tensor_by_index(t as usize));
+            let input = anchor
+                .inputs
+                .first()
+                .and_then(|&t| model.tensor_by_index(t as usize));
             let out = model.tensor_by_index(g.output_tensor as usize);
-            match (w, out) {
-                (Some(w), Some(o)) => {
-                    let in_c = last_dim(&w.shape);
+            match (input, out) {
+                (Some(i), Some(o)) => {
+                    let in_c = last_dim(&i.shape);
                     let out_c = last_dim(&o.shape);
-                    if in_c >= 1 && out_c >= 1 && in_c == out_c {
+                    // T3.5 — dm-aware mirror of `accx_eligible_depthwise_dm`
+                    // (accx.rs): the gate requires `out_c == in_c * dm`; any
+                    // `in_c >= 1` is accepted via pad-in-scratch staging.
+                    let dm = match &anchor.options {
+                        Some(ParsedOptions::DepthwiseConv2D {
+                            depth_multiplier, ..
+                        }) => *depth_multiplier,
+                        _ => 1,
+                    };
+                    if in_c >= 1 && out_c >= 1 && out_c == in_c * dm.max(1) as usize {
                         (
                             SimdEst::Simd,
-                            "depthwise: accx_eligible_depthwise in_c==out_c (accx.rs:87-89)",
+                            "depthwise: accx_eligible_depthwise_dm out_c==in_c*dm (accx.rs)",
                         )
                     } else {
                         (
                             SimdEst::Scalar,
-                            "depthwise: accx_eligible_depthwise fails — dm!=1 (accx.rs:87-89)",
+                            "depthwise: accx_eligible_depthwise_dm fails (accx.rs)",
                         )
                     }
                 }

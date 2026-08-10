@@ -654,8 +654,13 @@ fn conv3x3_scratch_need_codegen(
 }
 
 /// Scratch bytes for the depthwise path (`depthwise_scratch_need`).
+///
+/// T3.5 — depth_multiplier > 1: the kernel consumes `out_c`-channel vectors
+/// and the dispatch stages a REPLICATED input, so the padded channel count is
+/// `pad16(out_c)` (== `pad16(in_c)` for dm==1) and dm>1 always forces the
+/// staged path. Keep in sync with `hematite-s3/src/backend.rs`.
 #[allow(clippy::too_many_arguments)]
-fn depthwise_scratch_need_codegen(
+pub fn depthwise_scratch_need_codegen(
     in_h: usize,
     in_w: usize,
     in_c: usize,
@@ -668,6 +673,7 @@ fn depthwise_scratch_need_codegen(
     stride_w: i32,
     dil_h: i32,
     dil_w: i32,
+    depth_multiplier: i32,
     input_offset: i32,
 ) -> usize {
     let dilated_filter_h = (filter_h - 1) * dil_h + 1;
@@ -676,9 +682,11 @@ fn depthwise_scratch_need_codegen(
         ((out_h as i32 - 1) * stride_h + dilated_filter_h - in_h as i32).max(0) as usize;
     let pad_total_w =
         ((out_w as i32 - 1) * stride_w + dilated_filter_w - in_w as i32).max(0) as usize;
-    let padded_c = pad16(in_c);
-    let needs_channel_pad = padded_c != in_c;
-    let needs_pad = pad_total_h > 0 || pad_total_w > 0 || needs_channel_pad;
+    // dm==1: `out_c == in_c`, so pad16(out_c) == pad16(in_c) (historical).
+    let padded_c = pad16(if depth_multiplier > 1 { out_c } else { in_c });
+    let needs_channel_pad = padded_c != out_c;
+    let needs_pad =
+        pad_total_h > 0 || pad_total_w > 0 || needs_channel_pad || depth_multiplier > 1;
     let wsum = if input_offset != 0 { out_c * 4 } else { 0 };
     if needs_pad {
         let pad_input_len = (in_h + pad_total_h) * (in_w + pad_total_w) * padded_c;
@@ -914,6 +922,7 @@ fn emit_depthwise(model: &ParsedModel, storage: &[Storage], i: usize, op: &Parse
         stride_w,
         dilation_h,
         dilation_w,
+        depth_multiplier,
         input_offset,
     );
     Ok(OpEmission {
@@ -1976,5 +1985,85 @@ mod tests {
         u32v(&mut b, 1);
         u32v(&mut b, 1);
         b
+    }
+
+    /// Cross-crate scratch parity (T3.5 / T1.4 gate): the macro-time mirror
+    /// `depthwise_scratch_need_codegen` must equal the runtime
+    /// `S3Backend::depthwise_conv2d_scratch_size` for the dm>1 fan-out shapes
+    /// (and the dm==1 corpus). The runtime formula is canonical — a mismatch
+    /// is a mirror bug.
+    #[test]
+    fn depthwise_scratch_mirror_matches_s3_backend() {
+        use hematite_core::op_params::{DepthwiseConv2DParams, Padding};
+        use hematite_core::KernelBackend;
+        use hematite_s3::backend::S3Backend;
+
+        fn params(
+            dm: i32,
+            in_c: i32,
+            spatial: i32,
+            input_offset: i32,
+        ) -> DepthwiseConv2DParams<'static> {
+            let out_c = in_c * dm;
+            DepthwiseConv2DParams {
+                input_shape: [1, spatial, spatial, in_c],
+                filter_shape: [1, 3, 3, out_c],
+                output_shape: [1, spatial, spatial, out_c],
+                padding: Padding::Same,
+                stride_width: 1,
+                stride_height: 1,
+                dilation_width_factor: 1,
+                dilation_height_factor: 1,
+                depth_multiplier: dm,
+                input_offset,
+                weights_offset: 0,
+                output_offset: 0,
+                // The scratch-size formula reads shapes/offsets only — slice
+                // contents (and length) are irrelevant to `depthwise_scratch_need`.
+                output_multiplier_per_channel: &[],
+                output_shift_per_channel: &[],
+                quantized_activation_min: -128,
+                quantized_activation_max: 127,
+            }
+        }
+
+        fn codegen_need(p: &DepthwiseConv2DParams<'_>) -> usize {
+            depthwise_scratch_need_codegen(
+                p.input_shape[1].max(0) as usize,
+                p.input_shape[2].max(0) as usize,
+                p.input_shape[3].max(0) as usize,
+                p.output_shape[1].max(0) as usize,
+                p.output_shape[2].max(0) as usize,
+                p.output_shape[3].max(0) as usize,
+                p.filter_shape[1],
+                p.filter_shape[2],
+                p.stride_height,
+                p.stride_width,
+                p.dilation_height_factor,
+                p.dilation_width_factor,
+                p.depth_multiplier,
+                p.input_offset,
+            )
+        }
+
+        let mut checked = 0;
+        for &dm in &[1, 2, 4, 8] {
+            for &in_c in &[1, 3, 8, 16, 32] {
+                for &spatial in &[8, 12, 14] {
+                    for &offset in &[0, -3] {
+                        let p = params(dm, in_c, spatial, offset);
+                        let mirror = codegen_need(&p);
+                        let runtime = S3Backend::depthwise_conv2d_scratch_size(&p);
+                        assert_eq!(
+                            mirror, runtime,
+                            "depthwise dm={dm} in_c={in_c} spatial={spatial} offset={offset}: \
+                             codegen mirror {mirror} != S3Backend need {runtime}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked >= 32, "parity matrix did not expand");
     }
 }

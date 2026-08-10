@@ -496,6 +496,69 @@ fn check_depthwise_simd_matches_ref() {
     report(&compare("depthwise_12x12x16_s2", got, want));
 }
 
+// ── Depthwise dm=8 (T3.5): 12x12x8 -> 12x12x64, 3x3 SAME ────────────────────
+
+const DEPTHWISE_DM8_IN: usize = 12 * 12 * 8;
+const DEPTHWISE_DM8_W: usize = 1 * 3 * 3 * 64;
+const DEPTHWISE_DM8_OUT: usize = 12 * 12 * 64;
+
+fn check_depthwise_dm8_simd_matches_ref() {
+    // Buffers carved from the SRAM bench arena — NOT stack locals (see
+    // `arena_carve` for the task-18 OOB device finding).
+    let mut off = 0;
+    let input = arena_carve_i8(&mut off, DEPTHWISE_DM8_IN);
+    let weights = arena_carve_i8(&mut off, DEPTHWISE_DM8_W);
+    let want = arena_carve_i8(&mut off, DEPTHWISE_DM8_OUT);
+    let got = arena_carve_i8(&mut off, DEPTHWISE_DM8_OUT);
+    // dm=8 stages a replicated 14×14×64 padded input (12,544 B) + 256 B accs.
+    let scratch = arena_carve(&mut off, 16384);
+    input.copy_from_slice(&make_pattern::<DEPTHWISE_DM8_IN>(0xDD8A_DM8));
+    weights.copy_from_slice(&make_pattern::<DEPTHWISE_DM8_W>(0x0F8A_DM8));
+    let bias = bias_pattern::<64>();
+    want.fill(0);
+    got.fill(0);
+    scratch.fill(0);
+    let params = DepthwiseConv2DParams {
+        input_shape: [1, 12, 12, 8],
+        filter_shape: [1, 3, 3, 64],
+        output_shape: [1, 12, 12, 64],
+        padding: Padding::Same,
+        stride_width: 1,
+        stride_height: 1,
+        dilation_width_factor: 1,
+        dilation_height_factor: 1,
+        depth_multiplier: 8,
+        input_offset: 0,
+        weights_offset: 0,
+        output_offset: 0,
+        output_multiplier_per_channel: &MULT_64,
+        output_shift_per_channel: &SHIFT_64,
+        quantized_activation_min: -128,
+        quantized_activation_max: 127,
+    };
+
+    hematite_ref::depthwise_conv::depthwise_conv2d(
+        input,
+        weights,
+        &bias,
+        &params,
+        want,
+        scratch,
+    )
+    .expect("harness: ref depthwise dm8 shape");
+    hematite_s3::depthwise::depthwise_conv2d(
+        input,
+        weights,
+        &bias,
+        &params,
+        got,
+        scratch,
+    )
+    .expect("harness: s3 depthwise dm8 shape");
+
+    report(&compare("depthwise_12x12x8_dm8", got, want));
+}
+
 // ── Conv 1x1: 64x1x1x64 (spec.rs EMBER_CONV_1X1_64_PARAMS) ─────────────────
 
 const CONV1X1_IN: usize = 1 * 1 * 64;
@@ -732,6 +795,7 @@ pub fn validate_all() {
     check_relu_simd_matches_ref();
     check_softmax_simd_matches_ref();
     check_depthwise_simd_matches_ref();
+    check_depthwise_dm8_simd_matches_ref();
     check_conv1x1_simd_matches_ref();
     check_conv3x3_simd_matches_ref();
     check_fc_simd_matches_ref();

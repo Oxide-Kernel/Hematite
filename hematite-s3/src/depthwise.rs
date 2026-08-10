@@ -195,6 +195,64 @@ pub fn depthwise_conv2d(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Host-compilable SIMD-pipeline helpers (T3.5 — depth_multiplier > 1).
+//
+// The device dispatch below stages a replicated input and applies the
+// input_offset fold; these helpers implement exactly that staging/fold so the
+// host SIMD-model tests exercise the real device-pipeline code. Compiled on
+// the device (used by the dispatch) and under `#[cfg(test)]` on host (used by
+// the unit tests); never compiled into host release builds.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Stage the real input interior into the padded/replicated staged buffer.
+///
+/// `dst` is the pre-filled staged buffer (fill = `-input_offset`, or 0) of
+/// `padded_h×padded_w×dst_c` bytes; the real pixel at (h, w) is written at
+/// ((h + pad_h), (w + pad_w)). dm==1 copies channels 1:1 (the historical
+/// path); dm>1 replicates each input channel `depth_multiplier` times so
+/// output channel `oc = i*dm + j` reads input channel `i` — the TFLM
+/// depthwise fan-out the SIMD kernel consumes as per-lane values.
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+pub(crate) fn stage_depthwise_pixels(
+    dst: &mut [u8],
+    dst_c: usize,
+    dst_w: usize,
+    src: &[i8],
+    in_h: usize,
+    in_w: usize,
+    in_c: usize,
+    depth_multiplier: usize,
+    pad_h: usize,
+    pad_w: usize,
+) {
+    for h in 0..in_h {
+        for w in 0..in_w {
+            let srow = (h * in_w + w) * in_c;
+            let drow = ((h + pad_h) * dst_w + (w + pad_w)) * dst_c;
+            for i in 0..in_c {
+                let v = src[srow + i] as u8;
+                let base = drow + i * depth_multiplier;
+                for j in 0..depth_multiplier {
+                    dst[base + j] = v;
+                }
+            }
+        }
+    }
+}
+
+/// Phase-C input_offset fold: `acc[oc] += input_offset * wsum[oc]` in wrapping
+/// i32 — bit-identical to the scalar `Σ(in + off)·w = Σ in·w + off·Σw` split
+/// (the kernel produces `Σ in·w`).
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+pub(crate) fn fold_input_offset(accs: &mut [i32], wsum: &[i32], input_offset: i32) {
+    for oc in 0..accs.len() {
+        let v = accs[oc];
+        let s = wsum[oc];
+        accs[oc] = v.wrapping_add(input_offset.wrapping_mul(s));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // TIE728 SIMD backend — device-only (NEVER compiled on host)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -217,6 +275,14 @@ pub(crate) struct DepthwiseAccxCtx<'a> {
 /// ONE output pixel (all `out_c` channels) from the raw HWCN weights, into
 /// `scratch`; the bit-exact TFLite requantize epilogue runs in Rust. The
 /// caller strides over the output image, one kernel call per pixel.
+///
+/// Depth multipliers > 1 (T3.5): the dispatch stages a *replicated* input —
+/// each input channel `i` fanned out to `dm` output channels `i*dm .. i*dm+dm`
+/// — so the silicon-proven dm==1 per-lane kernel contract applies directly to
+/// the out_c-channel staged vectors; each output channel keeps its own filter
+/// row and its own per-channel requantize pair (the `requantize_1x1`
+/// epilogue is already per-channel). The dm==1 path (input copied 1:1, no
+/// replication) is byte-for-byte unchanged.
 ///
 /// Returns `Ok(true)` when the ACCX path handled the layer, `Ok(false)` when
 /// the layer is not eligible (caller falls through to scalar).
@@ -241,12 +307,11 @@ fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, Kerne
         - params.input_shape[2])
         / 2;
 
-    if params.depth_multiplier != 1
-        || params.dilation_height_factor != 1
+    if params.dilation_height_factor != 1
         || params.dilation_width_factor != 1
         || filter_h != 3
         || filter_w != 3
-        || !crate::accx::accx_eligible_depthwise(input_c, out_c)
+        || !crate::accx::accx_eligible_depthwise_dm(input_c, out_c, params.depth_multiplier)
     {
         return Ok(false);
     }
@@ -278,9 +343,18 @@ fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, Kerne
     // channel padding). Padded channels have zero input and zero weights, so
     // they contribute 0 to every real output channel (depthwise per-lane
     // semantics: output channel oc only sees input channel oc).
-    let padded_c = ((input_c + 15) / 16) * 16;
-    let needs_channel_pad = padded_c != input_c;
-    let needs_pad = pad_total_h > 0 || pad_total_w > 0 || needs_channel_pad;
+    //
+    // T3.5 — depth_multiplier > 1: the kernel consumes `out_c`-channel
+    // vectors, and the dispatch stages a REPLICATED input (each input channel
+    // `i` fanned out to `dm` output channels `i*dm .. i*dm+dm`), so the padded
+    // channel count is pad16(out_c) — for dm==1 `out_c == input_c` and this is
+    // exactly the historical pad16(input_c). dm>1 always stages (replication
+    // cannot run on the caller's in_c-channel input directly).
+    let depth_multiplier = params.depth_multiplier.max(1) as usize;
+    let dm_gt_1 = depth_multiplier > 1;
+    let padded_c = ((out_c + 15) / 16) * 16;
+    let needs_channel_pad = padded_c != out_c;
+    let needs_pad = pad_total_h > 0 || pad_total_w > 0 || needs_channel_pad || dm_gt_1;
 
     //   [padded_input: padded_h*padded_w*padded_c]
     //   [padded_filter: 9*padded_c   (only when channel padding)]
@@ -339,14 +413,34 @@ fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, Kerne
         // contribute 0 regardless.
         let fill: u8 = if input_offset != 0 { (-input_offset) as u8 } else { 0 };
         unsafe { core::ptr::write_bytes(p_in, fill, pad_input_len) };
-        let src = ctx.input.as_ptr();
-        for h in 0..in_h {
-            for w in 0..in_w {
-                let srow = unsafe { src.add((h * in_w + w) * input_c) };
-                let drow = unsafe {
-                    p_in.add(((h + pad_h) * padded_w + (w + pad_w)) * padded_c) as *mut i8
-                };
-                unsafe { core::ptr::copy_nonoverlapping(srow, drow, input_c) };
+        if dm_gt_1 {
+            // T3.5 — fan out each input channel `dm` times so output channel
+            // `oc = i*dm + j` reads input channel `i`. Padded channel slots
+            // keep the fill; their (padded) weights are zero so they
+            // contribute 0 and the Phase C fold cancels their `off·0 = 0`.
+            let staged = unsafe { core::slice::from_raw_parts_mut(p_in, pad_input_len) };
+            stage_depthwise_pixels(
+                staged,
+                padded_c,
+                padded_w,
+                ctx.input,
+                in_h,
+                in_w,
+                input_c,
+                depth_multiplier,
+                pad_h,
+                pad_w,
+            );
+        } else {
+            let src = ctx.input.as_ptr();
+            for h in 0..in_h {
+                for w in 0..in_w {
+                    let srow = unsafe { src.add((h * in_w + w) * input_c) };
+                    let drow = unsafe {
+                        p_in.add(((h + pad_h) * padded_w + (w + pad_w)) * padded_c) as *mut i8
+                    };
+                    unsafe { core::ptr::copy_nonoverlapping(srow, drow, input_c) };
+                }
             }
         }
 
@@ -382,10 +476,12 @@ fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, Kerne
     }
 
     // Depthwise filter is [tap][oc] (HWCN); wsum[oc] = Σ_tap w[tap·out_c + oc].
+    // The stride is `k_in_c` (== padded_c when channel-padded, == out_c on the
+    // raw [tap][out_c] filter otherwise) so the staged layout is read correctly.
     if input_offset != 0 {
         let ws = unsafe { core::slice::from_raw_parts_mut(wsum, out_c) };
         let wv = unsafe { core::slice::from_raw_parts(k_w_ptr, 9 * k_in_c) };
-        crate::accx::weight_sums_depthwise(ws, wv, out_c);
+        crate::accx::weight_sums_depthwise(ws, wv, k_in_c);
     }
 
     let multipliers = params.output_multiplier_per_channel;
@@ -413,11 +509,9 @@ fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, Kerne
                 );
             }
             if input_offset != 0 {
-                for oc in 0..out_c {
-                    let v = unsafe { accs.add(oc).read() };
-                    let s = unsafe { wsum.add(oc).read() };
-                    unsafe { accs.add(oc).write(v.wrapping_add(input_offset.wrapping_mul(s))) };
-                }
+                let acc_slice = unsafe { core::slice::from_raw_parts_mut(accs, out_c) };
+                let ws = unsafe { core::slice::from_raw_parts(wsum, out_c) };
+                fold_input_offset(acc_slice, ws, input_offset);
             }
             let acc_slice = unsafe { core::slice::from_raw_parts_mut(accs, out_c) };
             crate::accx::requantize_1x1(&mut crate::accx::ReqCtx {
@@ -454,7 +548,7 @@ impl PreparedDepthwise {
         let input_c = params.input_shape[3] as usize;
         let out_channels = params.output_shape[3] as usize;
         let accx = cfg!(all(target_arch = "xtensa", not(feature = "qemu")))
-            && crate::accx::accx_eligible_depthwise(input_c, out_channels);
+            && crate::accx::accx_eligible_depthwise_dm(input_c, out_channels, params.depth_multiplier);
         Ok(Self { accx, params })
     }
 
@@ -486,5 +580,258 @@ impl PreparedDepthwise {
             }
         }
         depthwise_conv2d(input, weights, bias, self.params, output, scratch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate alloc;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use super::*;
+    use hematite_core::op_params::{DepthwiseConv2DParams, Padding};
+
+    /// Host model of the `s8_accx_depthwise` per-lane accumulation contract on
+    /// the staged buffers (T3.5): `acc[oc] = Σ_tap staged_w[tap*padded_c + oc]
+    /// * staged_in[base + tap*padded_c + (tap/3)*row_delta + oc]` — the exact
+    /// QACC lane addressing the asm uses (input advances `padded_c` per tap,
+    /// `row_delta` per row; filter advances `padded_c` per tap).
+    fn kernel_model_accs(
+        staged_in: &[u8],
+        staged_w: &[i8],
+        padded_c: usize,
+        row_delta: usize,
+        base: usize,
+        out_c: usize,
+    ) -> Vec<i32> {
+        let mut accs = vec![0i32; out_c];
+        for tap in 0..9 {
+            let in_off = tap * padded_c + (tap / 3) * row_delta;
+            for oc in 0..out_c {
+                let iv = i32::from(staged_in[base + in_off + oc] as i8);
+                let wv = i32::from(staged_w[tap * padded_c + oc]);
+                accs[oc] = accs[oc].wrapping_add(iv.wrapping_mul(wv));
+            }
+        }
+        accs
+    }
+
+    /// Run the full device SIMD pipeline in software — real
+    /// `stage_depthwise_pixels` staging, the kernel-model accumulators, the
+    /// real `fold_input_offset`, and the real `requantize_1x1` epilogue —
+    /// producing one output layer.
+    fn simd_model_layer(
+        input: &[i8],
+        weights: &[i8],
+        bias: &[i32],
+        p: &DepthwiseConv2DParams<'_>,
+    ) -> Vec<i8> {
+        let in_h = p.input_shape[1] as usize;
+        let in_w = p.input_shape[2] as usize;
+        let in_c = p.input_shape[3] as usize;
+        let out_h = p.output_shape[1] as usize;
+        let out_w = p.output_shape[2] as usize;
+        let out_c = p.output_shape[3] as usize;
+        let dm = p.depth_multiplier.max(1) as usize;
+        let stride_h = p.stride_height.max(1) as usize;
+        let stride_w = p.stride_width.max(1) as usize;
+
+        let dilated_h = (p.filter_shape[1] - 1) * p.dilation_height_factor + 1;
+        let dilated_w = (p.filter_shape[2] - 1) * p.dilation_width_factor + 1;
+        let pad_total_h = ((out_h as i32 - 1) * p.stride_height + dilated_h - in_h as i32)
+            .max(0) as usize;
+        let pad_total_w = ((out_w as i32 - 1) * p.stride_width + dilated_w - in_w as i32)
+            .max(0) as usize;
+        let pad_h = pad_total_h / 2;
+        let pad_w = pad_total_w / 2;
+        let padded_h = in_h + pad_total_h;
+        let padded_w = in_w + pad_total_w;
+        let padded_c = ((out_c + 15) / 16) * 16;
+        let needs_channel_pad = padded_c != out_c;
+        let row_delta = if padded_w >= 3 { (padded_w - 3) * padded_c } else { 0 };
+
+        // Staged (replicated + padded) input, pre-filled like the dispatch.
+        let fill: u8 = if p.input_offset != 0 { (-p.input_offset) as u8 } else { 0 };
+        let mut staged_in = vec![fill; padded_h * padded_w * padded_c];
+        stage_depthwise_pixels(
+            &mut staged_in,
+            padded_c,
+            padded_w,
+            input,
+            in_h,
+            in_w,
+            in_c,
+            dm,
+            pad_h,
+            pad_w,
+        );
+
+        // Staged filter [tap][padded_c]; zero-fill padded channels.
+        let mut staged_w = vec![0i8; 9 * padded_c];
+        for tap in 0..9 {
+            staged_w[tap * padded_c..tap * padded_c + out_c]
+                .copy_from_slice(&weights[tap * out_c..(tap + 1) * out_c]);
+        }
+        let _ = needs_channel_pad;
+
+        // Per-channel weight sums (Phase C fold).
+        let mut wsum = vec![0i32; out_c];
+        crate::accx::weight_sums_depthwise(&mut wsum, &staged_w, padded_c);
+
+        let multipliers = p.output_multiplier_per_channel;
+        let shifts = p.output_shift_per_channel;
+        let (uniform_mult, uniform_shift) = match crate::accx::uniform_scale(multipliers, shifts) {
+            Some((m, s)) => (m, s),
+            None => (0, i32::MIN),
+        };
+        let mut output = vec![0i8; out_h * out_w * out_c];
+        for oh in 0..out_h {
+            for ow in 0..out_w {
+                let base = (oh * stride_h * padded_w + ow * stride_w) * padded_c;
+                let mut accs = kernel_model_accs(&staged_in, &staged_w, padded_c, row_delta, base, out_c);
+                if p.input_offset != 0 {
+                    fold_input_offset(&mut accs, &wsum, p.input_offset);
+                }
+                crate::accx::requantize_1x1(&mut crate::accx::ReqCtx {
+                    accs: &accs,
+                    bias,
+                    multipliers,
+                    shifts,
+                    output_offset: p.output_offset,
+                    act_min: p.quantized_activation_min,
+                    act_max: p.quantized_activation_max,
+                    out_base: (oh * out_w + ow) * out_c,
+                    output: &mut output,
+                    uniform_mult,
+                    uniform_shift,
+                });
+            }
+        }
+        output
+    }
+
+    fn per_channel_mult(n: usize) -> Vec<i32> {
+        (0..n).map(|i| (1 << 30) - (i as i32) * 7919).collect()
+    }
+
+    fn per_channel_shift(n: usize) -> Vec<i32> {
+        (0..n).map(|i| (i % 3) as i32).collect()
+    }
+
+    /// Deterministic pseudo-random `i8` pattern (full int8 range).
+    fn pattern(seed: u32, n: usize) -> Vec<i8> {
+        let mut out = vec![0i8; n];
+        let mut x = seed;
+        for v in out.iter_mut() {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *v = (x >> 16) as i8;
+        }
+        out
+    }
+
+    fn pattern_i32(seed: u32, n: usize) -> Vec<i32> {
+        let mut out = vec![0i32; n];
+        let mut x = seed;
+        for v in out.iter_mut() {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *v = ((x >> 16) as i32) * 37 - 500;
+        }
+        out
+    }
+
+    /// Host bit-exact gate (T3.5): the device SIMD pipeline model must equal
+    /// the independent `hematite-ref` scalar depthwise for every
+    /// dm {2,4,8} × 3×3 × in_c {1,3,8,16,32} fan-out shape, across offsets and
+    /// identity / non-identity per-channel multipliers — zero mismatches.
+    #[test]
+    fn depthwise_dm_gt1_simd_model_matches_ref_bit_exact() {
+        let mut checked = 0;
+        for &dm in &[2, 4, 8] {
+            for &in_c in &[1, 3, 8, 16, 32] {
+                let out_c = (in_c * dm) as i32;
+                for (spatial, offsets) in [(&[8, 12][..], &[0, -3][..]), (&[7][..], &[5, 0][..])] {
+                    for &sp in spatial {
+                        for &in_off in offsets {
+                            // Case A: identity uniform scale (1<<30, shift 1).
+                            // Case B: non-identity per-channel mult/shift.
+                            // Case C: uniform hoisted (1<<29, shift 0).
+                            for mode in 0..3 {
+                                let n = out_c as usize;
+                                let (mults, shifts): (Vec<i32>, Vec<i32>) = match mode {
+                                    0 => (vec![1 << 30; n], vec![1; n]),
+                                    1 => (per_channel_mult(n), per_channel_shift(n)),
+                                    _ => (vec![1 << 29; n], vec![0; n]),
+                                };
+                                let p = DepthwiseConv2DParams {
+                                    input_shape: [1, sp, sp, in_c as i32],
+                                    filter_shape: [1, 3, 3, out_c],
+                                    output_shape: [1, sp, sp, out_c],
+                                    padding: Padding::Same,
+                                    stride_width: 1,
+                                    stride_height: 1,
+                                    dilation_width_factor: 1,
+                                    dilation_height_factor: 1,
+                                    depth_multiplier: dm,
+                                    input_offset: in_off,
+                                    weights_offset: 0,
+                                    output_offset: if in_off == 0 { 0 } else { -10 },
+                                    output_multiplier_per_channel: &mults,
+                                    output_shift_per_channel: &shifts,
+                                    quantized_activation_min: if mode == 1 { 0 } else { -128 },
+                                    quantized_activation_max: 127,
+                                };
+                                let in_len = (sp * sp) as usize * in_c as usize;
+                                let w_len = 9 * out_c as usize;
+                                let seed = 0x51E5_0000u32 | (dm as u32 * 101 + in_c as u32);
+                                let input = pattern(seed, in_len);
+                                let weights = pattern(0xBEE5 + in_c as u32 * 17, w_len);
+                                let bias = pattern_i32(0xBAD + out_c as u32, out_c as usize);
+
+                                let got = simd_model_layer(&input, &weights, &bias, &p);
+                                let mut want = vec![0i8; got.len()];
+                                hematite_ref::depthwise_conv::depthwise_conv2d(
+                                    &input,
+                                    &weights,
+                                    &bias,
+                                    &p,
+                                    &mut want,
+                                    &mut [],
+                                )
+                                .expect("ref depthwise accepts the shape");
+                                assert_eq!(
+                                    got, want,
+                                    "dm={dm} in_c={in_c} sp={sp} in_off={in_off} mode={mode}: \
+                                     SIMD-model output must equal hematite-ref scalar"
+                                );
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked >= 100, "dm>1 matrix did not expand ({checked})");
+    }
+
+    /// The replication staging must produce the exact TFLM fan-out: output
+    /// channel `oc = i*dm + j` gets input channel `i` (all `dm` copies equal).
+    #[test]
+    fn stage_depthwise_pixels_replicates_fan_out() {
+        let src: Vec<i8> = (0..4).map(|i| i as i8 - 2).collect(); // in_c = 4 pixels 1x1
+        let mut dst = vec![0xEEu8; 8]; // dm = 2, dst_c = 8
+        stage_depthwise_pixels(&mut dst, 8, 1, &src, 1, 1, 4, 2, 0, 0);
+        assert_eq!(
+            dst,
+            vec![
+                (0u8).wrapping_sub(2),
+                (0u8).wrapping_sub(2),
+                (1u8).wrapping_sub(2),
+                (1u8).wrapping_sub(2),
+                (2u8).wrapping_sub(2),
+                (2u8).wrapping_sub(2),
+                (3u8).wrapping_sub(2),
+                (3u8).wrapping_sub(2),
+            ]
+        );
     }
 }

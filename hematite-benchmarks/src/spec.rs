@@ -441,6 +441,71 @@ const SIMD_DEPTHWISE_NON16_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseCon
     quantized_activation_max: 127,
 };
 
+/// depth_multiplier = 2 depthwise (T3.5): in_c 8 → out_c 16, 3×3 SAME. The
+/// dm>1 SIMD dispatch stages a replicated input (each input channel fanned
+/// out to dm output channels) and per-channel requantizes — bit-exact vs ref.
+const SIMD_DEPTHWISE_DM2_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseConv2DParams {
+    input_shape: [1, 12, 12, 8],
+    filter_shape: [1, 3, 3, 16],
+    output_shape: [1, 12, 12, 16],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    depth_multiplier: 2,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// depth_multiplier = 4 depthwise (T3.5): in_c 8 → out_c 32.
+const SIMD_DEPTHWISE_DM4_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseConv2DParams {
+    input_shape: [1, 12, 12, 8],
+    filter_shape: [1, 3, 3, 32],
+    output_shape: [1, 12, 12, 32],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    depth_multiplier: 4,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_32,
+    output_shift_per_channel: &SHIFT_32,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// depth_multiplier = 8 depthwise (T3.5): in_c 8 → out_c 64 — the KWS
+/// keyword-spotting fan-out shape family that drives the 12.3× model gap
+/// (kws 12,983,503 → 1,059,889 cyc vs ESP-NN; ESP-NN-relative bar:
+/// < 1,059,889 cyc / 4 ms, user-verified 2026-08-10 — Scope table).
+const SIMD_DEPTHWISE_DM8_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseConv2DParams {
+    input_shape: [1, 12, 12, 8],
+    filter_shape: [1, 3, 3, 64],
+    output_shape: [1, 12, 12, 64],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    depth_multiplier: 8,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_64,
+    output_shift_per_channel: &SHIFT_64,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
 /// FC with input_dim 256 and output_dim 64 (both %16) — fires the TIE728
 /// `dl_tie728_s8_conv2d_11cn` path (the same entry point conv1x1 uses).
 const SIMD_FC_256X64_PARAMS: FullyConnectedParams<'static> = FullyConnectedParams {
@@ -702,6 +767,35 @@ pub const fn kernel_specs() -> &'static [KernelSpec] {
             params: KernelParams::Depthwise(&SIMD_DEPTHWISE_NON16_PARAMS),
             reference: None,
             note: "Phase F non-%16 channel row: 12 channels zero-padded to 16 in scratch.",
+        },
+        KernelSpec {
+            name: "depthwise_s8 12x12,8x3x3x16 dm2 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::DepthwiseConv2d,
+            params: KernelParams::Depthwise(&SIMD_DEPTHWISE_DM2_PARAMS),
+            reference: None,
+            note: "T3.5 depth_multiplier=2 row: each input channel fans out to 2 output channels (replicated-input staging + per-channel requantize).",
+        },
+        KernelSpec {
+            name: "depthwise_s8 12x12,8x3x3x32 dm4 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::DepthwiseConv2d,
+            params: KernelParams::Depthwise(&SIMD_DEPTHWISE_DM4_PARAMS),
+            reference: None,
+            note: "T3.5 depth_multiplier=4 row: in_c 8 → out_c 32, 3×3 SAME.",
+        },
+        KernelSpec {
+            name: "depthwise_s8 12x12,8x3x3x64 dm8 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::DepthwiseConv2d,
+            params: KernelParams::Depthwise(&SIMD_DEPTHWISE_DM8_PARAMS),
+            reference: Some(CompetitorBaseline {
+                name: "ESP-NN optimized (kws depthwise fan-out)",
+                cycles: None,
+                target_speedup_x100: None,
+                source: "plan composed-kernels Scope table (user-verified 2026-08-10): kws 12,983,503 → 1,059,889 cyc / 54 → 4 ms (12.3×); ESP-NN-relative bar = beat 1,059,889 cyc / 4 ms. Measured Hematite row lands in T6.x (on-device).",
+            }),
+            note: "T3.5 depth_multiplier=8 row — the KWS keyword-spotting fan-out shape family (dm=8).",
         },
         KernelSpec {
             name: "max_pool_s8 2x2x16 (SIMD)",
@@ -1738,6 +1832,7 @@ mod tests {
 
                 // Only rows the ACCX gate accepts are SIMD-eligible weighted
                 // ops; the emulation must mirror the asm for exactly those.
+                let is_depthwise = matches!(spec.params, KernelParams::Depthwise(_));
                 let (in_c, out_c, taps) = match &spec.params {
                     KernelParams::Conv(p) if p.filter_shape[1] == 1 && p.filter_shape[2] == 1 => {
                         (p.filter_shape[3] as usize, p.filter_shape[0] as usize, 1)
@@ -1748,9 +1843,24 @@ mod tests {
                     KernelParams::Fc(p) => {
                         (p.input_dim as usize, p.output_dim as usize, 1)
                     }
+                    KernelParams::Depthwise(p) => {
+                        (p.input_shape[3] as usize, p.output_shape[3] as usize, 9)
+                    }
                     _ => continue,
                 };
-                if !(in_c >= 16 && in_c % 16 == 0 && out_c >= 1) {
+                let eligible = if is_depthwise {
+                    match &spec.params {
+                        KernelParams::Depthwise(p) => {
+                            in_c >= 1
+                                && out_c >= 1
+                                && out_c == in_c * p.depth_multiplier.max(1) as usize
+                        }
+                        _ => unreachable!(),
+                    }
+                } else {
+                    in_c >= 16 && in_c % 16 == 0 && out_c >= 1
+                };
+                if !eligible {
                     continue;
                 }
                 let mut emu = vec![0i8; lay.output_len];
@@ -1841,6 +1951,69 @@ mod tests {
                                 p.quantized_activation_max,
                             );
                             emu[oc] = saturating_cast(clamped);
+                        }
+                    }
+                    KernelParams::Depthwise(p) => {
+                        // TFLM depthwise fan-out (T3.5): output channel
+                        // `oc = i*dm + j` reads input channel `i`; weights are
+                        // HWCN [tap][out_c], so `w_idx = tap*out_c + oc`. The
+                        // SIMD dispatch stages a replicated input so the
+                        // per-lane kernel contract equals this accumulation.
+                        let in_h = p.input_shape[1] as usize;
+                        let in_w = p.input_shape[2] as usize;
+                        let out_h = p.output_shape[1] as usize;
+                        let out_w = p.output_shape[2] as usize;
+                        let dm = p.depth_multiplier.max(1) as usize;
+                        let stride_h = p.stride_height as usize;
+                        let stride_w = p.stride_width as usize;
+                        let dilated_h = (p.filter_shape[1] - 1) * p.dilation_height_factor + 1;
+                        let dilated_w = (p.filter_shape[2] - 1) * p.dilation_width_factor + 1;
+                        let pad_h = (((out_h as i32 - 1) * p.stride_height + dilated_h
+                            - p.input_shape[1])
+                            / 2)
+                            .max(0) as usize;
+                        let pad_w = (((out_w as i32 - 1) * p.stride_width + dilated_w
+                            - p.input_shape[2])
+                            / 2)
+                            .max(0) as usize;
+                        for oh in 0..out_h {
+                            for ow in 0..out_w {
+                                #[allow(clippy::needless_range_loop)]
+                                for oc in 0..out_c {
+                                    let ic = oc / dm;
+                                    let mut acc: i64 = 0;
+                                    for tap in 0..taps {
+                                        let (kh, kw) = (tap / 3, tap % 3);
+                                        let ih = (oh * stride_h + kh) as i32 - pad_h as i32;
+                                        let iw = (ow * stride_w + kw) as i32 - pad_w as i32;
+                                        if ih < 0
+                                            || iw < 0
+                                            || ih as usize >= in_h
+                                            || iw as usize >= in_w
+                                        {
+                                            continue;
+                                        }
+                                        let in_idx = (ih as usize * in_w + iw as usize) * in_c + ic;
+                                        let w_idx = tap * out_c + oc;
+                                        acc += bufs.weights[w_idx] as i64
+                                            * (bufs.input[in_idx] as i64 + p.input_offset as i64);
+                                    }
+                                    let acc32 = (bufs.bias[oc] as i64 + acc).clamp(
+                                        i32::MIN as i64,
+                                        i32::MAX as i64,
+                                    ) as i32;
+                                    let scaled = multiply_by_quantized_multiplier(
+                                        acc32,
+                                        p.output_multiplier_per_channel[oc],
+                                        p.output_shift_per_channel[oc],
+                                    );
+                                    let clamped = (scaled + p.output_offset).clamp(
+                                        p.quantized_activation_min,
+                                        p.quantized_activation_max,
+                                    );
+                                    emu[(oh * out_w + ow) * out_c + oc] = saturating_cast(clamped);
+                                }
+                            }
                         }
                     }
                     _ => unreachable!(),

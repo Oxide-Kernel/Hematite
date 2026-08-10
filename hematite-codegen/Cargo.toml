@@ -16,3 +16,9 @@ hematite-memory = { path = "../hematite-memory" }
 proc-macro2 = { workspace = true }
 quote = { workspace = true }
 syn = { workspace = true }
+
+[dev-dependencies]
+# Scratch parity tests (T3.5 / T1.4): the macro-time mirror formulas must equal
+# the runtime `S3Backend::*_scratch_size` computations. The dev-dep keeps the
+# proc-macro lib itself free of any runtime backend dependency.
+hematite-s3 = { path = "../hematite-s3" }
