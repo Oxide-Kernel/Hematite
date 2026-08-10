@@ -237,7 +237,10 @@ pub struct EspAppDesc {
 use crate::guardrails::{verify_boot_profile, watchdog_disabled_policy, BootProfile, StackCanary};
 #[cfg(not(feature = "qemu"))]
 use crate::guardrails::assert_ccount_calibration;
-use crate::model_bench::{model_bench_specs, ModelBenchSpec};
+use crate::model_bench::{
+    carve_model_bufs, fill_input_pattern, model_bench_specs, passes_reference_bar,
+    run_model_bench, ModelBenchSpec,
+};
 use crate::report::{row_from_summary, ReportRow};
 use crate::spec::{
     carve_into, fill_pattern, kernel_specs, layout, run_kernel, run_ref_kernel, KernelSpec,
@@ -995,20 +998,144 @@ fn emit_row(row: &ReportRow, ref_fnv: u32, s3_fnv: u32) {
     );
 }
 
-/// Emit the model-level registry.  Rows whose runner is not yet wired (no
-/// `.tflite` until T5.2) are listed with their documented reference bar and a
-/// NOT-WIRED marker — no fabricated measurements.
+/// Emit the model-level registry row when no runner is compiled in this
+/// build (no `model-validation` feature): the spec + its documented bar only,
+/// never a fabricated measurement.
 fn emit_model_row(spec: &ModelBenchSpec) {
     let bar_tenths = spec.reference_ms_tenths.unwrap_or(0);
     let bar_ms = (bar_tenths / 10, bar_tenths % 10);
     firmware_log!(
-        "| {} | {} | NOT-WIRED (T5.2) | bar={}.{} ms | {}",
+        "| {} | {} | bar-only (no runner; build with --features model-validation) | bar={}.{} ms | {}",
         spec.name,
         spec.tier.label(),
         bar_ms.0,
         bar_ms.1,
         spec.source,
     );
+}
+
+/// Benchmark one real zoo model end-to-end via `Model::<S3Backend>` (plan
+/// simd-zoo-hardening todo 19): warm-up + N ≥ 10 timed inferences with
+/// buffers carved from the bench arena, one timed row (cycles + wall ms) with
+/// the reference-bar verdict.
+///
+/// SKIP records (Metis F10 format) are emitted instead of timings where the
+/// model cannot run on this board — never a fabricated measurement:
+///
+/// * person_detect — the generated `predict` allocas ~232 KB of stack
+///   intermediates vs the ~65 KB device stack; the arena-stack SP switch
+///   faults on real silicon (todo-5 finding). SKIP reason=stack.
+/// * mobilenet_v2 — PSRAM tier; this board has no PSRAM (`PSRAM: 0 bytes`).
+///   SKIP reason=no-psram when the PSRAM arena is empty (the carve check
+///   catches a present-but-too-small arena the same way).
+#[cfg(feature = "model-validation")]
+fn bench_zoo_model(spec: &ModelBenchSpec, clock: &mut RealClock, canary: &mut StackCanary) {
+    use crate::model_bench::zoo_runners::zoo_runner_for;
+
+    // person_detect: proven hardware-fault on this board — never attempted.
+    if spec.path == "models/zoo/person_detect_vww/person_detect_int8.tflite" {
+        crate::firmware::uart0_log!(
+            "model person_detect_int8 [bench]: SKIP reason=stack rerun_condition=codegen-intermediates-off-stack"
+        );
+        firmware_log!(
+            "| {} | {} | SKIP | reason=stack rerun_condition=codegen-intermediates-off-stack |",
+            spec.name,
+            spec.tier.label(),
+        );
+        return;
+    }
+
+    // SAFETY: carve_model_bufs returns the only live borrow of the arena for
+    // the duration of this benchmark; the arena is re-carved per spec (same
+    // pattern as bench_kernel).
+    let arena = unsafe {
+        match spec.tier {
+            crate::spec::MemoryTier::Sram => &mut SRAM_ARENA.0[..],
+            crate::spec::MemoryTier::Psram => &mut **core::ptr::addr_of_mut!(PSRAM_ARENA),
+        }
+    };
+    // mobilenet_v2 PSRAM gate: no PSRAM on this board.
+    if arena.is_empty() {
+        crate::firmware::uart0_log!(
+            "model mobilenet_v2_1.0_224_int8 [bench]: SKIP reason=no-psram rerun_condition=board-with-PSRAM"
+        );
+        firmware_log!(
+            "| {} | {} | SKIP | reason=no-psram rerun_condition=board-with-PSRAM |",
+            spec.name,
+            spec.tier.label(),
+        );
+        return;
+    }
+
+    let mut runner = zoo_runner_for(spec);
+    let mut bufs = match carve_model_bufs(
+        arena,
+        runner.input_len(),
+        runner.output_len(),
+        runner.scratch_len(),
+    ) {
+        Some(b) => b,
+        None => {
+            firmware_log!(
+                "| {} | {} | SKIP | reason=arena-too-small |",
+                spec.name,
+                spec.tier.label(),
+            );
+            return;
+        }
+    };
+    let cfg = BenchmarkConfig::default();
+    fill_input_pattern(bufs.input);
+    bufs.output.fill(0);
+
+    let log = run_model_bench(clock, &mut runner, bufs.input, bufs.output, bufs.scratch, &cfg);
+    let summary = match summarize(&log) {
+        Some(s) => s,
+        None => return, // unreachable: run_repeated floors at 10
+    };
+    let out_fnv = fnv1a(bufs.output);
+
+    match spec.reference_ms_tenths {
+        Some(t) => {
+            let bar_ms = (t / 10, t % 10);
+            let verdict = if passes_reference_bar(&summary, t) { "PASS" } else { "FAIL" };
+            firmware_log!(
+                "| {} | {} | {}/{} | {}/{} | {}/{} | bar={}.{} ms | {} | out_fnv=0x{:08x} | {} |",
+                spec.name,
+                spec.tier.label(),
+                summary.min_cycles,
+                summary.median_cycles,
+                crate::timing::cycles_to_ms(summary.min_cycles, CPU_HZ_240MHZ),
+                crate::timing::cycles_to_ms(summary.median_cycles, CPU_HZ_240MHZ),
+                crate::timing::ns_to_ms(summary.min_wall_ns),
+                crate::timing::ns_to_ms(summary.median_wall_ns),
+                bar_ms.0,
+                bar_ms.1,
+                verdict,
+                out_fnv,
+                spec.source,
+            );
+        }
+        None => {
+            firmware_log!(
+                "| {} | {} | {}/{} | {}/{} | {}/{} | bar=None | no-bar | out_fnv=0x{:08x} | {} |",
+                spec.name,
+                spec.tier.label(),
+                summary.min_cycles,
+                summary.median_cycles,
+                crate::timing::cycles_to_ms(summary.min_cycles, CPU_HZ_240MHZ),
+                crate::timing::cycles_to_ms(summary.median_cycles, CPU_HZ_240MHZ),
+                crate::timing::ns_to_ms(summary.min_wall_ns),
+                crate::timing::ns_to_ms(summary.median_wall_ns),
+                out_fnv,
+                spec.source,
+            );
+        }
+    }
+
+    if let Err(e) = canary.verify() {
+        panic!("model bench '{}': {}", spec.name, e.describe());
+    }
 }
 
 /// Firmware entry point — runs the full benchmark suite and never returns.
@@ -1106,12 +1233,24 @@ pub fn run_benchmarks() -> ! {
     bench_cnn_model(&mut clock, &mut canary);
     bench_mv2_model(&mut clock, &mut canary);
     bench_mv2real_model(&mut clock, &mut canary);
-    for spec in kernel_specs() {
-        bench_kernel(spec, &mut clock, &mut canary);
+
+    // 5.5 Model-level registry — real zoo runners (todo 19). Runs before the
+    // kernel loop for the same reason the A/B/C benches do: the loop ends in
+    // the expected no-PSRAM panic, and the timed model rows must print first.
+    // Without the `model-validation` feature no runners are compiled and the
+    // rows are bar-only (no fabricated timings).
+    #[cfg(feature = "model-validation")]
+    for spec in model_bench_specs() {
+        bench_zoo_model(spec, &mut clock, &mut canary);
     }
-    // 6. Model-level registry.
+    #[cfg(not(feature = "model-validation"))]
     for spec in model_bench_specs() {
         emit_model_row(spec);
+    }
+
+    // 6. Per-kernel rows.
+    for spec in kernel_specs() {
+        bench_kernel(spec, &mut clock, &mut canary);
     }
 
     firmware_log!("benchmarks complete; reference bars: MobileNetV2 224x224 = 1294.5 ms single-core (never 856 ms dual-core), KWS = 7 ms");
