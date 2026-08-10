@@ -618,6 +618,23 @@ fn conv1x1_scratch_need_codegen(out_c: usize, input_offset: i32) -> usize {
     out_c * 4 + wsum
 }
 
+/// Scratch bytes for the FC/GEMM path (`fc_scratch_need` in backend.rs).
+///
+/// T3.6 — small / non-16 input dims: when `input_dim` is not a multiple of
+/// 16 the FC dispatch stages a zero-padded input copy (`pad16(input_dim)`
+/// bytes) AND a zero-padded weight copy (`output_dim * pad16(input_dim)`
+/// bytes) in scratch, plus the i32 accumulator buffer and the optional
+/// weight-sum buffer. Keep in sync with `hematite-s3/src/backend.rs`.
+fn fc_scratch_need_codegen(input_dim: usize, out_dim: usize, input_offset: i32) -> usize {
+    let padded_dim = pad16(input_dim);
+    let wsum = if input_offset != 0 { out_dim * 4 } else { 0 };
+    if padded_dim != input_dim {
+        padded_dim + out_dim * padded_dim + out_dim * 4 + wsum
+    } else {
+        out_dim * 4 + wsum
+    }
+}
+
 /// Scratch bytes for the general conv path (`conv3x3_scratch_need`).
 #[allow(clippy::too_many_arguments)]
 fn conv3x3_scratch_need_codegen(
@@ -990,7 +1007,8 @@ fn emit_fully_connected(model: &ParsedModel, storage: &[Storage], i: usize, op: 
     };
     let _ = batches;
     let out_dim = output_dim as usize;
-    let fc_scratch = out_dim * 4 + if input_offset != 0 { out_dim * 4 } else { 0 };
+    let in_dim = input_dim as usize;
+    let fc_scratch = fc_scratch_need_codegen(in_dim, out_dim, input_offset);
     Ok(OpEmission {
         consts: vec![weights_c, bias_c, mult_c, shift_c, params_c],
         call,
@@ -1735,9 +1753,10 @@ mod tests {
         assert!(s.contains("INPUT_LEN:usize=1usize"));
         assert!(s.contains("OUTPUT_LEN:usize=1usize"));
 
-        // Scratch computed at macro time — FC 1→1, input_offset 0 →
-        // output_dim*4 + 0 = 4 (mirrors the gemm ACCX `need` formula).
-        assert!(s.contains("SCRATCH_LEN:usize=4usize"));
+        // Scratch computed at macro time — FC 1→1, input_offset 0. T3.6 pad
+        // path: input_dim 1 pads to 16 (padded input 16 + padded weights
+        // 1×16 + accs 1×4 = 36), mirroring `fc_scratch_need` in backend.rs.
+        assert!(s.contains("SCRATCH_LEN:usize=36usize"), "scratch len wrong: {s}");
 
         // Weight/bias consts from buffer bytes. Weights are wrapped in a
         // `#[repr(C, align(16))]` struct so the ACCX/FC SIMD `w_ptr % 16 == 0`
@@ -2065,5 +2084,57 @@ mod tests {
             }
         }
         assert!(checked >= 32, "parity matrix did not expand");
+    }
+
+    /// Cross-crate scratch parity (T3.6): the macro-time mirror
+    /// `fc_scratch_need_codegen` must equal the runtime
+    /// `hematite_s3::backend::fc_scratch_need` for every small / non-16 FC
+    /// shape (pad and no-pad paths). The runtime formula is canonical — a
+    /// mismatch is a mirror bug.
+    #[test]
+    fn fc_scratch_mirror_matches_s3_backend() {
+        use hematite_core::op_params::FullyConnectedParams;
+
+        fn params(
+            input_dim: i32,
+            output_dim: i32,
+            input_offset: i32,
+        ) -> FullyConnectedParams<'static> {
+            FullyConnectedParams {
+                input_dim,
+                output_dim,
+                input_offset,
+                weights_offset: 0,
+                output_offset: 0,
+                // The scratch-size formula reads input/output dims + offset
+                // only — slice contents are irrelevant to `fc_scratch_need`.
+                output_multiplier_per_channel: &[],
+                output_shift_per_channel: &[],
+                quantized_activation_min: -128,
+                quantized_activation_max: 127,
+            }
+        }
+
+        let mut checked = 0;
+        for &input_dim in &[1, 3, 8, 15, 16, 17, 32, 128, 640] {
+            for &output_dim in &[1, 3, 8, 16, 128] {
+                for &offset in &[0, 5, 128] {
+                    let p = params(input_dim, output_dim, offset);
+                    let mirror = fc_scratch_need_codegen(
+                        input_dim.max(0) as usize,
+                        output_dim.max(0) as usize,
+                        p.input_offset,
+                    );
+                    let runtime = hematite_s3::backend::fc_scratch_need(&p);
+                    assert_eq!(
+                        mirror, runtime,
+                        "fc input_dim={input_dim} out_dim={output_dim} offset={offset}: \
+                         codegen mirror {mirror} != S3Backend need {runtime}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 100, "fc parity matrix did not expand");
     }
 }

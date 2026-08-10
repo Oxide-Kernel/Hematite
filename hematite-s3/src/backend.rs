@@ -76,14 +76,37 @@ fn pad16(n: usize) -> usize {
     n.div_ceil(16) * 16
 }
 
-/// Scratch bytes needed by the 1×1 ACCX path (`conv1x1_accx_dispatch`):
-/// `out_c * 4` i32 accumulators, plus an `out_c * 4` weight-sum buffer when
+/// Scratch bytes needed by the 1×1 ACCX path (`conv1x1_accx_dispatch`):/// `out_c * 4` i32 accumulators, plus an `out_c * 4` weight-sum buffer when
 /// `input_offset != 0`.
 #[inline(always)]
 fn conv1x1_scratch_need(params: &Conv2DParams) -> usize {
     let out_c = params.output_shape[3].max(0) as usize;
     let wsum = if params.input_offset != 0 { out_c * 4 } else { 0 };
     out_c * 4 + wsum
+}
+
+/// Scratch bytes needed by the FC/GEMM ACCX path
+/// (`fc_accx_dispatch` in `gemm.rs`).
+///
+/// When `input_dim` is not a multiple of 16 the dispatch stages a zero-padded
+/// input copy (`pad16(input_dim)` bytes) AND a zero-padded weight copy
+/// (`output_dim * pad16(input_dim)` bytes — the kernel strides weight rows by
+/// the padded input dim) in scratch at 16-byte-aligned offsets, plus the i32
+/// accumulator buffer and the optional weight-sum buffer (T3.6). The canonical
+/// runtime formula — kept in sync with `fc_scratch_need_codegen`
+/// (hematite-codegen/src/generate.rs) and the dispatch's own `need`
+/// computation in `gemm.rs`.
+#[inline(always)]
+pub fn fc_scratch_need(params: &FullyConnectedParams) -> usize {
+    let input_dim = params.input_dim.max(0) as usize;
+    let out_dim = params.output_dim.max(0) as usize;
+    let padded_dim = pad16(input_dim);
+    let wsum = if params.input_offset != 0 { out_dim * 4 } else { 0 };
+    if padded_dim != input_dim {
+        padded_dim + out_dim * padded_dim + out_dim * 4 + wsum
+    } else {
+        out_dim * 4 + wsum
+    }
 }
 
 /// Scratch bytes needed by the 3×3 ACCX path (`conv3x3_accx_dispatch`).
@@ -686,5 +709,40 @@ mod tests {
         let expect3 = (14 * 14 * 16) + (9 * 16) + (16 * 4) + (12 * 4);
         assert_eq!(depthwise_scratch_need(&p3), expect3);
         assert_eq!(S3Backend::depthwise_conv2d_scratch_size(&p3), expect3);
+    }
+
+    /// T3.6 — the FC padded-path scratch need formula must match the dispatch
+    /// layout in `gemm.rs::fc_accx_dispatch` for pad and no-pad shapes.
+    #[test]
+    fn fc_scratch_need_matches_padded_dispatch_layout() {
+        fn p(input_dim: i32, output_dim: i32, input_offset: i32) -> FullyConnectedParams<'static> {
+            FullyConnectedParams {
+                input_dim,
+                output_dim,
+                input_offset,
+                weights_offset: 0,
+                output_offset: 0,
+                output_multiplier_per_channel: &[0],
+                output_shift_per_channel: &[0],
+                quantized_activation_min: -128,
+                quantized_activation_max: 127,
+            }
+        }
+        // No pad (input_dim % 16 == 0): accs + wsum only.
+        assert_eq!(fc_scratch_need(&p(16, 64, 0)), 64 * 4);
+        assert_eq!(fc_scratch_need(&p(32, 8, 0)), 8 * 4);
+        assert_eq!(fc_scratch_need(&p(16, 64, 5)), 64 * 4 + 64 * 4);
+
+        // Pad (input_dim % 16 != 0): padded input + padded weights + accs
+        // (+ wsum when input_offset != 0). input_dim 1 → pad16 = 16.
+        assert_eq!(fc_scratch_need(&p(1, 16, 0)), 16 + 16 * 16 + 16 * 4);
+        assert_eq!(fc_scratch_need(&p(1, 16, 128)), 16 + 16 * 16 + 16 * 4 + 16 * 4);
+        // input_dim 8 → pad16 = 16; anomaly_detect's 8→128 gated-out FC.
+        assert_eq!(fc_scratch_need(&p(8, 128, 128)), 16 + 128 * 16 + 128 * 4 + 128 * 4);
+        // input_dim 15 → pad16 = 16; 17 → pad16 = 32.
+        assert_eq!(fc_scratch_need(&p(15, 3, 0)), 16 + 3 * 16 + 3 * 4);
+        assert_eq!(fc_scratch_need(&p(17, 4, 0)), 32 + 4 * 32 + 4 * 4);
+        // input_dim 1, output_dim 1 (sine-family shape).
+        assert_eq!(fc_scratch_need(&p(1, 1, 0)), 16 + 16 + 4);
     }
 }

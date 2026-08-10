@@ -53,6 +53,8 @@ const MULT_32: [i32; 32] = mults::<32>();
 const SHIFT_32: [i32; 32] = shifts::<32>();
 const MULT_64: [i32; 64] = mults::<64>();
 const SHIFT_64: [i32; 64] = shifts::<64>();
+const MULT_128: [i32; 128] = mults::<128>();
+const SHIFT_128: [i32; 128] = shifts::<128>();
 const MULT_1000: [i32; 1000] = mults::<1000>();
 const SHIFT_1000: [i32; 1000] = shifts::<1000>();
 
@@ -534,6 +536,64 @@ const SIMD_FC_256X64_OFF_PARAMS: FullyConnectedParams<'static> = FullyConnectedP
     quantized_activation_max: 127,
 };
 
+/// FC 1→1, input_offset 0 — the sine model's single-FC shape (T3.6). The
+/// input_dim 1 is zero-padded to 16 in scratch, then the TIE728 11cn path
+/// runs (pad-in-scratch widening).
+const SIMD_FC_1X1_PARAMS: FullyConnectedParams<'static> = FullyConnectedParams {
+    input_dim: 1,
+    output_dim: 1,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &[1 << 30],
+    output_shift_per_channel: &[0],
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// FC 1→16, input_offset 128 — hello_world's first dense layer (T3.6). The
+/// gated-out shape (input_dim 1 < 16) now dispatches SIMD via pad-in-scratch.
+const SIMD_FC_1X16_PARAMS: FullyConnectedParams<'static> = FullyConnectedParams {
+    input_dim: 1,
+    output_dim: 16,
+    input_offset: 128,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// FC 16→1, input_offset 128 — hello_world's final dense layer (T3.6).
+/// input_dim 16 (%16) needs no pad; output_dim 1 exercises the small-out
+/// path.
+const SIMD_FC_16X1_PARAMS: FullyConnectedParams<'static> = FullyConnectedParams {
+    input_dim: 16,
+    output_dim: 1,
+    input_offset: 128,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &[1 << 30],
+    output_shift_per_channel: &[0],
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// FC 8→128, input_offset 128 — anomaly_detect's gated-out 6th dense layer
+/// (T3.6). input_dim 8 is zero-padded to 16 in scratch.
+const SIMD_FC_8X128_PARAMS: FullyConnectedParams<'static> = FullyConnectedParams {
+    input_dim: 8,
+    output_dim: 128,
+    input_offset: 128,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_128,
+    output_shift_per_channel: &SHIFT_128,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
 /// 2×2 max-pool, stride 2, VALID, channels 16 (%16) — fires
 /// `dl_tie728_s8_max_pool2d_22c1` (hardcoded 2x2/stride-2 pattern).
 const SIMD_MAXPOOL_32X32_PARAMS: PoolParams = PoolParams {
@@ -743,6 +803,53 @@ pub const fn kernel_specs() -> &'static [KernelSpec] {
             params: KernelParams::Fc(&SIMD_FC_256X64_OFF_PARAMS),
             reference: None,
             note: "Phase C non-zero input_offset fold row (input_offset=5).",
+        },
+        KernelSpec {
+            name: "fc_s8 1row,1out (sine, T3.6)",
+            tier: MemoryTier::Sram,
+            op: OpKind::FullyConnected,
+            params: KernelParams::Fc(&SIMD_FC_1X1_PARAMS),
+            reference: Some(CompetitorBaseline {
+                name: "ESP-NN optimized (sine)",
+                cycles: None,
+                target_speedup_x100: None,
+                source: "plan composed-kernels Scope table (user-verified 2026-08-10): sine 618 → 190 cyc (3.3x). Measured Hematite row lands in T6.x (on-device).",
+            }),
+            note: "T3.6 sine-family row: input_dim 1 zero-padded to 16 in scratch (pad-in-scratch widening).",
+        },
+        KernelSpec {
+            name: "fc_s8 1row,16out off128 (hello_world FC1, T3.6)",
+            tier: MemoryTier::Sram,
+            op: OpKind::FullyConnected,
+            params: KernelParams::Fc(&SIMD_FC_1X16_PARAMS),
+            reference: Some(CompetitorBaseline {
+                name: "ESP-NN optimized (hello_world)",
+                cycles: None,
+                target_speedup_x100: None,
+                source: "plan composed-kernels Scope table (user-verified 2026-08-10): hello_world 10,314 → 4,675 cyc (2.2x). Measured Hematite row lands in T6.x (on-device).",
+            }),
+            note: "T3.6 hello_world first dense: input_dim 1 (<16, previously gated out) zero-padded to 16; non-zero input_offset fold over padded rows.",
+        },
+        KernelSpec {
+            name: "fc_s8 16row,1out off128 (hello_world FC3, T3.6)",
+            tier: MemoryTier::Sram,
+            op: OpKind::FullyConnected,
+            params: KernelParams::Fc(&SIMD_FC_16X1_PARAMS),
+            reference: None,
+            note: "T3.6 hello_world final dense: input_dim 16 (%16, no pad), output_dim 1.",
+        },
+        KernelSpec {
+            name: "fc_s8 8row,128out off128 (anomaly FC6, T3.6)",
+            tier: MemoryTier::Sram,
+            op: OpKind::FullyConnected,
+            params: KernelParams::Fc(&SIMD_FC_8X128_PARAMS),
+            reference: Some(CompetitorBaseline {
+                name: "ESP-NN optimized (anomaly_detect)",
+                cycles: None,
+                target_speedup_x100: None,
+                source: "plan composed-kernels Scope table (user-verified 2026-08-10): anomaly 28,550,253 → 7,758,145 cyc (3.7x). Measured Hematite row lands in T6.x (on-device).",
+            }),
+            note: "T3.6 anomaly_detect 6th dense (the only gated-out FC): input_dim 8 zero-padded to 16; non-zero input_offset fold over padded rows.",
         },
         KernelSpec {
             name: "depthwise_s8 12x12,16x3x3x16 S2 SAME (SIMD)",
@@ -1858,7 +1965,12 @@ mod tests {
                         _ => unreachable!(),
                     }
                 } else {
-                    in_c >= 16 && in_c % 16 == 0 && out_c >= 1
+                    match &spec.params {
+                        // T3.6 — FC accepts any input_dim >= 1: small /
+                        // non-16 input dims are zero-padded in scratch.
+                        KernelParams::Fc(_) => in_c >= 1 && out_c >= 1,
+                        _ => in_c >= 16 && in_c % 16 == 0 && out_c >= 1,
+                    }
                 };
                 if !eligible {
                     continue;
@@ -1931,16 +2043,30 @@ mod tests {
                         }
                     }
                     KernelParams::Fc(p) => {
+                        // T3.6 — mirror the dispatch's pad-in-scratch: for
+                        // input_dim % 16 != 0 the SIMD kernel runs on a
+                        // zero-padded input (real lanes then zeros) and
+                        // zero-padded weight rows (pad lanes zero), then the
+                        // input_offset fold reads weight sums over the padded
+                        // rows. Padded lanes contribute 0×0 = 0 — this equals
+                        // the scalar `Σ (in + off)·w` exactly.
+                        let padded_dim = in_c.div_ceil(16) * 16;
                         for oc in 0..out_c {
-                            let mut acc: i64 = 0;
-                            for ic in 0..in_c {
-                                // RAW [oc][ic] — asm filter[oc*in_c+ic]
-                                acc += bufs.weights[oc * in_c + ic] as i64
-                                    * (bufs.input[ic] as i64 + p.input_offset as i64);
+                            let mut raw: i64 = 0;
+                            let mut wsum: i64 = 0;
+                            for ic in 0..padded_dim {
+                                let w = if ic < in_c {
+                                    bufs.weights[oc * in_c + ic] as i64
+                                } else {
+                                    0
+                                };
+                                let x = if ic < in_c { bufs.input[ic] as i64 } else { 0 };
+                                raw += x * w;
+                                wsum += w;
                             }
-                            let acc32 =
-                                (bufs.bias[oc] as i64 + acc).clamp(i32::MIN as i64, i32::MAX as i64)
-                                    as i32;
+                            let acc = raw + p.input_offset as i64 * wsum;
+                            let acc32 = (bufs.bias[oc] as i64 + acc)
+                                .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
                             let scaled = multiply_by_quantized_multiplier(
                                 acc32,
                                 p.output_multiplier_per_channel[oc],

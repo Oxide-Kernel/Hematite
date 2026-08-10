@@ -243,6 +243,8 @@ const MULT_32: [i32; 32] = [1 << 30; 32];
 const SHIFT_32: [i32; 32] = [0; 32];
 const MULT_64: [i32; 64] = [1 << 30; 64];
 const SHIFT_64: [i32; 64] = [0; 64];
+const MULT_128: [i32; 128] = [1 << 30; 128];
+const SHIFT_128: [i32; 128] = [0; 128];
 
 // ── Elementwise: add / mul / sub at N = 16 / 32 / 48 ────────────────────────
 
@@ -512,8 +514,8 @@ fn check_depthwise_dm8_simd_matches_ref() {
     let got = arena_carve_i8(&mut off, DEPTHWISE_DM8_OUT);
     // dm=8 stages a replicated 14×14×64 padded input (12,544 B) + 256 B accs.
     let scratch = arena_carve(&mut off, 16384);
-    input.copy_from_slice(&make_pattern::<DEPTHWISE_DM8_IN>(0xDD8A_DM8));
-    weights.copy_from_slice(&make_pattern::<DEPTHWISE_DM8_W>(0x0F8A_DM8));
+    input.copy_from_slice(&make_pattern::<DEPTHWISE_DM8_IN>(0xDD8A_0F00));
+    weights.copy_from_slice(&make_pattern::<DEPTHWISE_DM8_W>(0x0F8A_00FF));
     let bias = bias_pattern::<64>();
     want.fill(0);
     got.fill(0);
@@ -769,6 +771,85 @@ fn check_mean_simd_matches_ref() {
     report(&compare("mean_hw_2x2x4", &got.0, &want.0));
 }
 
+// ── FC small / non-16 input dims (T3.6 pad-in-scratch widening) ─────────────
+//
+// The zoo FC-bound shapes: sine 1→1, hello_world 1→16 / 16→1,
+// anomaly_detect 8→128 — input_dims in {1,3,8,15} gate out of the old
+// `% 16` gate and now dispatch SIMD via zero-pad-in-scratch; 17 and 32 cover
+// the no-pad boundary and the pad-to-32 case. The host bit-exact matrix in
+// gemm.rs (`fc_small_simd_model_matches_ref_bit_exact`) mirrors this.
+
+/// Fill `out` with the LCG pattern (same generator as `make_pattern`).
+fn fill_pattern_slice(seed: u32, out: &mut [i8]) {
+    let mut x = seed;
+    for v in out.iter_mut() {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        *v = (x >> 16) as i8;
+    }
+}
+
+fn check_fc_small_simd_matches_ref() {
+    let shapes: [((usize, usize, i32), &'static str); 7] = [
+        ((1, 1, 0), "fc_small_1x1"),      // sine-family
+        ((1, 16, 128), "fc_small_1x16"),  // hello_world FC1 (gated out before T3.6)
+        ((3, 16, 128), "fc_small_3x16"),
+        ((8, 128, 128), "fc_small_8x128"), // anomaly_detect FC6 (gated out before T3.6)
+        ((15, 8, 128), "fc_small_15x8"),
+        ((17, 8, 0), "fc_small_17x8"),    // pad to 32
+        ((32, 8, 0), "fc_small_32x8"),    // no-pad path
+    ];
+    // Max padded scratch: input_dim 8 → pad16 16, out 128:
+    // 16 + 128*16 + 128*4 + 128*4 = 3088 (a multiple of 16).
+    const SCRATCH: usize = 16 + 128 * 16 + 128 * 4 + 128 * 4;
+    let mut off = 0;
+    for &((input_dim, output_dim, input_offset), name) in &shapes {
+        // Carve at 16-aligned offsets (round up each region); the kernels
+        // receive exact-length sub-slices that start at the aligned base.
+        let in_len = (input_dim + 15) & !15;
+        let w_len = ((input_dim * output_dim) + 15) & !15;
+        let out_len = (output_dim + 15) & !15;
+        let mut input = &mut arena_carve_i8(&mut off, in_len)[..input_dim];
+        let mut weights = &mut arena_carve_i8(&mut off, w_len)[..input_dim * output_dim];
+        let want = &mut arena_carve_i8(&mut off, out_len)[..output_dim];
+        let got = &mut arena_carve_i8(&mut off, out_len)[..output_dim];
+        let scratch = arena_carve(&mut off, SCRATCH);
+        fill_pattern_slice(0xA11_5ED, input);
+        fill_pattern_slice(0xD07_5C0DE, weights);
+        want.fill(0);
+        got.fill(0);
+        scratch.fill(0);
+        let mut bias = [0i32; 128];
+        for (i, b) in bias.iter_mut().enumerate() {
+            *b = (i as i32) * 37 - 500;
+        }
+        let params = FullyConnectedParams {
+            input_dim: input_dim as i32,
+            output_dim: output_dim as i32,
+            input_offset,
+            weights_offset: 0,
+            output_offset: 0,
+            output_multiplier_per_channel: &MULT_128[..output_dim],
+            output_shift_per_channel: &SHIFT_128[..output_dim],
+            quantized_activation_min: -128,
+            quantized_activation_max: 127,
+        };
+
+        hematite_ref::fully_connected::fully_connected(
+            input,
+            weights,
+            &bias[..output_dim],
+            &params,
+            want,
+            scratch,
+        )
+        .expect("harness: ref small fc shape");
+        hematite_s3::gemm::fully_connected(input, weights, &bias[..output_dim], &params, got, scratch)
+            .expect("harness: s3 small fc shape");
+
+        report(&compare(name, got, want));
+    }
+}
+
 /// Run all SIMD correctness checks. Called from the firmware boot flow
 /// right after [`crate::model_validation::validate_all`] (same rationale:
 /// every PASS/FAIL line must print even if a later benchmark row panics).
@@ -799,6 +880,7 @@ pub fn validate_all() {
     check_conv1x1_simd_matches_ref();
     check_conv3x3_simd_matches_ref();
     check_fc_simd_matches_ref();
+    check_fc_small_simd_matches_ref();
     check_mean_simd_matches_ref();
     crate::firmware::uart0_log!("=== SIMD CORRECTNESS DONE ===");
 }

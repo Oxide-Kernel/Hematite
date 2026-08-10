@@ -65,6 +65,24 @@ pub(crate) fn accx_eligible_1x1(input_c: usize, out_c: usize) -> bool {
     input_c >= 16 && input_c.is_multiple_of(16) && out_c >= 1
 }
 
+/// Host-compilable eligibility for the ACCX 1×1 / FC kernel when small or
+/// non-16 input dims are zero-padded in scratch (T3.6 — small-shape FC SIMD).
+///
+/// Any `input_c >= 1` is accepted: when `input_c % 16 != 0` (e.g. the
+/// hello_world 1→16 and anomaly_detect 8→128 FCs) the fc dispatch stages a
+/// zero-padded input copy (`pad16(input_c)` bytes) AND a zero-padded weight
+/// copy (the kernel strides weight rows by the padded input dim), so the
+/// `% 16` requirement is lifted here. Padded lanes contribute `0 × 0 = 0`
+/// and the Phase-C `input_offset` fold reads the padded weight sums (pad
+/// lanes are zero, so the sums equal the real ones) — bit-exact either way.
+///
+/// The conv1x1 kernel keeps the strict [`accx_eligible_1x1`] gate (untouched);
+/// only the FC/GEMM dispatch uses this widened gate.
+#[inline]
+pub(crate) fn accx_eligible_1x1_padded(input_c: usize, out_c: usize) -> bool {
+    input_c >= 1 && out_c >= 1
+}
+
 /// Host-compilable eligibility for the ACCX 3×3 kernel.
 ///
 /// Any `input_c >= 1` is accepted: when `input_c % 16 != 0` (e.g. a 3-channel

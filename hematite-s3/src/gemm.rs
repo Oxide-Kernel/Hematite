@@ -33,10 +33,74 @@
 //! into scratch, then the bit-exact TFLite requantize epilogue runs in Rust —
 //! an FC layer is mathematically a 1×1 conv with H=W=1. See
 //! [`fc_accx_dispatch`] for the eligibility gate.
+//!
+//! # Small / non-16 input dims (T3.6)
+//!
+//! The FC gate (`input_dim >= 16 && input_dim % 16 == 0`) is widened to any
+//! `input_dim >= 1`: when `input_dim % 16 != 0` the dispatch stages a
+//! zero-padded input copy AND a zero-padded weight copy (rows padded to the
+//! next multiple of 16) in scratch at 16-byte-aligned offsets, runs the same
+//! `s8_accx_conv1x1` kernel on the padded buffers, and folds the non-zero
+//! `input_offset` via weight sums over the padded rows (pad lanes are zero).
+//! Padded lanes contribute `0 × 0 = 0` — the output is bit-exact vs the
+//! scalar reference. The staged carve mirrors the conv3x3/depthwise
+//! channel-pad path (16-byte alignment; an unaligned staged copy would
+//! silently fall back to scalar).
 
 use hematite_core::op_params::FullyConnectedParams;
 use hematite_core::KernelError;
 use hematite_int8::{multiply_by_quantized_multiplier, saturating_cast};
+
+/// Round a length up to the TIE728 SIMD group width (16 lanes).
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+#[inline(always)]
+const fn pad16(n: usize) -> usize {
+    (n + 15) & !15
+}
+
+/// Stage a zero-padded FC input (real `input[0..input_dim]`, then zeros) and
+/// the zero-padded weight rows (`weights` is `output_dim × input_dim` raw
+/// `[oc][ic]`; the staged copy is `output_dim × padded_dim` with each row
+/// zero-filled past `input_dim`).
+///
+/// The staged buffers are what the device dispatch hands to `s8_accx_conv1x1`
+/// when `input_dim % 16 != 0`: the kernel VLDs 16-lane vectors and strides
+/// weight rows by the padded input dim, so both staged buffers must be padded
+/// to a multiple of 16. Padded lanes multiply `0 × 0 = 0`, and the Phase-C
+/// `input_offset` fold reads weight sums over the padded rows — pad lanes are
+/// zero, so the sums equal the real per-row sums — bit-exact vs the scalar
+/// `Σ (in + offset)·w` loop. Host-compilable so the unit tests exercise the
+/// real device-pipeline staging.
+///
+/// # Panics
+/// `dst_in` / `dst_w` must be exactly `padded_dim` / `output_dim * padded_dim`
+/// bytes (caller-computed via [`pad16`]); this is asserted.
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+pub(crate) fn stage_fc_padded(
+    dst_in: &mut [u8],
+    dst_w: &mut [i8],
+    input: &[i8],
+    weights: &[i8],
+    input_dim: usize,
+    output_dim: usize,
+) {
+    let padded_dim = pad16(input_dim);
+    assert_eq!(dst_in.len(), padded_dim, "stage_fc_padded: dst_in len");
+    assert_eq!(
+        dst_w.len(),
+        output_dim * padded_dim,
+        "stage_fc_padded: dst_w len"
+    );
+    for (d, &x) in dst_in[..input_dim].iter_mut().zip(input.iter()) {
+        *d = x as u8; // bit-preserving i8→u8 re-interpret (VLD reads i8 lanes)
+    }
+    dst_in[input_dim..].fill(0);
+    for oc in 0..output_dim {
+        let row = &mut dst_w[oc * padded_dim..(oc + 1) * padded_dim];
+        row[..input_dim].copy_from_slice(&weights[oc * input_dim..(oc + 1) * input_dim]);
+        row[input_dim..].fill(0);
+    }
+}
 
 /// Context for the ACCX FC/GEMM dispatch — bundled into one `&mut` arg so the
 /// Xtensa LLVM backend generates a 1-arg call (multi-arg calls are miscompiled
@@ -70,12 +134,26 @@ fn fc_accx_dispatch(ctx: &mut FcAccxCtx<'_>, uniform: (i32, i32)) -> Result<bool
     let input_dim = params.input_dim as usize;
     let output_dim = params.output_dim as usize;
 
-    if !crate::accx::accx_eligible_1x1(input_dim, output_dim) {
+    if !crate::accx::accx_eligible_1x1_padded(input_dim, output_dim) {
         return Ok(false);
     }
 
     let input_offset = params.input_offset;
-    let need = output_dim * 4 + if input_offset != 0 { output_dim * 4 } else { 0 };
+    // T3.6 — small / non-16 input dims: stage a zero-padded input copy AND a
+    // zero-padded weight copy (the kernel VLDs 16-lane vectors and strides
+    // weight rows by the padded input dim), then run the same kernel.
+    let padded_dim = pad16(input_dim);
+    let needs_pad = padded_dim != input_dim;
+    // Padded layout (mirrors the conv3x3/depthwise channel-pad carve):
+    //   [padded input: padded_dim][padded weights: output_dim*padded_dim][accs: output_dim*4][wsum: output_dim*4 if input_offset != 0]
+    let pad_input_len = padded_dim;
+    let pad_weights_len = output_dim * padded_dim;
+    let wsum_extra = if input_offset != 0 { output_dim * 4 } else { 0 };
+    let need = if needs_pad {
+        pad_input_len + pad_weights_len + output_dim * 4 + wsum_extra
+    } else {
+        output_dim * 4 + wsum_extra
+    };
     if ctx.scratch.len() < need {
         return Ok(false);
     }
@@ -83,23 +161,65 @@ fn fc_accx_dispatch(ctx: &mut FcAccxCtx<'_>, uniform: (i32, i32)) -> Result<bool
     let in_ptr = ctx.input.as_ptr();
     let w_ptr = ctx.weights.as_ptr();
     let out_ptr = ctx.output.as_mut_ptr();
-    let accs = ctx.scratch.as_mut_ptr() as *mut i32;
-    if (in_ptr as usize) % 16 != 0
-        || (w_ptr as usize) % 16 != 0
-        || (out_ptr as usize) % 16 != 0
-        || (accs as usize) % 4 != 0
-    {
-        return Ok(false);
-    }
-    let wsum = if input_offset != 0 {
-        unsafe { accs.add(output_dim) }
+    let scratch_ptr = ctx.scratch.as_mut_ptr();
+    let scratch_u = scratch_ptr as usize;
+
+    let (k_in_ptr, k_w_ptr, accs, wsum);
+    if needs_pad {
+        // Padded buffers — carve from scratch at 16-byte boundaries so the
+        // kernel's VLD.128 stays aligned (mirrors conv3x3.rs:180-195).
+        let in_off = (scratch_u + 15) & !15;
+        let w_off = in_off + pad_input_len;
+        let accs_off = (w_off + pad_weights_len + 15) & !15;
+        let p_in: *const i8 = unsafe { scratch_ptr.add(in_off - scratch_u) }.cast::<i8>();
+        let p_w: *const i8 = unsafe { scratch_ptr.add(w_off - scratch_u) }.cast::<i8>();
+        let p_accs = unsafe { scratch_ptr.add(accs_off - scratch_u) } as *mut i32;
+        if (accs_off - scratch_u) % 4 != 0 {
+            return Ok(false);
+        }
+        wsum = if input_offset != 0 {
+            (unsafe { scratch_ptr.add(accs_off - scratch_u + output_dim * 4) }) as *mut i32
+        } else {
+            core::ptr::null_mut()
+        };
+        let dst_in = unsafe {
+            core::slice::from_raw_parts_mut(p_in as *mut u8, pad_input_len)
+        };
+        let dst_w = unsafe { core::slice::from_raw_parts_mut(p_w as *mut i8, pad_weights_len) };
+        stage_fc_padded(
+            dst_in,
+            dst_w,
+            ctx.input,
+            ctx.weights,
+            input_dim,
+            output_dim,
+        );
+        k_in_ptr = p_in;
+        k_w_ptr = p_w;
+        accs = p_accs;
     } else {
-        core::ptr::null_mut()
-    };
+        if (in_ptr as usize) % 16 != 0
+            || (w_ptr as usize) % 16 != 0
+            || (out_ptr as usize) % 16 != 0
+        {
+            return Ok(false);
+        }
+        accs = scratch_ptr as *mut i32;
+        if (accs as usize) % 4 != 0 {
+            return Ok(false);
+        }
+        wsum = if input_offset != 0 {
+            unsafe { accs.add(output_dim) }
+        } else {
+            core::ptr::null_mut()
+        };
+        k_in_ptr = in_ptr;
+        k_w_ptr = w_ptr;
+    }
     if input_offset != 0 {
         let ws = unsafe { core::slice::from_raw_parts_mut(wsum, output_dim) };
-        let wv = unsafe { core::slice::from_raw_parts(w_ptr, output_dim * input_dim) };
-        crate::accx::weight_sums_conv(ws, wv, 1, input_dim);
+        let wv = unsafe { core::slice::from_raw_parts(k_w_ptr, output_dim * padded_dim) };
+        crate::accx::weight_sums_conv(ws, wv, 1, padded_dim);
     }
 
     let multipliers = params.output_multiplier_per_channel;
@@ -110,7 +230,7 @@ fn fc_accx_dispatch(ctx: &mut FcAccxCtx<'_>, uniform: (i32, i32)) -> Result<bool
     let (uniform_mult, uniform_shift) = uniform;
 
     unsafe {
-        crate::accx::accx_conv1x1(in_ptr, w_ptr, accs, input_dim, output_dim);
+        crate::accx::accx_conv1x1(k_in_ptr, k_w_ptr, accs, padded_dim, output_dim);
     }
     if input_offset != 0 {
         for oc in 0..output_dim {
@@ -158,7 +278,7 @@ impl PreparedFc {
         let input_dim = params.input_dim as usize;
         let output_dim = params.output_dim as usize;
         let accx = cfg!(all(target_arch = "xtensa", not(feature = "qemu")))
-            && crate::accx::accx_eligible_1x1(input_dim, output_dim);
+            && crate::accx::accx_eligible_1x1_padded(input_dim, output_dim);
         let uniform =
             crate::accx::uniform_scale(params.output_multiplier_per_channel, params.output_shift_per_channel)
                 .unwrap_or((0, i32::MIN));
@@ -314,4 +434,206 @@ fn fully_connected_scalar(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate alloc;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use super::*;
+    use hematite_core::op_params::FullyConnectedParams;
+
+    /// Host model of the `s8_accx_conv1x1` accumulation contract on the
+    /// staged (padded) buffers: `acc[oc] = Σ_ic staged_w[oc*padded_dim + ic] *
+    /// staged_in[ic]` in wrapping i32 — the exact GPR-accumulator arithmetic
+    /// the asm uses (raw dot product, no input_offset).
+    fn kernel_model_accs(staged_in: &[u8], staged_w: &[i8], padded_dim: usize, out_c: usize) -> Vec<i32> {
+        let mut accs = vec![0i32; out_c];
+        for oc in 0..out_c {
+            let mut acc: i32 = 0;
+            for ic in 0..padded_dim {
+                let iv = i32::from(staged_in[ic] as i8);
+                let wv = i32::from(staged_w[oc * padded_dim + ic]);
+                acc = acc.wrapping_add(iv.wrapping_mul(wv));
+            }
+            accs[oc] = acc;
+        }
+        accs
+    }
+
+    /// Run the full device SIMD pipeline in software — real
+    /// [`stage_fc_padded`] staging, the kernel-model accumulators, the real
+    /// Phase-C `input_offset` fold, and the real `requantize_1x1` epilogue —
+    /// producing one FC output layer. This exercises the exact device
+    /// pipeline code (pad + kernel contract + fold + requantize).
+    fn simd_model_layer(
+        input: &[i8],
+        weights: &[i8],
+        bias: &[i32],
+        p: &FullyConnectedParams<'_>,
+    ) -> Vec<i8> {
+        let input_dim = p.input_dim as usize;
+        let output_dim = p.output_dim as usize;
+        let padded_dim = pad16(input_dim);
+        let needs_pad = padded_dim != input_dim;
+
+        let mut staged_in = vec![0u8; padded_dim];
+        let mut staged_w = vec![0i8; output_dim * padded_dim];
+        if needs_pad {
+            stage_fc_padded(
+                &mut staged_in,
+                &mut staged_w,
+                input,
+                weights,
+                input_dim,
+                output_dim,
+            );
+        } else {
+            for (d, &x) in staged_in[..input_dim].iter_mut().zip(input.iter()) {
+                *d = x as u8; // bit-preserving i8→u8 re-interpret
+            }
+            staged_w.copy_from_slice(weights);
+        }
+
+        let mut accs = kernel_model_accs(&staged_in, &staged_w, padded_dim, output_dim);
+        if p.input_offset != 0 {
+            // Weight sums over the PADDED rows — pad lanes are zero, so these
+            // equal the real per-row sums (the dispatch computes them this
+            // way; mirror exactly).
+            let mut wsum = vec![0i32; output_dim];
+            crate::accx::weight_sums_conv(&mut wsum, &staged_w, 1, padded_dim);
+            crate::depthwise::fold_input_offset(&mut accs, &wsum, p.input_offset);
+        }
+
+        let multipliers = p.output_multiplier_per_channel;
+        let shifts = p.output_shift_per_channel;
+        let (uniform_mult, uniform_shift) = match crate::accx::uniform_scale(multipliers, shifts) {
+            Some((m, s)) => (m, s),
+            None => (0, i32::MIN),
+        };
+        let mut output = vec![0i8; output_dim];
+        crate::accx::requantize_1x1(&mut crate::accx::ReqCtx {
+            accs: &accs,
+            bias,
+            multipliers,
+            shifts,
+            output_offset: p.output_offset,
+            act_min: p.quantized_activation_min,
+            act_max: p.quantized_activation_max,
+            out_base: 0,
+            output: &mut output,
+            uniform_mult,
+            uniform_shift,
+        });
+        output
+    }
+
+    fn per_channel_mult(n: usize) -> Vec<i32> {
+        (0..n).map(|i| (1 << 30) - (i as i32) * 7919).collect()
+    }
+
+    fn per_channel_shift(n: usize) -> Vec<i32> {
+        (0..n).map(|i| (i % 3) as i32).collect()
+    }
+
+    /// Deterministic pseudo-random `i8` pattern (full int8 range).
+    fn pattern(seed: u32, n: usize) -> Vec<i8> {
+        let mut out = vec![0i8; n];
+        let mut x = seed;
+        for v in out.iter_mut() {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *v = (x >> 16) as i8;
+        }
+        out
+    }
+
+    fn pattern_i32(seed: u32, n: usize) -> Vec<i32> {
+        let mut out = vec![0i32; n];
+        let mut x = seed;
+        for v in out.iter_mut() {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *v = ((x >> 16) as i32) * 37 - 500;
+        }
+        out
+    }
+
+    /// Host bit-exact gate (T3.6): the device SIMD pipeline model (real
+    /// staging + kernel-contract accumulation + real fold + real requantize)
+    /// must equal the independent `hematite-ref` scalar fully_connected for
+    /// every small / non-16 input dim in {1, 3, 8, 15, 17, 32} — pad and
+    /// no-pad paths — across output dims, offsets, and identity /
+    /// non-identity per-channel multipliers. Zero mismatches.
+    #[test]
+    fn fc_small_simd_model_matches_ref_bit_exact() {
+        let mut checked = 0;
+        for &input_dim in &[1, 3, 8, 15, 17, 32] {
+            for &out_dim in &[1, 16, 128] {
+                for &in_off in &[0, 5, 128] {
+                    for mode in 0..3 {
+                        let n = out_dim as usize;
+                        let (mults, shifts): (Vec<i32>, Vec<i32>) = match mode {
+                            0 => (vec![1 << 30; n], vec![1; n]),
+                            1 => (per_channel_mult(n), per_channel_shift(n)),
+                            _ => (vec![1 << 29; n], vec![0; n]),
+                        };
+                        let p = FullyConnectedParams {
+                            input_dim,
+                            output_dim: out_dim,
+                            input_offset: in_off,
+                            weights_offset: 0,
+                            output_offset: if in_off == 0 { 0 } else { -10 },
+                            output_multiplier_per_channel: &mults,
+                            output_shift_per_channel: &shifts,
+                            quantized_activation_min: if mode == 1 { 0 } else { -128 },
+                            quantized_activation_max: 127,
+                        };
+                        let seed = 0x3C60_0000u32 | (input_dim as u32 * 31 + out_dim as u32);
+                        let input = pattern(seed, input_dim as usize);
+                        let weights =
+                            pattern(0xD3A + input_dim as u32 * 17, input_dim as usize * n);
+                        let bias = pattern_i32(0xFAC + out_dim as u32, n);
+
+                        let got = simd_model_layer(&input, &weights, &bias, &p);
+                        let mut want = vec![0i8; got.len()];
+                        hematite_ref::fully_connected::fully_connected(
+                            &input,
+                            &weights,
+                            &bias,
+                            &p,
+                            &mut want,
+                            &mut [],
+                        )
+                        .expect("ref fc accepts the shape");
+                        assert_eq!(
+                            got, want,
+                            "input_dim={input_dim} out_dim={out_dim} in_off={in_off} mode={mode}: \
+                             SIMD-model output must equal hematite-ref scalar"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked >= 160, "small-fc matrix did not expand ({checked})");
+    }
+
+    /// The staging must produce the exact padded layout the kernel consumes:
+    /// input `[real | zeros]`, weight rows `[real row | zeros]`.
+    #[test]
+    fn stage_fc_padded_zero_fills_pad_lanes() {
+        let input: Vec<i8> = (0..8).map(|i| i as i8 - 3).collect(); // input_dim = 8
+        let weights: Vec<i8> = (0..32).map(|i| (i % 7) as i8 - 2).collect(); // 4 rows x 8
+        let mut dst_in = vec![0xEEu8; 16];
+        let mut dst_w = vec![0x7Fi8; 64]; // 4 rows x 16
+        stage_fc_padded(&mut dst_in, &mut dst_w, &input, &weights, 8, 4);
+        let expect_in: Vec<u8> = input.iter().map(|&x| x as u8).collect();
+        assert_eq!(&dst_in[..8], &expect_in[..]);
+        assert_eq!(&dst_in[8..], &[0; 8]);
+        for oc in 0..4 {
+            let row = &dst_w[oc * 16..(oc + 1) * 16];
+            assert_eq!(&row[..8], &weights[oc * 8..(oc + 1) * 8]);
+            assert_eq!(&row[8..], &[0; 8], "row {oc} pad lanes must be zero");
+        }
+    }
 }

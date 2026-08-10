@@ -492,7 +492,7 @@ fn sine_model_predict_with_mock_backend() {
 
     // predict_with_scratch: sized scratch array, caller-provided output.
     let mut out_buf = [0i8; 1];
-    let mut scratch = [0u8; 4];
+    let mut scratch = [0u8; 64];
     let r = model.predict_with_scratch(&[5], &mut out_buf, &mut scratch);
     assert_eq!(r, Ok(()));
     assert_eq!(out_buf, [2]);
