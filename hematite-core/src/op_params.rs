@@ -565,3 +565,301 @@ pub struct ReduceParams {
     /// Clamp upper bound for fused activation (applied after requantize).
     pub quantized_activation_max: i32,
 }
+
+// ── Composed kernels (T2.1) ────────────────────────────────────────────────
+//
+// Params for the [`FusedKernelBackend`](crate::FusedKernelBackend) composed
+// entry points.  Each struct carries (1) the anchor op's per-op params
+// EXACTLY as the unfused emitter would emit them (so the RefBackend default
+// decomposition is a plain forward of the existing per-op calls, bit-exact
+// by construction), (2) the fusion-side data (scales / zero points / kinds)
+// derived from the T1.1 fusion IR (`hematite-codegen/src/optimize/fusion.rs`),
+// and (3) tensor data slices for operands that the trait method signature
+// has no slot for.
+//
+// Field-level provenance is noted per struct: which `FusedGroup` /
+// `AbsorbedElementwise` / `ResidualAdd` / `InputFold` / `StepRequantize`
+// field the T1.2 emitter maps from.
+
+/// Activation kinds absorbable as a composed trailing epilogue (fusion
+/// patterns (a) and (c)).
+///
+/// Maps from `FusedGroup::activation`'s `FusedActivationKind` (T1.1).  This
+/// is a NEW enum, deliberately distinct from [`FusedActivation`]: it adds
+/// `HardSwish` and omits `Relu1` (not absorbable).  Adding a variant to
+/// [`FusedActivation`] instead would break exhaustive matches in codegen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComposedActivation {
+    /// No activation epilogue (identity).
+    None,
+    /// `max(0, x)` after requantize.
+    Relu,
+    /// `clamp(x, 0, quantized_six)` after requantize.
+    Relu6,
+    /// `x · ReLU6(x + 3) / 6` in quantized space.
+    HardSwish,
+}
+
+/// Quant params of an absorbed trailing activation op, exactly as the
+/// unfused emitter would emit the standalone activation's `ActivationParams`
+/// (relu / relu6 / hard_swish subset).
+///
+/// Derived at emit time from these tensors: the absorbed activation op's
+/// input/output tensors (input_offset = −input zp, output_offset = +output
+/// zp, output_multiplier/shift = the activation's requantize ratio) and the
+/// `FusedGroup::activation` range (`FusedActivationKind` → `kind`,
+/// `quantized_min` / `quantized_max`).  When `kind == None` the quant
+/// fields are ignored (identity epilogue).
+#[derive(Clone, Copy, Debug)]
+pub struct ActivationEpilogueParams {
+    /// Which activation to apply (None = identity).
+    pub kind: ComposedActivation,
+    /// Input zero-point offset (`−zp` of the epilogue's input tensor).
+    pub input_offset: i32,
+    /// Output zero-point offset (`+zp` of the epilogue's output tensor).
+    pub output_offset: i32,
+    /// Output-ratio multiplier (Q0.31) — relu.
+    pub output_multiplier: i32,
+    /// Output right-shift — relu.
+    pub output_shift: i32,
+    /// Clamp lower bound (relu6: 0; carried for the composed kernel).
+    pub quantized_activation_min: i32,
+    /// Clamp upper bound (relu6: the quantized six; relu6's standalone
+    /// kernel reads this as the clamp bound via the RefBackend adapter).
+    pub quantized_activation_max: i32,
+}
+
+/// The residual-ADD absorbed into a conv-family anchor (fusion pattern (c)),
+/// with the two-stage TFLM Add rounding.
+///
+/// Derived at emit time from these tensors: `FusedGroup::residual_add`
+/// (T1.1) — `ResidualAdd.residual_tensor` → `residual_data` (constant
+/// tensor data, element-aligned with the conv output; `alpha_data`
+/// precedent) + the residual tensor's quant (`residual_scale` /
+/// `residual_zero_point`), `ResidualAdd.output_scale` /
+/// `ResidualAdd.output_zero_point` (the add's output tensor quant, written
+/// in-place over the anchor output), and `ResidualAdd.requantize`
+/// (`StepRequantize`: `left_shift`, `input1_multiplier/shift`,
+/// `input2_multiplier/shift`, `output_multiplier/shift`).
+///
+/// The add's `input1` is the anchor output tensor, so
+/// `ElementwiseParams::input1_offset = −(FusedConvParams::output_zero_point)`
+/// at emit time.
+#[derive(Clone, Debug)]
+pub struct ResidualAddParams<'a> {
+    /// The residual tensor data (model constant, element-aligned with dst).
+    pub residual_data: &'a [i8],
+    /// Residual tensor scale.
+    pub residual_scale: f32,
+    /// Residual tensor zero-point.
+    pub residual_zero_point: i64,
+    /// Add output tensor scale.
+    pub output_scale: f32,
+    /// Add output tensor zero-point.
+    pub output_zero_point: i64,
+    /// `input1` per-input multiplier (Q0.31) — `StepRequantize.input1_multiplier`.
+    pub input1_multiplier: i32,
+    /// `input1` per-input shift — `StepRequantize.input1_shift`.
+    pub input1_shift: i32,
+    /// `input2` per-input multiplier (Q0.31) — `StepRequantize.input2_multiplier`.
+    pub input2_multiplier: i32,
+    /// `input2` per-input shift — `StepRequantize.input2_shift`.
+    pub input2_shift: i32,
+    /// Left-shift before per-input rescaling (20 for ADD/SUB) —
+    /// `StepRequantize.left_shift`.
+    pub left_shift: i32,
+    /// Output-ratio multiplier (Q0.31) — `StepRequantize.output_multiplier`.
+    pub output_multiplier: i32,
+    /// Output right-shift — `StepRequantize.output_shift`.
+    pub output_shift: i32,
+}
+
+/// Params for the fused CONV_2D (+ residual-ADD + activation epilogue)
+/// composed kernel call.
+///
+/// Derived at emit time from these tensors: the `FusedGroup` anchor conv op
+/// via the EXISTING per-op conv emission → `conv` (`Conv2DParams` exactly as
+/// the unfused emitter would emit the standalone conv, INCLUDING its own
+/// baked fused-activation range in `quantized_activation_min/max`); the
+/// anchor output tensor's quant → `output_scale` / `output_zero_point` /
+/// `output_multiplier_per_channel` / `output_shift_per_channel`;
+/// `FusedGroup::residual_add` → `residual`; `FusedGroup::activation` →
+/// `activation`.
+#[derive(Clone, Debug)]
+pub struct FusedConvParams<'a> {
+    /// The anchor conv's per-op params, exactly as the unfused emitter
+    /// would emit them.
+    pub conv: Conv2DParams<'a>,
+    /// Anchor output tensor scale (the add's input1 tensor scale).
+    pub output_scale: f32,
+    /// Anchor output tensor zero-point.
+    pub output_zero_point: i64,
+    /// Anchor per-channel output multipliers (Q0.31) — also carried by
+    /// `conv`; repeated here for the composed kernel's requantize.
+    pub output_multiplier_per_channel: &'a [i32],
+    /// Anchor per-channel output right-shifts.
+    pub output_shift_per_channel: &'a [i32],
+    /// Absorbed residual-ADD (None = no residual).
+    pub residual: Option<ResidualAddParams<'a>>,
+    /// Absorbed trailing activation epilogue (kind None = identity).
+    pub activation: ActivationEpilogueParams,
+}
+
+/// Kind of one op in an absorbed elementwise chain (fusion pattern (b)).
+///
+/// Maps from `AbsorbedElementwise.kind` (T1.1 `ElementwiseKind`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ElementwiseKind {
+    /// Elementwise ADD.
+    Add,
+    /// Elementwise MUL.
+    Mul,
+    /// Elementwise SUB.
+    Sub,
+    /// Standalone ReLU.
+    Relu,
+    /// Standalone ReLU6.
+    Relu6,
+    /// Standalone HardSwish.
+    HardSwish,
+}
+
+/// One step of a fused elementwise chain (pattern (b)); the step's per-op
+/// params exactly as the unfused emitter would emit that step's op.
+///
+/// Derived at emit time from these tensors: `AbsorbedElementwise` (T1.1) —
+/// `kind`, `operand_tensor` → `operand` (constant tensor data; None for
+/// activation steps), and `requantize: StepRequantize` →
+/// `input1_multiplier/shift`, `input2_multiplier/shift`, `left_shift`,
+/// `output_multiplier/shift`, `input1_offset`, `input2_offset`,
+/// `output_offset` (the offsets double as the op's zero-point math;
+/// activation steps carry the running input zp as `input1_offset`).
+///
+/// `input1_offset = −(this step's input1 tensor zp)`, where input1 is `src`
+/// (step 0) or the running value (steps ≥ 1, whose zp = −(the previous
+/// step's `output_offset`)).  Steps are NEVER collapsed — every step is
+/// carried.
+#[derive(Clone, Debug)]
+pub struct ElementwiseChainStep<'a> {
+    /// The step's op kind.
+    pub kind: ElementwiseKind,
+    /// The non-running input tensor data (None for activation steps).
+    /// Model constant tensors — never alias the running buffer.
+    pub operand: Option<&'a [i8]>,
+    /// Input-1 zero-point offset (= −(input1 tensor zp)).
+    pub input1_offset: i32,
+    /// Input-2 zero-point offset (= −(operand tensor zp); 0 for activations).
+    pub input2_offset: i32,
+    /// Output zero-point offset (= +step output zp).
+    pub output_offset: i32,
+    /// Output-ratio multiplier (Q0.31).
+    pub output_multiplier: i32,
+    /// Output right-shift.
+    pub output_shift: i32,
+    /// Left-shift (20 for ADD/SUB, 0 for MUL and activations).
+    pub left_shift: i32,
+    /// Input-1 per-input multiplier (ADD/SUB; else 0).
+    pub input1_multiplier: i32,
+    /// Input-1 per-input shift (ADD/SUB; else 0).
+    pub input1_shift: i32,
+    /// Input-2 per-input multiplier (ADD/SUB; else 0).
+    pub input2_multiplier: i32,
+    /// Input-2 per-input shift (ADD/SUB; else 0).
+    pub input2_shift: i32,
+    /// Activation clamp lower bound.
+    pub quantized_activation_min: i32,
+    /// Activation clamp upper bound.
+    pub quantized_activation_max: i32,
+}
+
+/// Params for a fused elementwise chain (pattern (b)): anchor op + absorbed
+/// ops executed as one composed kernel call.
+///
+/// Derived at emit time from these tensors: `FusedGroup.elementwise_chain`
+/// (T1.1) — each `AbsorbedElementwise` becomes one [`ElementwiseChainStep`];
+/// the chain's ANCHOR elementwise op (the group's kernel op) is
+/// [`ElementwiseChainStep`] 0 (`num_elements` = the chain tensors' flat
+/// element count).  Steps are NEVER collapsed.
+#[derive(Clone, Debug)]
+pub struct ElementwiseChainParams<'a> {
+    /// Flat element count of every chain tensor (src, operands, dst).
+    pub num_elements: i32,
+    /// Chain steps in execution order, INCLUDING the anchor op as step 0.
+    pub steps: &'a [ElementwiseChainStep<'a>],
+}
+
+/// Pool kind for [`FoldedPoolParams`]; maps from the `FusedGroup` anchor's
+/// `builtin_code` (AVERAGE_POOL_2D / MAX_POOL_2D).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolKind {
+    /// Average pooling.
+    Average,
+    /// Max pooling.
+    Max,
+}
+
+/// An input fold (pattern (d)): a MUL/SUB absorbed into a pool's input
+/// handling, with the fold op's per-op requantize pairs.
+///
+/// Derived at emit time from these tensors: `FusedGroup::input_fold` (T1.1)
+/// — `InputFold.builtin` → `builtin` (18 = MUL, 41 = SUB),
+/// `InputFold.operand_tensor` → `operand_data` (constant) + the operand
+/// tensor's zp → `operand_zero_point`, `InputFold.input_zero_point` →
+/// `input_zero_point`, `InputFold.folded_scale` → `folded_scale` (MUL:
+/// s_out/s_in); the fold op's output tensor zp → `output_zero_point`; the
+/// fold op's per-op `ElementwiseParams` emission → `left_shift`,
+/// `input1_multiplier/shift`, `input2_multiplier/shift`,
+/// `output_multiplier/shift`, `num_elements`.
+#[derive(Clone, Debug)]
+pub struct PoolInputFold<'a> {
+    /// Fold op builtin code: 18 = MUL, 41 = SUB.
+    pub builtin: i32,
+    /// The constant operand tensor data (the mul's / sub's input2).
+    pub operand_data: &'a [i8],
+    /// Operand tensor zero-point.
+    pub operand_zero_point: i64,
+    /// Folded (pre-fold) input tensor zero-point.
+    pub input_zero_point: i64,
+    /// Fold op output tensor zero-point.
+    pub output_zero_point: i64,
+    /// MUL: real-domain scale ratio `s_out / s_in` the fold applies
+    /// (`InputFold.folded_scale`).
+    pub folded_scale: f32,
+    /// Left-shift (0 for MUL; 20 for SUB).
+    pub left_shift: i32,
+    /// Output-ratio multiplier (Q0.31).
+    pub output_multiplier: i32,
+    /// Output right-shift.
+    pub output_shift: i32,
+    /// Input-1 per-input multiplier (SUB; else 0).
+    pub input1_multiplier: i32,
+    /// Input-1 per-input shift (SUB; else 0).
+    pub input1_shift: i32,
+    /// Input-2 per-input multiplier (SUB; else 0).
+    pub input2_multiplier: i32,
+    /// Input-2 per-input shift (SUB; else 0).
+    pub input2_shift: i32,
+    /// Flat element count of the fold input tensor (= pool input).
+    pub num_elements: i32,
+}
+
+/// Params for a fused pool (+ input fold + activation epilogue) composed
+/// kernel call.
+///
+/// Derived at emit time from these tensors: the `FusedGroup` anchor pool op
+/// via the EXISTING per-op pool emission → `pool` (`PoolParams` exactly as
+/// the unfused emitter would emit it) and `pool_kind` (from the anchor's
+/// `builtin_code`); `FusedGroup::input_fold` → `fold`;
+/// `FusedGroup::activation` → `activation`.
+#[derive(Clone, Debug)]
+pub struct FoldedPoolParams<'a> {
+    /// The anchor pool's per-op params, exactly as the unfused emitter
+    /// would emit them.
+    pub pool: PoolParams,
+    /// Whether the anchor is an average or max pool.
+    pub pool_kind: PoolKind,
+    /// Absorbed MUL/SUB input fold (None = no fold).
+    pub fold: Option<PoolInputFold<'a>>,
+    /// Absorbed trailing activation epilogue (kind None = identity).
+    pub activation: ActivationEpilogueParams,
+}
