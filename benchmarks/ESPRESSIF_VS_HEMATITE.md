@@ -65,7 +65,7 @@ of the final 16-byte output.
 
 | Stack | End-to-end cycles (min/med) | Speedup vs scalar | Output fnv1a | Bit-exact vs scalar? |
 |---|---|---|---|---|
-| **Hematite (bespoke ACCX + SIMD + asm requantize)** | **1,708,383 / 1,708,383** | 45.9× | `0x75eb32f5` | ✅ |
+| **Hematite (bespoke ACCX + SIMD + asm requantize)** | **1,686,922 / 1,686,922** | 45.9× | `0x75eb32f5` | ✅ |
 | ESP-NN optimized (esp32s3 asm) | 2,630,401 / 2,630,423 | 29.8× | `0x75eb32f5` | ✅ |
 | ESP-NN ANSI-C (reference) | 27,361,045 / 27,361,069 | 2.9× | `0x75eb32f5` | ✅ |
 | Scalar C reference (TFLite semantics) | 78,274,617 / 78,275,992 | 1.0× | `0x75eb32f5` | — |
@@ -79,7 +79,7 @@ every layer** (L1 `0xa18d9741`, L2 `0xbd989bf4`, L3 `0xb26f62c3`, final
 
 | Stack | End-to-end cycles (min/med) | Speedup vs scalar | Output fnv1a | Bit-exact vs scalar? |
 |---|---|---|---|---|
-| **Hematite (bespoke ACCX + SIMD + asm requantize)** | **770,986 / 770,986** | 18.8× | `0x7f23eb05` | ✅ |
+| **Hematite (bespoke ACCX + SIMD + asm requantize)** | **763,105 / 763,105** | 18.8× | `0x7f23eb05` | ✅ |
 | ESP-NN optimized (esp32s3 asm) | 994,782 / 994,782 | 14.6× | `0x7f23eb05` | ✅ |
 | Scalar reference (TFLite semantics) | 14,519,278 / 14,519,291 | 1.0× | `0x7f23eb05` | — |
 
@@ -92,7 +92,7 @@ MobileNetV2-style model **Hematite is ~1.29× faster than ESP-NN**.
 
 | Stack | End-to-end cycles (min/med) | Speedup vs scalar | Output fnv1a | Bit-exact vs scalar? |
 |---|---|---|---|---|
-| **Hematite (bespoke ACCX + SIMD + asm requantize)** | **654,407 / 654,407** | 22.1× | `0x75eb32f5` | ✅ |
+| **Hematite (bespoke ACCX + SIMD + asm requantize)** | **650,773 / 650,773** | 22.1× | `0x75eb32f5` | ✅ |
 | ESP-NN optimized (esp32s3 asm) | 655,194 / 655,303 | 18.2× | `0x75eb32f5` | ✅ |
 | Scalar reference (TFLite semantics) | 11,948,873 / 11,948,894 | 1.0× | `0x75eb32f5` | — |
 
@@ -224,13 +224,13 @@ lacks are `—` with the reason, and the exact rows to add are specified in
 
 | Operation (canonical shape) | Rust public-API cyc (min/med) | Rust out_fnv(ref/s3) | C raw-asm cyc (min/med) | C-side note |
 |---|---|---|---|---|
-| conv1x1 64x1x1x64 | 4269 / 4296 | `0x0bea8225`/`0x0bea8225` | 472 / 472 | shape match; raw `_11cn` entry |
+| conv1x1 64x1x1x64 | **3201 / 3228** | `0x0bea8225`/`0x0bea8225` | 472 / 472 | shape match; raw `_11cn` entry. Phase-18 (todo 16): prepared-path reuse inside the trait call path (scale_cache + inline `#[inline(never)]` scalar kernels) — was 4269 |
 | conv3x3 32x32x64 VALID | 8867105 / 8867106 | `0x0a181085`/`0x0a181085` | 2824 / 2824 | ⚠️ per-pixel call: `_33cn` computes ONE output pixel per call; a full-image C pass (900 px) is not yet measured |
-| conv3x3 16x16x32 SAME | 880343 / 880343 | `0xc53ebbc5`/`0xc53ebbc5` | — | no C row yet: `_33cn` is pad-0 per-pixel; SAME needs a caller-side zero-pad loop |
-| fc 256x64 | 8344 / 8371 | `0x32e35185`/`0x32e35185` | 1288 / 1288 | shape match; raw `_11cn` entry |
-| depthwise 12x12x16 S2 SAME | 35714 / 35714 | `0x5159710e`/`0x5159710e` | — | no C row yet: harness has only 7x7x32 stride-1 depthwise; the S2-SAME canonical shape is not added |
-| max_pool 2x2x16 | 33240 / 33253 | `0x651bfdc5`/`0x651bfdc5` | 1396 / 1396 | shape match; raw `_22c1` entry |
-| avg_pool 2x2x16 | 29225 / 29225 | `0xb8a6ddc5`/`0xb8a6ddc5` | 7181 / 7181 | shape match; raw `_22c1` entry (C-SIMD out ≠ ref — documented pool fixed-point semantics) |
+| conv3x3 16x16x32 SAME | 880343 / 880343 | `0xc53ebbc5`/`0xc53ebbc5` | — | no C row yet: `_33cn` is pad-0 per-pixel; SAME needs a caller-side zero-pad loop. TIE-memory-bound floor (todo 18: 2.36M MACs → ~880K cyc is the TIE-op floor, public == prepared) |
+| fc 256x64 | **7161 / 7188** | `0x32e35185`/`0x32e35185` | 1288 / 1288 | shape match; raw `_11cn` entry. Phase-18 (todo 16): was 8344 |
+| depthwise 12x12x16 S2 SAME | 35714 / 35714 | `0x5159710e`/`0x5159710e` | — | no C row yet: harness has only 7x7x32 stride-1 depthwise; the S2-SAME canonical shape is not added. SIMD dispatch verified engaged (todo 18) |
+| max_pool 2x2x16 | **14046 / 14046** | `0x651bfdc5`/`0x651bfdc5` | 1396 / 1396 | shape match; raw `_22c1` entry. Phase-18 (todo 17): prebuilt args + shared whole-op driver — was 33240 |
+| avg_pool 2x2x16 | **19913 / 19913** | `0xb8a6ddc5`/`0xb8a6ddc5` | 7181 / 7181 | shape match; raw `_22c1` entry (C-SIMD out ≠ ref — documented pool fixed-point semantics). Phase-18 (todo 17): was 29225 |
 | relu 256 | 358 / 358 | `0x6c620b3d`/`0x6c620b3d` | 175 / 175 | shape match; raw `_relu_11c` entry |
 | add 256 | 477 / 490 | `0x14834bbb`/`0x14834bbb` | 167 / 167 | shape match; raw `_add_w1_16_w2_16` entry |
 | mul 256 | 851 / 879 | `0xd3c0a7f1`/`0xd3c0a7f1` | 539 / 539 | shape match; raw `_mul_w1_16_w2_16` entry |
@@ -277,12 +277,12 @@ per-op table).
 
 | Zoo model | Hematite cycles (min/med) | Hematite ms @ 240 MHz | ESP-NN cycles (min/med) | Speedup | Notes |
 |---|---|---|---|---|---|
-| KWS `kws_micro_speech_int8` (1×1960→4) | 13,091,330 / 13,091,344 | 54 / 54 | — | — | C side `—`: no esp-nn runner yet (needs new harness code; feasible when toolchain returns — 18.8 KB model). Hematite 54 ms vs the 7 ms ESP-DL bar: FAIL — feeds todo 21. out_fnv `0x2131fda5` |
+| KWS `kws_micro_speech_int8` (1×1960→4) | 13,091,330 / 13,091,344 | 54 / 54 | — | — | C side `—`: no esp-nn runner yet (needs new harness code; feasible when toolchain returns — 18.8 KB model). **54 ms root-caused (todo 21):** the KWS depthwise has `depth_multiplier=8` (in_c=1, out_c=8) and the bespoke per-lane depthwise SIMD kernel requires `input_c==output_c` (dm==1) — structurally ineligible, runs scalar. Also fixed: zoo-model SIMD was silently disabled because codegen emitted `scratch: 0` (→ `SCRATCH_LEN=0` → every op got an empty scratch → scalar fallback); codegen now computes real per-op scratch (conv2d/depthwise/softmax/fc) and emits `#[repr(C, align(16))]` weight wrappers so the ACCX `w_ptr%16` gate engages. out_fnv `0x2131fda5` |
 | sine (1→1 smoke) | 536 / 536 | 0 / 0 | — | — | C side `—`: no runner yet (needs new harness code). out_fnv `0x040c5b8c` |
 | hello_world `hello_world_int8` (1→1) | 11,329 / 11,329 | 0 / 0 | — | — | C side `—`: no runner yet (needs new harness code). out_fnv `0xfaf3a2e1` |
-| anomaly_detect `anomaly_detect_int8` (640→640) | 19,669,640 / 19,669,640 | 81 / 81 | — | — | C side `—`: no runner yet; 277 KB model embed is above the ~200 KB app-write ceiling this USB adapter sustained (T16 finding) — verify flash path before trusting a C row. out_fnv `0xe8f86342` |
-| person_detect `person_detect_int8` (96×96×3→2) | SKIP | — | — | — | SKIP on both stacks: Hematite `reason=stack` (generated `predict` allocas ~232 KB vs ~65 KB device stack); C side `—` (no runner; 333 KB weights + tensors exceed SRAM/DRAM budget, no PSRAM to spill into) |
-| mobilenet_v2 `mobilenet_v2_1.0_224_int8` (3×224×224→1000) | SKIP | — | — | — | SKIP on both stacks: `reason=no-psram` (board probe: `PSRAM: 0 bytes`); 3.98 MB model cannot be embedded or held in the 416 KB DRAM |
+| anomaly_detect `anomaly_detect_int8` (640→640) | 19,669,640 / 19,669,640 | 81 / 81 | — | — | C side `—`: no runner yet; 277 KB model embed is above the ~200 KB app-write ceiling this USB adapter sustained (T16 finding) — verify flash path before trusting a C row. 10×FC model — FC SIMD now engages post-todo-21 (aligned weights + codegen scratch); run-4 re-measure pending board replug. out_fnv `0xe8f86342` |
+| person_detect `person_detect_int8` (96×96×3→2) | SKIP | — | — | — | SKIP on both stacks: Hematite `reason=stack` (generated `predict` allocas ~232 KB vs ~65 KB device stack); C side `—` (no runner; 333 KB weights + tensors exceed SRAM/DRAM budget, no PSRAM to spill into). Bit-exact vs executed-TFLM golden on host (`0x6962079d`) |
+| mobilenet_v2 `mobilenet_v2_1.0_224_int8` (3×224×224→1000) | SKIP | — | — | — | SKIP on both stacks: `reason=no-psram` (board probe: `PSRAM: 0 bytes`); 3.98 MB model cannot be embedded or held in the 416 KB DRAM. 984/1000 residual vs executed-TFLM golden: TFLM `pad.cc` fills `output_zero_point` (−14), `PadParams` carries no zero point (documented follow-up) |
 
 Reading the table: **every zoo row's C cell is honestly `—`** — the ESP-NN
 C baseline for these models does not exist yet (separate scope decision) and

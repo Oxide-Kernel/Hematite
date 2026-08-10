@@ -22,9 +22,11 @@ benchmarked.
 - **Full MobileNetV2 parity.** SAME padding, stride-2, non-zero input
   offsets, softmax, and non-multiple-of-16 depthwise channels all run SIMD
   (no scalar fallback) — the shapes a stock MobileNetV2 uses.
-- **`no_std` + host tests.** Kernels are host-compilable; the 34-test suite
-  (plus 3 kernel-level tests) runs on the host and every model/row is
-  re-verified bit-exact on the device.
+- **`no_std` + host tests.** Kernels are host-compilable; the 296-test suite
+  runs on the host and every model/row is re-verified bit-exact on the
+  device. `S3Backend` implements the full `KernelBackend` trait so `#[model]`-
+  generated zoo models run accelerated (conv, depthwise, fc, pooling,
+  softmax, elementwise, mean, data movement) on real silicon.
 
 ## Head-to-head vs the standard ESP-NN stack
 
@@ -34,9 +36,9 @@ in [`benchmarks/ESPRESSIF_VS_HEMATITE.md`](benchmarks/ESPRESSIF_VS_HEMATITE.md).
 
 | Model | ESP-NN optimized | **Hematite** | Hematite wins |
 |---|---|---|---|
-| A — 4-layer CNN | 2,630,401 cyc | **1,708,383 cyc** | 1.54× |
-| B — MobileNetV2-style 7-layer | 994,782 cyc | **770,986 cyc** | 1.29× |
-| C — real MobileNetV2 (SAME + stride-2) | 655,303 cyc | **654,407 cyc** | 1.01× |
+| A — 4-layer CNN | 2,630,401 cyc | **1,686,922 cyc** | 1.56× |
+| B — MobileNetV2-style 7-layer | 994,782 cyc | **763,105 cyc** | 1.30× |
+| C — real MobileNetV2 (SAME + stride-2) | 655,303 cyc | **650,773 cyc** | 1.01× |
 
 Every number is bit-exact with the scalar reference on every layer of every
 model — the comparison is apples-to-apples.
@@ -73,8 +75,10 @@ cargo build --release -Zbuild-std=core,alloc \
 ```
 
 See `benchmarks/ESPRESSIF_VS_HEMATITE.md` and `PROJECT_LOG.md` for the full
-flash/capture pipeline, the engineering history (Phases 0–17), and the
-hardware findings (including the permanent-flash-encryption flashing rule).
+flash/capture pipeline, the engineering history (Phases 0–18), and the
+hardware findings (including the permanent-flash-encryption flashing rule:
+**`esptool.py write_flash --encrypt` is required** — `espflash` has no
+encryption support and a plaintext write will not boot on this board).
 
 ## Engineering history
 
