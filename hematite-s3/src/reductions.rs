@@ -74,6 +74,20 @@ pub fn mean(
         return Err(KernelError::ShapeMismatch);
     }
 
+    // ── SIMD dispatch (device-only; compiled out entirely on host) ──
+    // Bespoke QACC per-lane `s8_mean_reduce` kernel: exact int32 lane sums
+    // over the reduced spatial axes, then the bit-exact round-half-away
+    // division + requantize in Rust. Bit-exact vs the scalar path below.
+    //
+    // ALSO gated off under the `qemu` feature: QEMU's xtensa/esp32s3 TIE728
+    // emulation does not correctly execute the TIE MAC instructions this
+    // kernel depends on. QEMU builds fall through to the scalar path; real
+    // hardware still gets SIMD.
+    #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+    if mean_accx_dispatch(input, params, output)? {
+        return Ok(());
+    }
+
     // Build a boolean mask: which axes are reduced?
     let mut reduce_mask = [false; 4];
     for i in 0..(params.axis_count as usize).min(4) {
@@ -177,46 +191,154 @@ pub fn mean(
 ///
 /// **Entirely cfg-gated** — NEVER compiled on host.
 ///
-/// ## Plan-per-op SIMD instructions
+/// ## Mean SIMD (QACC per-lane, bit-exact)
 ///
-/// * Mean: sum → requantize, partial SIMD (scalar accumulator with
-///   SIMD load/store via `ee.vld.128.ip` / `ee.vst.128.ip`).
-//
-// mean_simd is an unimplemented placeholder stub (writes nothing) — do not
-// dispatch to it. Scalar-only until a real backend is vendored.
-#[cfg(target_arch = "xtensa")]
+/// For a MEAN that reduces the spatial axes (H,W) while keeping channels —
+/// the MobileNetV2 global-average-pool shape — the `s8_mean_reduce` kernel
+/// accumulates per-lane via `EE.VMULAS.S8.QACC q0, q1` (q1 = 16×0x01 ones),
+/// the same primitive as the depthwise kernel, and recovers the 16 int32
+/// lane sums via the verified two-pass QACC read-back. The bit-exact
+/// round-half-away division + per-tensor requantize run in Rust from the
+/// raw sums (identical arithmetic to the scalar path).
+#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
 mod reduction_simd {
-    /// TIE728 reduction args struct.
-    ///
-    /// ## ABI (unverified — T5.3 device verification required)
-    #[allow(dead_code)]
-    #[repr(C)]
-    pub struct Tie728ReduceArgs {
-        output: *mut i8,
-        input: *const i8,
-        _pad: [u8; 64], // reserved
-    }
+    use core::arch::{asm, global_asm};
 
-    /// Mean SIMD — partial SIMD load/store, scalar accumulator.
+    global_asm!(include_str!("asm/s8_mean_reduce.S"));
+
+    /// Ones vector (16×0x01) for the QACC lane accumulate.
+    #[repr(align(16))]
+    struct AlignedOnes([i8; 16]);
+    static ONES: AlignedOnes = AlignedOnes([1i8; 16]);
+
+    /// MEAN-reduce `[positions, in_c]` → `in_c` int32 lane sums.
     ///
     /// # Safety
-    ///
-    /// ABI-unverified. Inline global_asm! with ee.vld.128.ip +
-    /// ee.vst.128.ip.
-    #[allow(dead_code)]
-    pub unsafe fn mean_simd(_output: *mut i8, _input: *const i8, _args: &Tie728ReduceArgs) {
-        core::arch::asm!(
-            // Placeholder — real SIMD loop:
-            // 1. ee.vld.128.ip to load 16 int8 values
-            // 2. Scalar i32 accumulate (no SIMD add — overflow risk
-            //    with int8 × 16 = small window)
-            // 3. Scalar divide + requantize
-            // 4. ee.vst.128.ip to store result
-            "nop",
+    /// `input`/`ones` 16-byte aligned, `acc_out` 4-byte aligned,
+    /// `in_c % 16 == 0`, `in_c >= 16`, `positions >= 1`, buffers sized.
+    pub unsafe fn mean_reduce(
+        input: *const i8,
+        acc_out: *mut i32,
+        positions: usize,
+        in_c: usize,
+    ) {
+        asm!(
+            "call8 s8_mean_reduce",
+            in("a10") input,
+            in("a11") &ONES.0,
+            inout("a12") acc_out => _,
+            in("a13") positions,
+            in("a14") in_c,
+            out("a15") _,
             clobber_abi("C"),
         );
     }
 }
 
-#[cfg(target_arch = "xtensa")]
-pub use reduction_simd::mean_simd;
+/// Mean SIMD eligibility + dispatch — device-only.
+///
+/// Handles the MEAN-over-spatial-axes case bit-exactly:
+/// * reduction axes are exactly {H, W} (fully reduced: `out_h == out_w == 1`),
+///   channels preserved;
+/// * `positions = in_h * in_w <= 256` — the QACC lanes hold `127*positions`
+///   max, a signed-16-bit bound (see the kernel doc);
+/// * `in_c <= 256` — the int32 accs scratch fits a bounded stack local;
+/// * `in_c % 16 == 0` OR `positions * padded_c <= 4096` so the zero-padded
+///   channel staging fits a bounded stack local.
+///
+/// Returns `Ok(true)` when the SIMD path handled the mean, `Ok(false)` when
+/// the shape is ineligible (caller falls through to scalar).
+#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+fn mean_accx_dispatch(
+    input: &[i8],
+    params: &ReduceParams,
+    output: &mut [i8],
+) -> Result<bool, KernelError> {
+    let in_h = params.input_shape[1] as usize;
+    let in_w = params.input_shape[2] as usize;
+    let in_c = params.input_shape[3] as usize;
+    let out_h = params.output_shape[1];
+    let out_w = params.output_shape[2];
+    let out_c = params.output_shape[3] as usize;
+
+    let mut reduce_mask = [false; 4];
+    for i in 0..(params.axis_count as usize).min(4) {
+        let ax = params.axis[i] as usize;
+        if ax < 4 {
+            reduce_mask[ax] = true;
+        }
+    }
+    let spatial_full = reduce_mask[1] && reduce_mask[2] && !reduce_mask[0] && !reduce_mask[3];
+    if !spatial_full || out_h != 1 || out_w != 1 || out_c != in_c {
+        return Ok(false);
+    }
+    let positions = in_h * in_w;
+    if positions < 1 || positions > 256 || in_c < 1 || in_c > 256 {
+        return Ok(false);
+    }
+
+    let padded_c = ((in_c + 15) / 16) * 16;
+    let needs_channel_pad = padded_c != in_c;
+    if needs_channel_pad && positions * padded_c > 4096 {
+        return Ok(false);
+    }
+    let mut accs = [0i32; 256];
+    let count = (in_h * in_w) as i32;
+    let mult = params.output_multiplier;
+    let shift = params.output_shift;
+    let out_off = params.output_offset;
+    let act_min = params.quantized_activation_min;
+    let act_max = params.quantized_activation_max;
+
+    // The padded channel stage must outlive the kernel call — a `padded`
+    // local scoped to the branch below would be dropped (stack slot reused)
+    // before `mean_reduce` reads it, producing a dangling input pointer
+    // (task-18 device finding: all-zero lane sums).
+    let mut padded_stage = [0i8; 4096];
+    let k_input: *const i8;
+    unsafe {
+        if needs_channel_pad {
+            let src = input.as_ptr();
+            let dst = padded_stage.as_mut_ptr();
+            for pos in 0..positions {
+                core::ptr::copy_nonoverlapping(
+                    src.add(pos * in_c),
+                    dst.add(pos * padded_c),
+                    in_c,
+                );
+            }
+            k_input = padded_stage.as_ptr();
+        } else {
+            k_input = input.as_ptr();
+        }
+        reduction_simd::mean_reduce(k_input, accs.as_mut_ptr(), positions, padded_c);
+    }
+
+    for oc in 0..in_c {
+        let acc = accs[oc];
+        let averaged = if count == 0 { 0 } else { round_half_away_zero(acc, count) };
+        let scaled = multiply_by_quantized_multiplier(averaged, mult, shift);
+        let val = (scaled + out_off).max(act_min).min(act_max);
+        output[oc] = saturating_cast(val);
+    }
+    SIMD_MEAN_RAN.store(1, core::sync::atomic::Ordering::Relaxed);
+    Ok(true)
+}
+
+/// Last-`mean` SIMD engagement flag (device diagnostic for simd_validation).
+static SIMD_MEAN_RAN: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Whether the most recent `mean` call took the SIMD path.
+///
+/// Host/QEMU builds never run the SIMD kernel, so this is always `false`
+/// there; on real hardware it flips to `true` after an eligible mean.
+pub fn mean_took_simd() -> bool {
+    #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+    {
+        SIMD_MEAN_RAN.load(core::sync::atomic::Ordering::Relaxed) != 0
+    }
+    #[cfg(not(all(target_arch = "xtensa", not(feature = "qemu"))))]
+    {
+        false
+    }
+}
