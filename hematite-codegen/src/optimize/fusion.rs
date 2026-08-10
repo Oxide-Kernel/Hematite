@@ -138,6 +138,13 @@ pub(crate) struct FusedGroup {
     /// Constant-folded requantize (pattern (e)): one per-channel
     /// multiply-shift replacing kernel-requantize + scale-change requantize.
     pub(crate) folded_requantize: Option<FoldedRequantize>,
+    /// T1.1 correctness tier: `true` for T2 (proof-obligated) groups.
+    /// Input-folds (pattern (d)) and requantize-folds (pattern (e)) are
+    /// algebraically transformative — NOT semantics-preserving — so their
+    /// bit-exactness depends on a per-model fused==unfused verification
+    /// passing before the composed kernel may be used.  T1.2 consumes this
+    /// flag: a `true` group is emitted per-op until verification passes.
+    pub(crate) requires_verification: bool,
 }
 
 impl FusedGroup {
@@ -155,6 +162,7 @@ impl FusedGroup {
             residual_add: None,
             input_fold: None,
             folded_requantize: None,
+            requires_verification: false,
         }
     }
 }
@@ -188,6 +196,98 @@ pub(crate) enum ElementwiseKind {
     HardSwish,
 }
 
+/// TFLM int8 requantize parameters for one fused elementwise / residual-add
+/// step (T1.1).  Mirrors the per-op elementwise math emitted in generate.rs
+/// (`left_shift = 20` twice-max scaling for ADD/SUB, a single
+/// `QuantizeMultiplier` output ratio for MUL, the activation output ratio
+/// for activation steps) so the composed emitter (T1.2) can reproduce each
+/// step bit-exactly from the operand tensors.  Steps are NEVER collapsed —
+/// every step keeps its own multiplier/shift/offset triple.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StepRequantize {
+    /// `left_shift` — 20 for ADD/SUB (twice-max scaling), 0 for MUL and
+    /// activation steps.
+    pub(crate) left_shift: i32,
+    /// ADD/SUB: `QuantizeMultiplier(input1_scale / twice_max)`; else 0.
+    pub(crate) input1_multiplier: i32,
+    pub(crate) input1_shift: i32,
+    /// ADD/SUB: `QuantizeMultiplier(input2_scale / twice_max)`; else 0.
+    pub(crate) input2_multiplier: i32,
+    pub(crate) input2_shift: i32,
+    /// Output-ratio multiplier: ADD/SUB
+    /// `twice_max / (2^left_shift · output_scale)`; MUL
+    /// `input1_scale · input2_scale / output_scale`; activation steps
+    /// `input_scale / output_scale`.
+    pub(crate) output_multiplier: i32,
+    pub(crate) output_shift: i32,
+    /// Input-1 offset — `-zero_point` for ADD/SUB/MUL steps, `+zero_point`
+    /// for activation steps (each follows the respective generate.rs
+    /// per-op emission convention).
+    pub(crate) input1_offset: i32,
+    /// Input-2 offset — `-zero_point` of the operand/residual tensor
+    /// (0 for activation steps).
+    pub(crate) input2_offset: i32,
+    /// Output offset — `+zero_point` of the step's output tensor.
+    pub(crate) output_offset: i32,
+}
+
+impl StepRequantize {
+    /// Requantize params for one chain/residual-add step computed from the
+    /// parsed tensors: `in1` is the running tensor (a chain) or the anchor
+    /// output (a residual add), `in2` the operand/residual (`u32::MAX` for
+    /// activation steps), `out` the step's output tensor.
+    fn elementwise(
+        ctx: &Ctx<'_>,
+        in1: u32,
+        in2: u32,
+        out: u32,
+        kind: ElementwiseKind,
+    ) -> Self {
+        let in1_scale = f64::from(ctx.scale_of(in1).unwrap_or(1.0));
+        let in2_scale = f64::from(ctx.scale_of(in2).unwrap_or(1.0));
+        let out_scale = f64::from(ctx.scale_of(out).unwrap_or(1.0));
+        let (left_shift, i1m, i1s, i2m, i2s, om, os) = match kind {
+            ElementwiseKind::Add | ElementwiseKind::Sub => {
+                let twice_max = 2.0 * in1_scale.max(in2_scale);
+                let (a, b) = quantize_multiplier(in1_scale / twice_max);
+                let (c, d) = quantize_multiplier(in2_scale / twice_max);
+                let (e, f) = quantize_multiplier(twice_max / ((1i32 << 20) as f64 * out_scale));
+                (20, a, b, c, d, e, f)
+            }
+            ElementwiseKind::Mul => {
+                let (e, f) = quantize_multiplier(in1_scale * in2_scale / out_scale);
+                (0, 0, 0, 0, 0, e, f)
+            }
+            ElementwiseKind::Relu | ElementwiseKind::Relu6 | ElementwiseKind::HardSwish => {
+                let (e, f) = quantize_multiplier(in1_scale / out_scale);
+                (0, 0, 0, 0, 0, e, f)
+            }
+        };
+        let is_activation =
+            matches!(kind, ElementwiseKind::Relu | ElementwiseKind::Relu6 | ElementwiseKind::HardSwish);
+        StepRequantize {
+            left_shift,
+            input1_multiplier: i1m,
+            input1_shift: i1s,
+            input2_multiplier: i2m,
+            input2_shift: i2s,
+            output_multiplier: om,
+            output_shift: os,
+            input1_offset: if is_activation {
+                ctx.zp_of(in1).unwrap_or(0) as i32
+            } else {
+                -(ctx.zp_of(in1).unwrap_or(0) as i32)
+            },
+            input2_offset: if is_activation {
+                0
+            } else {
+                -(ctx.zp_of(in2).unwrap_or(0) as i32)
+            },
+            output_offset: ctx.zp_of(out).unwrap_or(0) as i32,
+        }
+    }
+}
+
 /// One op absorbed into a register-held elementwise loop (pattern (b)).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AbsorbedElementwise {
@@ -200,6 +300,10 @@ pub(crate) struct AbsorbedElementwise {
     /// Quant params of this op's output tensor (the chain result scale).
     pub(crate) output_scale: f32,
     pub(crate) output_zero_point: i64,
+    /// T1.1: this step's TFLM requantize params (twice-max triple for
+    /// ADD/SUB, output ratio for MUL/activations) — carried per step so the
+    /// emitter reproduces the exact rounding sequence, never collapsed.
+    pub(crate) requantize: StepRequantize,
 }
 
 /// Residual-add group (pattern (c)).
@@ -212,6 +316,10 @@ pub(crate) struct ResidualAdd {
     /// Quant params of the ADD's output tensor (written in-place).
     pub(crate) output_scale: f32,
     pub(crate) output_zero_point: i64,
+    /// T1.1: the ADD's TFLM requantize params (input1 = anchor output,
+    /// input2 = residual) carried so the composed kernel reproduces the
+    /// exact TFLM Add rounding sequence.
+    pub(crate) requantize: StepRequantize,
 }
 
 /// Input fold for a pool/softmax (pattern (d)).
@@ -364,7 +472,7 @@ pub(crate) fn fuse(model: &ParsedModel<'_>) -> FusedSchedule {
             continue;
         }
         let code = model.ops()[i].builtin_code;
-        let group = if is_conv_family(code) {
+        let mut group = if is_conv_family(code) {
             try_fuse_conv(&ctx, i)
         } else if is_elementwise(code) {
             try_fuse_elementwise_chain(&ctx, i)
@@ -376,6 +484,12 @@ pub(crate) fn fuse(model: &ParsedModel<'_>) -> FusedSchedule {
         for &absorbed in &group.absorbed_ops {
             ctx.consumed[absorbed] = true;
         }
+        // T1.1: pattern-(d) input-folds and pattern-(e) requantize-folds are
+        // algebraically transformative (NOT semantics-preserving) — they are
+        // proof-obligated T2 groups, tagged here for the emitter so T1.2 can
+        // keep them per-op until a fused==unfused verification passes.
+        group.requires_verification =
+            group.input_fold.is_some() || group.folded_requantize.is_some();
         groups.push(group);
     }
 
@@ -499,14 +613,25 @@ fn try_fuse_conv(ctx: &Ctx<'_>, op_index: usize) -> FusedGroup {
         }
     }
 
-    // (a) absorb a following standalone activation.
+    // (a) absorb a following standalone activation.  T1.1 correctness tier:
+    // a standalone RELU/RELU6/HARD_SWISH kernel is a FULL requantize
+    // (`x + input_offset; max(v, 0); multiply_by_quantized_multiplier;
+    // + output_offset` — hematite-ref activation.rs), NOT a pure clamp.
+    // Absorbing it as an `activation_range` clamp (see `activation_from`) is
+    // exact only when the activation's output quant is IDENTICAL to the
+    // anchor's output quant (scale AND zero point): equal scales with
+    // differing zps diverge — unfused `max(x, 0) + zp_out` vs fused
+    // `clamp(x, zp_out, 127)`.  When the gate fails the group is NOT
+    // formed; the activation falls back to a separate per-op call.
     if let Some(act_idx) = ctx.next_consumer(out) {
         if let Some(kind) = activation_kind(ctx.model.ops()[act_idx].builtin_code) {
             let act_out = ctx.model.ops()[act_idx].outputs.first().copied().unwrap_or(u32::MAX);
-            g.activation = Some(activation_from(ctx, kind, act_out));
-            g.absorbed_ops.push(act_idx);
-            g.eliminated_tensors.push(out);
-            g.output_tensor = act_out;
+            if quant_identity(ctx, act_out, out) {
+                g.activation = Some(activation_from(ctx, kind, act_out));
+                g.absorbed_ops.push(act_idx);
+                g.eliminated_tensors.push(out);
+                g.output_tensor = act_out;
+            }
         }
     }
 
@@ -545,24 +670,40 @@ fn try_fuse_residual(
         _ => return false, // residual not yet available at the conv's position
     }
 
+    // T1.1: the ADD's per-step requantize params (input1 = the anchor
+    // output, input2 = the residual) reproduce the exact TFLM Add rounding.
+    let requantize = StepRequantize::elementwise(
+        ctx,
+        conv_out,
+        residual,
+        add_out,
+        ElementwiseKind::Add,
+    );
+
     g.residual_add = Some(ResidualAdd {
         op_index: add_idx,
         residual_tensor: residual,
         output_scale: ctx.scale_of(add_out).unwrap_or(1.0),
         output_zero_point: ctx.zp_of(add_out).unwrap_or(0),
+        requantize,
     });
     g.absorbed_ops.push(add_idx);
     g.eliminated_tensors.push(conv_out);
     g.output_tensor = add_out;
 
     // Absorb a trailing relu/relu6/hard-swish as the fused activation.
+    // Same T1.1 quant-identity gate as the conv path: the standalone
+    // activation is a full requantize, so the clamp is exact only when the
+    // activation output quant equals the add output quant.
     if let Some(act_idx) = ctx.next_consumer(add_out) {
         if let Some(kind) = activation_kind(ctx.model.ops()[act_idx].builtin_code) {
             let act_out = ctx.model.ops()[act_idx].outputs.first().copied().unwrap_or(u32::MAX);
-            g.activation = Some(activation_from(ctx, kind, act_out));
-            g.absorbed_ops.push(act_idx);
-            g.eliminated_tensors.push(add_out);
-            g.output_tensor = act_out;
+            if quant_identity(ctx, act_out, add_out) {
+                g.activation = Some(activation_from(ctx, kind, act_out));
+                g.absorbed_ops.push(act_idx);
+                g.eliminated_tensors.push(add_out);
+                g.output_tensor = act_out;
+            }
         }
     }
     true
@@ -595,19 +736,31 @@ fn try_fold_requantize(ctx: &Ctx<'_>, conv_idx: usize, mul_idx: usize) -> Option
         return None; // not all-ones → data-dependent scaling, not a requantize
     }
 
+    // Metis G-3: the fold may only claim exactness when the mul's output
+    // scale equals the conv output scale (`s_conv_out == s_mul_out`, i.e.
+    // the mul's own requantize multiplier is the identity).  A real scale
+    // change makes the mul perform its OWN `QuantizeMultiplier` rounding
+    // AFTER the conv's — two-stage rounding is NOT equivalent to the single
+    // folded requantize, so that case is never claimed here (the mul stays
+    // a separate per-op call; only a passing T5.1 fused==unfused
+    // verification could ever allow a scale-changing composed kernel).
+    let s_mul_out = ctx.scale_of(mul.outputs.first().copied().unwrap_or(u32::MAX))?;
+    if ctx.scale_of(conv_out)? != s_mul_out {
+        return None;
+    }
+
     let conv = &ctx.model.ops()[conv_idx];
     let weight = *conv.inputs.get(1)?;
     let s_in = ctx.scale_of(*conv.inputs.first()?)?;
-    let s_out = ctx.scale_of(mul.outputs.first().copied().unwrap_or(u32::MAX))?;
     let multipliers = ctx
         .weight_scales(weight)?
         .iter()
-        .map(|&sw| quantize_multiplier(f64::from(s_in * sw / s_out)))
+        .map(|&sw| quantize_multiplier(f64::from(s_in * sw / s_mul_out)))
         .collect();
 
     Some(FoldedRequantize {
         op_index: mul_idx,
-        output_scale: s_out,
+        output_scale: s_mul_out,
         output_zero_point: ctx.zp_of(mul.outputs[0]).unwrap_or(0),
         multipliers,
     })
@@ -644,12 +797,17 @@ fn try_fuse_elementwise_chain(ctx: &Ctx<'_>, op_index: usize) -> FusedGroup {
             .unwrap_or(u32::MAX);
         let out = next.outputs.first().copied().unwrap_or(u32::MAX);
 
+        // T1.1: carry this step's TFLM requantize params — each chain step
+        // keeps its own multiplier/shift/offset triple (never collapsed).
+        let requantize = StepRequantize::elementwise(ctx, running, operand, out, kind);
+
         g.elementwise_chain.push(AbsorbedElementwise {
             op_index: next_idx,
             kind,
             operand_tensor: operand,
             output_scale: ctx.scale_of(out).unwrap_or(1.0),
             output_zero_point: ctx.zp_of(out).unwrap_or(0),
+            requantize,
         });
         g.absorbed_ops.push(next_idx);
         g.eliminated_tensors.push(running);
@@ -726,6 +884,18 @@ fn fused_activation_field(options: Option<&ParsedOptions>) -> Option<i8> {
         | ParsedOptions::Sub { fused_activation, .. }
         | ParsedOptions::Mul { fused_activation } => Some(*fused_activation),
         _ => None,
+    }
+}
+
+/// T1.1 quant-identity gate: tensors `a` and `b` share the same scale AND
+/// the same zero point.  Exact `f32` equality (not epsilon) — two distinct
+/// scale values define distinct quantization grids, so any requantize
+/// between them is a rounding step a pure clamp cannot reproduce.  Tensors
+/// without quantization never pass.
+fn quant_identity(ctx: &Ctx<'_>, a: u32, b: u32) -> bool {
+    match (ctx.scale_of(a), ctx.zp_of(a), ctx.scale_of(b), ctx.zp_of(b)) {
+        (Some(sa), Some(za), Some(sb), Some(zb)) => sa == sb && za == zb,
+        _ => false,
     }
 }
 
@@ -1330,14 +1500,32 @@ mod opt_fusion {
     // assertions (independent of the implementation under test).
     const QM_4_0: (i32, i32) = (1073741824, 3); // quantize_multiplier(4.0)
     const QM_2_0: (i32, i32) = (1073741824, 2); // quantize_multiplier(2.0)
+    const QM_1_0: (i32, i32) = (1073741824, 1); // quantize_multiplier(1.0)
+    const QM_HALF: (i32, i32) = (1073741824, 0); // quantize_multiplier(0.5)
 
     // ------------------------------------------------------------------
     // Pattern (a) — conv-family + activation epilogue
     // ------------------------------------------------------------------
 
-    /// A minimal conv→relu graph with quantized tensors.
+    /// A minimal conv→relu graph with quantized tensors.  The conv output
+    /// quant equals the activation output quant (T1.1 quant identity) so the
+    /// standalone-activation absorption is exact and the tests exercise the
+    /// clamp-range computation; the mismatch cases use
+    /// [`conv_relu_model_quants`].
     fn conv_relu_model(
         relu_code: i32,
+        act_scale: f32,
+        act_zp: i64,
+    ) -> (&'static [u8], flatbuffer::ParsedModel<'static>) {
+        conv_relu_model_quants(relu_code, act_scale, act_zp, act_scale, act_zp)
+    }
+
+    /// A conv→activation graph with INDEPENDENT conv-output and
+    /// activation-output quants (the scale/zero-point gate cases).
+    fn conv_relu_model_quants(
+        relu_code: i32,
+        conv_scale: f32,
+        conv_zp: i64,
         act_scale: f32,
         act_zp: i64,
     ) -> (&'static [u8], flatbuffer::ParsedModel<'static>) {
@@ -1346,8 +1534,16 @@ mod opt_fusion {
                 BuildTensor::quantized(&[1, 4, 4, 8], "input", BuildQuant::tensor(1.0, 0)),
                 BuildTensor::constant(&[16, 1, 1, 8], "conv/weights", vec![0u8; 16 * 8]),
                 BuildTensor::constant(&[16], "conv/bias", vec![0u8; 16 * 4]),
-                BuildTensor::quantized(&[1, 4, 4, 16], "conv/output", BuildQuant::tensor(0.25, 0)),
-                BuildTensor::quantized(&[1, 4, 4, 16], "act/output", BuildQuant::tensor(act_scale, act_zp)),
+                BuildTensor::quantized(
+                    &[1, 4, 4, 16],
+                    "conv/output",
+                    BuildQuant::tensor(conv_scale, conv_zp),
+                ),
+                BuildTensor::quantized(
+                    &[1, 4, 4, 16],
+                    "act/output",
+                    BuildQuant::tensor(act_scale, act_zp),
+                ),
             ],
             vec![
                 BuildOp::fused(CONV_2D, vec![0, 1, 2], vec![3], OptionsKind::Conv2d, ACT_NONE),
@@ -1378,6 +1574,10 @@ mod opt_fusion {
         assert_eq!(act.kind, FusedActivationKind::Relu);
         // CalculateActivationRangeQuantized(RELU, scale=1, zp=0) → [0, 127].
         assert_eq!((act.quantized_min, act.quantized_max), (0, 127));
+        assert!(
+            !g.requires_verification,
+            "activation absorption is T1 semantics-preserving"
+        );
     }
 
     #[test]
@@ -1406,6 +1606,50 @@ mod opt_fusion {
         let act = schedule.groups[0].activation.expect("relu must fuse");
         // quantize(0.0) = zp + round(0/1) = 5 → [max(-128, 5), 127] = [5, 127].
         assert_eq!((act.quantized_min, act.quantized_max), (5, 127));
+    }
+
+    #[test]
+    fn scale_changing_activation_not_absorbed() {
+        // conv output scale 0.25 vs activation output scale 1.0: the
+        // standalone relu is a full requantize, so absorbing it as an
+        // `activation_range` clamp would NOT be bit-exact.  The T1.1
+        // scale-identity gate refuses → the relu stays a separate call.
+        let (_bytes, model) = conv_relu_model_quants(RELU, 0.25, 0, 1.0, 0);
+        let schedule = fuse(&model);
+        assert_eq!(
+            schedule.groups.len(),
+            2,
+            "scale-changing relu must stay a separate call"
+        );
+        let conv = &schedule.groups[0];
+        assert!(
+            conv.activation.is_none(),
+            "standalone relu must not be absorbed as a clamp"
+        );
+        assert!(conv.absorbed_ops.is_empty());
+        assert!(conv.eliminated_tensors.is_empty());
+        assert_eq!(conv.output_tensor, 3);
+        assert_eq!(schedule.groups[1].anchor_op_index, 1, "relu keeps its own call");
+        assert_eq!(schedule.fused_op_count(), 0);
+    }
+
+    #[test]
+    fn zero_point_only_difference_activation_not_absorbed() {
+        // Equal scales (1.0), differing zero points (conv 0, relu 5): the
+        // unfused relu computes `max(x, 0) + 5` while the fused clamp would
+        // give `clamp(x, 5, 127)` — divergent, so absorption must be refused.
+        let (_bytes, model) = conv_relu_model_quants(RELU, 1.0, 0, 1.0, 5);
+        let schedule = fuse(&model);
+        assert_eq!(
+            schedule.groups.len(),
+            2,
+            "zero-point-changing relu must stay a separate call"
+        );
+        let conv = &schedule.groups[0];
+        assert!(conv.activation.is_none());
+        assert!(conv.absorbed_ops.is_empty());
+        assert_eq!(schedule.groups[1].anchor_op_index, 1);
+        assert_eq!(schedule.fused_op_count(), 0);
     }
 
     #[test]
@@ -1577,6 +1821,73 @@ mod opt_fusion {
         assert!((chain[1].output_scale - 0.5).abs() < 1e-6);
         assert_eq!(chain[2].kind, ElementwiseKind::HardSwish);
         assert_eq!(chain[2].operand_tensor, u32::MAX);
+        assert!(
+            !g.requires_verification,
+            "elementwise chains are T1 semantics-preserving"
+        );
+    }
+
+    #[test]
+    fn two_step_chain_keeps_per_step_requantize_params() {
+        // sub → mul → mul: two consecutive scale-changing muls (× ones@1.0,
+        // 1.0 → 0.25 → 0.5).  Each chain step requantizes with NON-identity
+        // scales and must carry its OWN output ratio — step 0 is
+        // qm(1.0·1.0/0.25) = qm(4.0), step 1 is qm(0.25·1.0/0.5) = qm(0.5),
+        // never collapsed into a single multiplier.
+        let (_bytes, model) = model!(
+            vec![
+                BuildTensor::quantized(&[1, 4], "a", BuildQuant::tensor(1.0, 0)),
+                BuildTensor::quantized(&[1, 4], "b", BuildQuant::tensor(0.5, 0)),
+                BuildTensor::quantized(&[1, 4], "sub/out", BuildQuant::tensor(1.0, 0)),
+                BuildTensor::constant_quantized(
+                    &[1],
+                    "ones",
+                    vec![1, 1, 1, 1],
+                    BuildQuant::tensor(1.0, 0),
+                ),
+                BuildTensor::quantized(&[1, 4], "mul1/out", BuildQuant::tensor(0.25, 0)),
+                BuildTensor::quantized(&[1, 4], "mul2/out", BuildQuant::tensor(0.5, 0)),
+            ],
+            vec![
+                BuildOp::plain(SUB, vec![0, 1], vec![2]),
+                BuildOp::plain(MUL, vec![2, 3], vec![4]),
+                BuildOp::plain(MUL, vec![4, 3], vec![5]),
+            ],
+            vec![0, 1],
+            vec![5]
+        );
+        let schedule = fuse(&model);
+        assert_eq!(schedule.groups.len(), 1, "three-op chain is one emitted call");
+        let g = &schedule.groups[0];
+        let chain = &g.elementwise_chain;
+        assert_eq!(chain.len(), 2);
+
+        // Step 0 (MUL): output ratio 1.0·1.0/0.25 = 4.0; offsets zero.
+        let s0 = chain[0].requantize;
+        assert_eq!(s0.left_shift, 0);
+        assert_eq!((s0.output_multiplier, s0.output_shift), QM_4_0);
+        assert_eq!(s0.input1_multiplier, 0);
+        assert_eq!(s0.input2_multiplier, 0);
+        assert_eq!(s0.input1_offset, 0);
+        assert_eq!(s0.input2_offset, 0);
+        assert_eq!(s0.output_offset, 0);
+
+        // Step 1 (MUL): output ratio 0.25·1.0/0.5 = 0.5 — a DIFFERENT
+        // multiplier than step 0, carried per step (never collapsed).
+        let s1 = chain[1].requantize;
+        assert_eq!(s1.left_shift, 0);
+        assert_eq!((s1.output_multiplier, s1.output_shift), QM_HALF);
+        assert_eq!(s1.input1_multiplier, 0);
+        assert_eq!(s1.input2_multiplier, 0);
+        assert_ne!(
+            (s0.output_multiplier, s0.output_shift),
+            (s1.output_multiplier, s1.output_shift),
+            "steps must keep distinct requantize params (no collapsing)"
+        );
+        assert!(
+            !g.requires_verification,
+            "elementwise chains are T1 semantics-preserving"
+        );
     }
 
     #[test]
@@ -1786,6 +2097,10 @@ mod opt_fusion {
         assert_eq!(fold.input_zero_point, 0);
         assert_eq!(g.inputs[0], 0, "kernel reads the pre-mul tensor");
         assert_eq!(g.eliminated_tensors, vec![2]);
+        assert!(
+            g.requires_verification,
+            "input folds are algebraically transformative T2 groups"
+        );
     }
 
     #[test]
@@ -1863,9 +2178,11 @@ mod opt_fusion {
     #[test]
     fn fuse_conv_mul_requantize_single_multiply_shift() {
         // conv (per-channel w scales [0.5, 0.25], s_in 1.0) → mul by an
-        // all-ones constant at scale 1.0 → mul output scale 0.125.
-        // Folded per-channel multipliers: qm(1·0.5/0.125)=qm(4.0),
-        // qm(1·0.25/0.125)=qm(2.0).
+        // all-ones constant at scale 1.0 → mul output scale 0.25, EQUAL to
+        // the conv output scale (Metis G-3 identity — the mul's own
+        // requantize multiplier is the identity, so the fold is exact).
+        // Folded per-channel multipliers: qm(1·0.5/0.25)=qm(2.0),
+        // qm(1·0.25/0.25)=qm(1.0).
         let (_bytes, model) = model!(
             vec![
                 BuildTensor::quantized(&[1, 4, 4, 8], "input", BuildQuant::tensor(1.0, 0)),
@@ -1878,7 +2195,7 @@ mod opt_fusion {
                 BuildTensor::constant(&[2], "conv/bias", vec![0u8; 2 * 4]),
                 BuildTensor::quantized(&[1, 4, 4, 2], "conv/out", BuildQuant::tensor(0.25, 0)),
                 BuildTensor::constant_quantized(&[1], "ones", vec![1, 1, 1, 1], BuildQuant::tensor(1.0, 0)),
-                BuildTensor::quantized(&[1, 4, 4, 2], "mul/out", BuildQuant::tensor(0.125, 0)),
+                BuildTensor::quantized(&[1, 4, 4, 2], "mul/out", BuildQuant::tensor(0.25, 0)),
             ],
             vec![
                 BuildOp::fused(CONV_2D, vec![0, 1, 2], vec![3], OptionsKind::Conv2d, ACT_NONE),
@@ -1896,17 +2213,24 @@ mod opt_fusion {
         let g = &schedule.groups[0];
         let fr = g.folded_requantize.as_ref().expect("requantize must fold");
         assert_eq!(fr.op_index, 1);
-        assert!((fr.output_scale - 0.125).abs() < 1e-6);
+        assert!((fr.output_scale - 0.25).abs() < 1e-6);
         assert_eq!(fr.output_zero_point, 0);
-        assert_eq!(fr.multipliers, vec![QM_4_0, QM_2_0]);
+        assert_eq!(fr.multipliers, vec![QM_2_0, QM_1_0]);
         assert_eq!(g.absorbed_ops, vec![1]);
         assert_eq!(g.eliminated_tensors, vec![3]);
         assert_eq!(g.output_tensor, 5);
+        assert!(
+            g.requires_verification,
+            "requantize folds are algebraically transformative T2 groups"
+        );
     }
 
     #[test]
     fn requantize_fold_composes_with_activation_absorption() {
-        // conv → scale-mul → relu: the mul folds AND the relu fuses.
+        // conv → scale-mul → relu: the mul folds AND the relu fuses.  The
+        // mul output scale equals the conv output scale (G-3 identity), and
+        // the relu output quant equals the mul output quant (T1.1 identity)
+        // so the activation absorption stays exact.
         let (_bytes, model) = model!(
             vec![
                 BuildTensor::quantized(&[1, 4, 4, 8], "input", BuildQuant::tensor(1.0, 0)),
@@ -1919,8 +2243,8 @@ mod opt_fusion {
                 BuildTensor::constant(&[2], "conv/bias", vec![0u8; 2 * 4]),
                 BuildTensor::quantized(&[1, 4, 4, 2], "conv/out", BuildQuant::tensor(0.25, 0)),
                 BuildTensor::constant_quantized(&[1], "ones", vec![1, 1, 1, 1], BuildQuant::tensor(1.0, 0)),
-                BuildTensor::quantized(&[1, 4, 4, 2], "mul/out", BuildQuant::tensor(0.125, 0)),
-                BuildTensor::quantized(&[1, 4, 4, 2], "relu/out", BuildQuant::tensor(0.125, 0)),
+                BuildTensor::quantized(&[1, 4, 4, 2], "mul/out", BuildQuant::tensor(0.25, 0)),
+                BuildTensor::quantized(&[1, 4, 4, 2], "relu/out", BuildQuant::tensor(0.25, 0)),
             ],
             vec![
                 BuildOp::fused(CONV_2D, vec![0, 1, 2], vec![3], OptionsKind::Conv2d, ACT_NONE),
@@ -1938,6 +2262,7 @@ mod opt_fusion {
         assert_eq!((act.quantized_min, act.quantized_max), (0, 127));
         assert_eq!(g.absorbed_ops, vec![1, 2]);
         assert_eq!(g.output_tensor, 6);
+        assert!(g.requires_verification, "requantize fold is a T2 group");
     }
 
     #[test]
