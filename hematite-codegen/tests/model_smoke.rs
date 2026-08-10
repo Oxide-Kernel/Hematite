@@ -14,12 +14,12 @@ use std::rc::Rc;
 use hematite_codegen::model;
 use hematite_core::op_params::{
     ActivationParams, ConcatParams, Conv2DParams, DepthwiseConv2DParams,
-    ElementwiseParams, FullyConnectedParams, GruParams, LstmParams, MatMulParams,
-    PadParams, PoolParams, QuantParam, ReduceParams, ReshapeParams,
-    ResizeNearestParams, SliceParams, SoftmaxParams, SplitParams, SvdfParams,
-    TransposeParams,
+    ElementwiseChainParams, ElementwiseParams, FoldedPoolParams, FullyConnectedParams,
+    FusedConvParams, GruParams, LstmParams, MatMulParams, PadParams, PoolParams, QuantParam,
+    ReduceParams, ReshapeParams, ResizeNearestParams, SliceParams, SoftmaxParams, SplitParams,
+    SvdfParams, TransposeParams,
 };
-use hematite_core::{KernelBackend, KernelError};
+use hematite_core::{FusedKernelBackend, KernelBackend, KernelError};
 
 /// Smoke test struct annotated with the `#[model]` proc-macro.
 ///
@@ -467,6 +467,43 @@ macro_rules! mock_backend {
 }
 
 mock_backend!(MockBackend);
+
+/// The generated `Model<B>` requires `B: FusedKernelBackend` (T1.2).  The
+/// sine model has no fused groups, so the composed entry points are never
+/// dispatched — record them and return Ok.
+impl FusedKernelBackend for MockBackend {
+    fn fused_conv2d(
+        &mut self,
+        input: &[i8],
+        _weight: &[i8],
+        _bias: &[i32],
+        _params: &FusedConvParams,
+        output: &mut [i8],
+        _scratch: &mut [u8],
+    ) -> Result<(), KernelError> {
+        self.log.borrow_mut().push(Call { op: "fused_conv2d", in_len: input.len(), out_len: output.len() });
+        Ok(())
+    }
+    fn fused_elementwise_chain(
+        &mut self,
+        input: &[i8],
+        _params: &ElementwiseChainParams,
+        output: &mut [i8],
+    ) -> Result<(), KernelError> {
+        self.log.borrow_mut().push(Call { op: "fused_elementwise_chain", in_len: input.len(), out_len: output.len() });
+        Ok(())
+    }
+    fn fused_pool_with_fold(
+        &mut self,
+        input: &[i8],
+        _params: &FoldedPoolParams,
+        output: &mut [i8],
+        _scratch: &mut [u8],
+    ) -> Result<(), KernelError> {
+        self.log.borrow_mut().push(Call { op: "fused_pool_with_fold", in_len: input.len(), out_len: output.len() });
+        Ok(())
+    }
+}
 
 #[test]
 fn sine_model_predict_with_mock_backend() {

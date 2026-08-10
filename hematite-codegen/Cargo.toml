@@ -22,3 +22,7 @@ syn = { workspace = true }
 # the runtime `S3Backend::*_scratch_size` computations. The dev-dep keeps the
 # proc-macro lib itself free of any runtime backend dependency.
 hematite-s3 = { path = "../hematite-s3" }
+# T1.2 fused-vs-unfused equivalence gate: runs every zoo model twice
+# (`#[model]` fused vs `#[model_unfused]` per-op) through `RefBackend` and
+# asserts element-equal outputs + identical FNV-1a.
+hematite-ref = { path = "../hematite-ref" }

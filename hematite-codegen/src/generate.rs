@@ -35,13 +35,43 @@ use quote::quote;
 use syn::Ident;
 
 use crate::flatbuffer::{ParsedModel, ParsedOp, ParsedOptions, ParsedTensor, QuantInfo, TensorType};
+use crate::optimize::fusion::{
+    AbsorbedElementwise, ElementwiseKind as FusedStepKind, FusedActivationKind, FusedGroup,
+    FusedSchedule,
+};
 
-/// Emit the full model wrapper for `subgraph[0]` of a parsed model.
+/// Emit the full model wrapper for `subgraph[0]` of a parsed model — the
+/// plain **unfused** per-op straight-line sequence (no fusion schedule).
 ///
-/// The op list is read from `model.ops()` (execution order); a later wiring
-/// task (T4.2a fusion) can pass a preprocessed schedule by refactoring the
-/// single `let ops = model.ops();` line into a parameter.
+/// This is the T4.1 emission, kept reachable as the unfused reference of the
+/// T1.2 fused-vs-unfused equivalence gate (and by `#[model_unfused]`).
 pub(crate) fn emit_model(model: &ParsedModel) -> Result<TokenStream, String> {
+    emit_model_with(model, None)
+}
+
+/// Emit the full model wrapper for `subgraph[0]`, honoring a fused schedule
+/// (T1.2 wiring of the T4.2a fusion pass).
+///
+/// Groups whose anchor has a composed kernel emission (see [`composed_kind`])
+/// collapse the anchor + absorbed ops into ONE `FusedKernelBackend` composed
+/// call; the absorbed ops and their eliminated intermediate tensors vanish
+/// from the emitted code.  Everything else — including every T2 group
+/// (`requires_verification == true`) — emits exactly as the unfused
+/// [`emit_model`], so a model with zero composed groups emits byte-identical
+/// code through both entry points.
+pub(crate) fn emit_model_fused(
+    model: &ParsedModel,
+    schedule: &FusedSchedule,
+) -> Result<TokenStream, String> {
+    emit_model_with(model, Some(schedule))
+}
+
+/// Shared emission core: `schedule: None` is the unfused path; `Some` routes
+/// composed groups through the `fused_*` backend calls (T1.2).
+fn emit_model_with(
+    model: &ParsedModel,
+    schedule: Option<&FusedSchedule>,
+) -> Result<TokenStream, String> {
     if model.subgraph_count() != 1 {
         return Err(format!(
             "model has {} subgraphs; only single-subgraph models are supported",
@@ -53,6 +83,10 @@ pub(crate) fn emit_model(model: &ParsedModel) -> Result<TokenStream, String> {
         return Err("model subgraph[0] has no tensors".into());
     }
     let ops = model.ops();
+    let plan = match schedule {
+        Some(s) => Some(fused_plan(s, ops.len(), tensors.len())),
+        None => None,
+    };
     let inputs = model.inputs();
     let outputs = model.outputs();
     if inputs.is_empty() {
@@ -93,21 +127,45 @@ pub(crate) fn emit_model(model: &ParsedModel) -> Result<TokenStream, String> {
     }
 
     // ── Emit per-op consts + calls (straight-line, execution order) ────────
+    // With a schedule, each op is either (a) an anchor of a composed group
+    // → one `fused_*` call, (b) absorbed into a composed group → skipped, or
+    // (c) an ordinary op → its per-op call exactly as the unfused emitter.
     let mut consts: Vec<TokenStream> = Vec::new();
     let mut calls: Vec<TokenStream> = Vec::new();
     let mut scratch_max = 0usize;
     for (i, op) in ops.iter().enumerate() {
-        let em = emit_op(model, &storage, i, op)?;
+        if plan.as_ref().is_some_and(|p| p.absorbed[i]) {
+            continue;
+        }
+        let em = match plan.as_ref().and_then(|p| p.anchor_group[i]) {
+            Some(gi) => {
+                let group = &schedule.expect("anchor_group implies a schedule").groups[gi];
+                match composed_kind(group) {
+                    Some(ComposedKind::Conv) => emit_fused_conv(model, &storage, i, op, group)?,
+                    Some(ComposedKind::Chain) => emit_fused_chain(model, &storage, i, op, group)?,
+                    Some(ComposedKind::PoolFold) => {
+                        emit_fused_pool_fold(model, &storage, i, op, group)?
+                    }
+                    None => emit_op(model, &storage, i, op)?,
+                }
+            }
+            None => emit_op(model, &storage, i, op)?,
+        };
         consts.extend(em.consts);
         calls.push(em.call);
         scratch_max = scratch_max.max(em.scratch);
     }
 
     // ── Intermediate stack-array types ──────────────────────────────────────
+    // Eliminated tensors (single-use intermediates absorbed into composed
+    // groups) get no stack array — their data never materializes.
     let mut tensor_types: Vec<TokenStream> = Vec::new();
     let mut tensor_locals: Vec<TokenStream> = Vec::new();
     for s in &storage {
         if let Storage::Tensor { idx } = s {
+            if plan.as_ref().is_some_and(|p| p.eliminated[*idx]) {
+                continue;
+            }
             let len = flat_len(&tensors[*idx].shape)?;
             let ty = Ident::new(&format!("TENSOR_{idx}"), proc_macro2::Span::call_site());
             let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
@@ -126,8 +184,15 @@ pub(crate) fn emit_model(model: &ParsedModel) -> Result<TokenStream, String> {
     let input_len_ts = input_len;
     let output_len_ts = output_len;
     let scratch_ts = scratch_max;
+    // Composed `fused_*` calls need `&mut self` (the `FusedKernelBackend`
+    // receiver); models without composed groups keep the `&self` receiver so
+    // existing call sites (non-`mut` bindings) compile unchanged.
+    let composed = plan.as_ref().is_some_and(|p| p.anchor_group.iter().any(|g| g.is_some()));
+    let receiver = if composed { quote!(&mut self) } else { quote!(&self) };
     let backend_bind = if calls.is_empty() {
         quote! { let _ = &self.backend; }
+    } else if composed {
+        quote! { let backend = &mut self.backend; }
     } else {
         quote! { let backend = &self.backend; }
     };
@@ -135,8 +200,10 @@ pub(crate) fn emit_model(model: &ParsedModel) -> Result<TokenStream, String> {
     let wrapper = quote! {
         /// Generated inference model — typed I/O bridge for `subgraph[0]`.
         ///
-        /// `B` is any [`::hematite_core::KernelBackend`] implementation; the
-        /// straight-line op sequence dispatches through it.
+        /// `B` is any [`::hematite_core::FusedKernelBackend`]
+        /// implementation (which extends [`::hematite_core::KernelBackend`]);
+        /// the straight-line op sequence dispatches through it, with fused
+        /// groups going through the composed `fused_*` entry points.
         pub struct Model<B> {
             backend: B,
         }
@@ -158,11 +225,11 @@ pub(crate) fn emit_model(model: &ParsedModel) -> Result<TokenStream, String> {
             }
         }
 
-        impl<B: ::hematite_core::KernelBackend> Model<B> {
+        impl<B: ::hematite_core::FusedKernelBackend> Model<B> {
             /// Run inference with an internally allocated scratch buffer.
             ///
             /// No panic paths: on error the output array is left zeroed.
-            pub fn predict(&self, input: &[i8; INPUT_LEN]) -> [i8; OUTPUT_LEN] {
+            pub fn predict(#receiver, input: &[i8; INPUT_LEN]) -> [i8; OUTPUT_LEN] {
                 let mut output = [0i8; OUTPUT_LEN];
                 let mut scratch = [0u8; SCRATCH_LEN];
                 let _ = self.predict_with_scratch(input, &mut output, &mut scratch);
@@ -177,7 +244,7 @@ pub(crate) fn emit_model(model: &ParsedModel) -> Result<TokenStream, String> {
             ///   `scratch.len()` is below [`SCRATCH_LEN`] — the macro-time
             ///   max over ops of their documented scratch need.
             pub fn predict_with_scratch(
-                &self,
+                #receiver,
                 input: &[i8; INPUT_LEN],
                 output: &mut [i8; OUTPUT_LEN],
                 scratch: &mut [u8],
@@ -201,6 +268,156 @@ pub(crate) fn emit_model(model: &ParsedModel) -> Result<TokenStream, String> {
         #(#tensor_types)*
         #wrapper
     })
+}
+
+// ---------------------------------------------------------------------------
+// Fused-schedule wiring (T1.2)
+// ---------------------------------------------------------------------------
+
+/// Which composed `FusedKernelBackend` call replaces the anchor's per-op call.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ComposedKind {
+    /// CONV_2D anchor with an absorbed residual-ADD and/or trailing
+    /// activation (fusion patterns (c) / (a)) → `fused_conv2d`.
+    Conv,
+    /// ADD/MUL/SUB anchor with an absorbed elementwise chain (pattern (b))
+    /// → `fused_elementwise_chain`.
+    Chain,
+    /// Pool anchor with an absorbed MUL/SUB input fold (pattern (d))
+    /// → `fused_pool_with_fold`.
+    PoolFold,
+}
+
+/// Classify a fused group for the T1.2 emitter.
+///
+/// Only **T1 groups** (`requires_verification == false`) are composed — T2
+/// groups (input folds, requantize folds) are algebraically transformative
+/// and stay per-op until a fused==unfused verification passes.  Only
+/// CONV_2D anchors compose as convs: [`FusedConvParams`] carries
+/// `Conv2DParams`, so a DEPTHWISE/FULLY_CONNECTED anchor with absorbed ops
+/// falls back to per-op emission (bit-exact, unchanged).  Softmax anchors
+/// never compose (their fold has no `PoolParams` representation).
+fn composed_kind(group: &FusedGroup) -> Option<ComposedKind> {
+    if group.requires_verification {
+        return None;
+    }
+    match group.anchor_builtin {
+        3 if group.residual_add.is_some() || !group.absorbed_ops.is_empty() => {
+            Some(ComposedKind::Conv)
+        }
+        0 | 18 | 41 if !group.elementwise_chain.is_empty() => Some(ComposedKind::Chain),
+        1 | 17 if group.input_fold.is_some() => Some(ComposedKind::PoolFold),
+        _ => None,
+    }
+}
+
+/// Per-op / per-tensor decisions derived from the schedule once per model.
+struct FusedPlan {
+    /// Op index → group index in `FusedSchedule::groups` (composed groups
+    /// only; `None` for ordinary ops and T2 groups).
+    anchor_group: Vec<Option<usize>>,
+    /// Op indices absorbed into composed groups (skip their own emission).
+    absorbed: Vec<bool>,
+    /// Tensor indices eliminated by composed groups (no stack array).
+    eliminated: Vec<bool>,
+}
+
+fn fused_plan(schedule: &FusedSchedule, op_count: usize, tensor_count: usize) -> FusedPlan {
+    let mut anchor_group = vec![None; op_count];
+    let mut absorbed = vec![false; op_count];
+    let mut eliminated = vec![false; tensor_count];
+    for (gi, group) in schedule.groups.iter().enumerate() {
+        if composed_kind(group).is_none() {
+            continue;
+        }
+        anchor_group[group.anchor_op_index] = Some(gi);
+        for &a in &group.absorbed_ops {
+            absorbed[a] = true;
+        }
+        for &t in &group.eliminated_tensors {
+            if (t as usize) < tensor_count {
+                eliminated[t as usize] = true;
+            }
+        }
+    }
+    FusedPlan { anchor_group, absorbed, eliminated }
+}
+
+/// `&tensor_N.data` for an intermediate tensor — the composed params'
+/// runtime operand slices (the residual, chain operands) must point at the
+/// generated stack arrays.  Fusion guarantees the residual is a computed
+/// intermediate (never a const / model I/O).
+fn tensor_ref_expr(storage: &[Storage], t: usize) -> Result<TokenStream, String> {
+    match storage.get(t).ok_or_else(|| format!("tensor index {t} out of range"))? {
+        Storage::Tensor { idx } => {
+            let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
+            Ok(quote!(&#var.data))
+        }
+        _ => Err(format!(
+            "tensor {t} must be an intermediate stack array for composed params"
+        )),
+    }
+}
+
+/// Runtime operand slice for a composed param struct: an emitted const for
+/// buffer-backed tensors, `&tensor_N.data` for intermediates, `&input[..]`
+/// for model inputs.  (The T4.1 per-op emitter rejects constant operands —
+/// "deferred to T4.2a fusion" — the composed paths are where they land.)
+fn operand_data(
+    model: &ParsedModel,
+    storage: &[Storage],
+    t: u32,
+    name: &Ident,
+) -> Result<(TokenStream, Vec<TokenStream>), String> {
+    match storage
+        .get(t as usize)
+        .ok_or_else(|| format!("tensor index {t} out of range"))?
+    {
+        Storage::Const => {
+            let c = weight_const(model, t, name)?;
+            Ok((quote!(&#name.0), vec![c]))
+        }
+        Storage::Tensor { idx } => {
+            let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
+            Ok((quote!(&#var.data), Vec::new()))
+        }
+        Storage::Input { start, len } => {
+            let end = start + len;
+            Ok((quote!(&input[#start..#end]), Vec::new()))
+        }
+        Storage::Output { .. } => Err(format!(
+            "tensor {t} is a model output used as a composed operand"
+        )),
+    }
+}
+
+/// `FusedActivationKind` → `ComposedActivation` token (the epilogue enum).
+fn composed_activation_enum(kind: FusedActivationKind) -> TokenStream {
+    match kind {
+        FusedActivationKind::Relu => {
+            quote!(::hematite_core::op_params::ComposedActivation::Relu)
+        }
+        FusedActivationKind::Relu6 => {
+            quote!(::hematite_core::op_params::ComposedActivation::Relu6)
+        }
+        FusedActivationKind::HardSwish => {
+            quote!(::hematite_core::op_params::ComposedActivation::HardSwish)
+        }
+    }
+}
+
+/// Fusion `ElementwiseKind` → `op_params::ElementwiseKind` token.
+fn chain_step_kind_enum(kind: FusedStepKind) -> TokenStream {
+    match kind {
+        FusedStepKind::Add => quote!(::hematite_core::op_params::ElementwiseKind::Add),
+        FusedStepKind::Mul => quote!(::hematite_core::op_params::ElementwiseKind::Mul),
+        FusedStepKind::Sub => quote!(::hematite_core::op_params::ElementwiseKind::Sub),
+        FusedStepKind::Relu => quote!(::hematite_core::op_params::ElementwiseKind::Relu),
+        FusedStepKind::Relu6 => quote!(::hematite_core::op_params::ElementwiseKind::Relu6),
+        FusedStepKind::HardSwish => {
+            quote!(::hematite_core::op_params::ElementwiseKind::HardSwish)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -730,7 +947,7 @@ fn emit_op(
     match op.builtin_code {
         0 => emit_elementwise(model, storage, i, op, quote!(add), ElementwiseKind::AddSub),
         1 => emit_pool(model, storage, i, op, quote!(average_pool_2d)),
-        3 => emit_conv2d(model, storage, i, op),
+        3 => emit_conv2d(model, storage, i, op).map(|c| c.em),
         4 => emit_depthwise(model, storage, i, op),
         9 => emit_fully_connected(model, storage, i, op),
         17 => emit_pool(model, storage, i, op, quote!(max_pool_2d)),
@@ -757,7 +974,7 @@ fn emit_op(
     }
 }
 
-fn emit_conv2d(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
+fn emit_conv2d(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<ConvEmission, String> {
     let opts = match op.options.as_ref() {
         Some(ParsedOptions::Conv2D {
             padding,
@@ -846,10 +1063,17 @@ fn emit_conv2d(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp
             input_offset,
         )
     };
-    Ok(OpEmission {
-        consts: vec![weights_c, bias_c, mult_c, shift_c, params_c],
-        call,
-        scratch,
+    Ok(ConvEmission {
+        em: OpEmission {
+            consts: vec![weights_c, bias_c, mult_c, shift_c, params_c],
+            call,
+            scratch,
+        },
+        weight: w_name,
+        bias: b_name,
+        mult: m_name,
+        shift: s_name,
+        params: p_name,
     })
 }
 
@@ -1021,6 +1245,18 @@ fn emit_fully_connected(model: &ParsedModel, storage: &[Storage], i: usize, op: 
         call,
         scratch: fc_scratch,
     })
+}
+
+/// Per-op CONV_2D emission plus the const names the composed
+/// [`emit_fused_conv`] re-references (`FusedConvParams` embeds the anchor's
+/// `Conv2DParams` and per-channel slices).
+struct ConvEmission {
+    em: OpEmission,
+    weight: Ident,
+    bias: Ident,
+    mult: Ident,
+    shift: Ident,
+    params: Ident,
 }
 
 /// TFLM FC shape math: `input_dim` = flattened non-batch dims (or last dim
@@ -1379,6 +1615,62 @@ enum ElementwiseKind {
     Mul,
 }
 
+/// TFLM int8 elementwise requantize triple (the `ElementwiseParams` quant
+/// fields), shared by the per-op emission and the composed chain / pool-fold
+/// param derivation (T1.2) so both use the identical rounding sequence.
+struct ElementwiseQuant {
+    in1_off: i32,
+    in2_off: i32,
+    out_off: i32,
+    left_shift: i32,
+    input1_multiplier: i32,
+    input1_shift: i32,
+    input2_multiplier: i32,
+    input2_shift: i32,
+    output_multiplier: i32,
+    output_shift: i32,
+}
+
+/// ADD/SUB: twice_max scaling with `left_shift = 20` (add_common.cc); MUL:
+/// single output ratio.  Offsets follow the per-op emission convention
+/// (`-zp` inputs, `+zp` output).
+fn elementwise_quant(
+    input1: &ParsedTensor,
+    input2: &ParsedTensor,
+    output: &ParsedTensor,
+    kind: ElementwiseKind,
+) -> Result<ElementwiseQuant, String> {
+    let in1_scale = tensor_scale(input1)?;
+    let in2_scale = tensor_scale(input2)?;
+    let out_scale = tensor_scale(output)?;
+    let (left_shift, i1m, i1s, i2m, i2s, om, os) = match kind {
+        ElementwiseKind::AddSub => {
+            let twice_max = 2.0 * in1_scale.max(in2_scale);
+            let ls = 20i32;
+            let (a, b) = quantize_multiplier(in1_scale / twice_max);
+            let (c, d) = quantize_multiplier(in2_scale / twice_max);
+            let (e, f) = quantize_multiplier(twice_max / ((1i32 << ls) as f64 * out_scale));
+            (ls, a, b, c, d, e, f)
+        }
+        ElementwiseKind::Mul => {
+            let (e, f) = quantize_multiplier(in1_scale * in2_scale / out_scale);
+            (0, 0, 0, 0, 0, e, f)
+        }
+    };
+    Ok(ElementwiseQuant {
+        in1_off: -tensor_zp(input1)?,
+        in2_off: -tensor_zp(input2)?,
+        out_off: tensor_zp(output)?,
+        left_shift,
+        input1_multiplier: i1m,
+        input1_shift: i1s,
+        input2_multiplier: i2m,
+        input2_shift: i2s,
+        output_multiplier: om,
+        output_shift: os,
+    })
+}
+
 fn emit_elementwise(
     model: &ParsedModel,
     storage: &[Storage],
@@ -1406,46 +1698,36 @@ fn emit_elementwise(
             "op {i}: elementwise input1/input2/output element counts must match"
         ));
     }
-    let in1_scale = tensor_scale(input1)?;
-    let in2_scale = tensor_scale(input2)?;
+    let q = elementwise_quant(input1, input2, output, kind)?;
     let out_scale = tensor_scale(output)?;
-    let in1_off = -tensor_zp(input1)?;
-    let in2_off = -tensor_zp(input2)?;
     let out_off = tensor_zp(output)?;
     let (act_min, act_max) = act_range(fused_activation, out_scale, out_off);
-
-    let (left_shift, i1m, i1s, i2m, i2s, om, os) = match kind {
-        ElementwiseKind::AddSub => {
-            // TFLM int8 Add/Sub (add_common.cc): twice_max scaling with
-            // left_shift = 20; output ratio carries 2^left_shift.
-            let twice_max = 2.0 * in1_scale.max(in2_scale);
-            let ls = 20i32;
-            let (a, b) = quantize_multiplier(in1_scale / twice_max);
-            let (c, d) = quantize_multiplier(in2_scale / twice_max);
-            let (e, f) = quantize_multiplier(twice_max / ((1i32 << ls) as f64 * out_scale));
-            (ls, a, b, c, d, e, f)
-        }
-        ElementwiseKind::Mul => {
-            let (e, f) = quantize_multiplier(in1_scale * in2_scale / out_scale);
-            (0, 0, 0, 0, 0, e, f)
-        }
-    };
+    let q_in1_off = q.in1_off;
+    let q_in2_off = q.in2_off;
+    let q_out_off = q.out_off;
+    let q_left_shift = q.left_shift;
+    let q_i1m = q.input1_multiplier;
+    let q_i1s = q.input1_shift;
+    let q_i2m = q.input2_multiplier;
+    let q_i2s = q.input2_shift;
+    let q_om = q.output_multiplier;
+    let q_os = q.output_shift;
 
     let p_name = Ident::new(&format!("ELEMENTWISE_PARAMS_{i}"), proc_macro2::Span::call_site());
     let params_c = quote! {
         const #p_name: ::hematite_core::op_params::ElementwiseParams =
             ::hematite_core::op_params::ElementwiseParams {
                 num_elements: #num_elements,
-                input1_offset: #in1_off,
-                input2_offset: #in2_off,
-                output_offset: #out_off,
-                output_multiplier: #om,
-                output_shift: #os,
-                left_shift: #left_shift,
-                input1_multiplier: #i1m,
-                input1_shift: #i1s,
-                input2_multiplier: #i2m,
-                input2_shift: #i2s,
+                input1_offset: #q_in1_off,
+                input2_offset: #q_in2_off,
+                output_offset: #q_out_off,
+                output_multiplier: #q_om,
+                output_shift: #q_os,
+                left_shift: #q_left_shift,
+                input1_multiplier: #q_i1m,
+                input1_shift: #q_i1s,
+                input2_multiplier: #q_i2m,
+                input2_shift: #q_i2s,
                 quantized_activation_min: #act_min,
                 quantized_activation_max: #act_max,
             };
@@ -1460,6 +1742,427 @@ fn emit_elementwise(
         consts: vec![params_c],
         call,
         scratch: 0,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Composed-kernel emitters (T1.2 — one `fused_*` call per composed group)
+// ---------------------------------------------------------------------------
+
+/// Emit the composed CONV_2D call for a group with an absorbed residual-ADD
+/// and/or trailing activation (patterns (c) / (a)).
+///
+/// The `FusedConvParams` (T2.1) is built as a runtime `let` inside
+/// `predict_with_scratch`: every value is a macro-time literal except the
+/// anchor's consts (re-referenced) and the residual slice
+/// (`&tensor_N.data` — the residual is a computed intermediate produced
+/// before the conv, per the fusion `HasOneUse` guard).
+fn emit_fused_conv(
+    model: &ParsedModel,
+    storage: &[Storage],
+    i: usize,
+    op: &ParsedOp,
+    group: &FusedGroup,
+) -> Result<OpEmission, String> {
+    let conv = emit_conv2d(model, storage, i, op)?;
+    let in_t = *op.inputs.first().ok_or("conv2d missing input tensor")?;
+    let out_t = *op.outputs.first().ok_or("conv2d missing output tensor")?;
+    let output = tensor_at(model.tensors(), out_t)?;
+    let out_scale = tensor_scale(output)? as f32;
+    let out_zp = tensor_zp(output)? as i64;
+
+    let residual_ts = match &group.residual_add {
+        Some(res) => {
+            let r_t = tensor_at(model.tensors(), res.residual_tensor)?;
+            let r_expr = tensor_ref_expr(storage, res.residual_tensor as usize)?;
+            let r_scale = tensor_scale(r_t)? as f32;
+            let r_zp = tensor_zp(r_t)? as i64;
+            let r_out_scale = res.output_scale;
+            let r_out_zp = res.output_zero_point;
+            let rq = &res.requantize;
+            let rq_i1m = rq.input1_multiplier;
+            let rq_i1s = rq.input1_shift;
+            let rq_i2m = rq.input2_multiplier;
+            let rq_i2s = rq.input2_shift;
+            let rq_ls = rq.left_shift;
+            let rq_om = rq.output_multiplier;
+            let rq_os = rq.output_shift;
+            quote! {
+                Some(::hematite_core::op_params::ResidualAddParams {
+                    residual_data: #r_expr,
+                    residual_scale: #r_scale,
+                    residual_zero_point: #r_zp,
+                    output_scale: #r_out_scale,
+                    output_zero_point: #r_out_zp,
+                    input1_multiplier: #rq_i1m,
+                    input1_shift: #rq_i1s,
+                    input2_multiplier: #rq_i2m,
+                    input2_shift: #rq_i2s,
+                    left_shift: #rq_ls,
+                    output_multiplier: #rq_om,
+                    output_shift: #rq_os,
+                })
+            }
+        }
+        None => quote!(None),
+    };
+
+    let (act_kind, act_in_off, act_out_off, act_mult, act_shift, act_min, act_max) =
+        match &group.activation {
+            Some(act) => {
+                let act_idx = *group
+                    .absorbed_ops
+                    .last()
+                    .ok_or_else(|| format!("group anchor {i}: activation without absorbed op"))?;
+                let act_op = model
+                    .ops()
+                    .get(act_idx)
+                    .ok_or_else(|| format!("group anchor {i}: absorbed op {act_idx} out of range"))?;
+                let a_in_t = *act_op.inputs.first().ok_or("activation missing input tensor")?;
+                let a_out_t = *act_op.outputs.first().ok_or("activation missing output tensor")?;
+                let a_in = tensor_at(model.tensors(), a_in_t)?;
+                let a_out = tensor_at(model.tensors(), a_out_t)?;
+                let (am, ash) = quantize_multiplier(tensor_scale(a_in)? / tensor_scale(a_out)?);
+                (
+                    composed_activation_enum(act.kind),
+                    -tensor_zp(a_in)?,
+                    tensor_zp(a_out)?,
+                    am,
+                    ash,
+                    act.quantized_min,
+                    act.quantized_max,
+                )
+            }
+            None => (
+                quote!(::hematite_core::op_params::ComposedActivation::None),
+                0i32,
+                0i32,
+                0i32,
+                0i32,
+                -128i32,
+                127i32,
+            ),
+        };
+
+    let src = src_expr(storage, in_t as usize)?;
+    let dst = dst_expr(storage, group.output_tensor as usize)?;
+    let conv_params = &conv.params;
+    let conv_mult = &conv.mult;
+    let conv_shift = &conv.shift;
+    let conv_weight = &conv.weight;
+    let conv_bias = &conv.bias;
+    let p = Ident::new(&format!("FUSED_CONV_PARAMS_{i}"), proc_macro2::Span::call_site());
+    let call = quote! {
+        let #p = ::hematite_core::op_params::FusedConvParams {
+            conv: #conv_params,
+            output_scale: #out_scale,
+            output_zero_point: #out_zp,
+            output_multiplier_per_channel: &#conv_mult,
+            output_shift_per_channel: &#conv_shift,
+            residual: #residual_ts,
+            activation: ::hematite_core::op_params::ActivationEpilogueParams {
+                kind: #act_kind,
+                input_offset: #act_in_off,
+                output_offset: #act_out_off,
+                output_multiplier: #act_mult,
+                output_shift: #act_shift,
+                quantized_activation_min: #act_min,
+                quantized_activation_max: #act_max,
+            },
+        };
+        backend.fused_conv2d(#src, &#conv_weight.0, &#conv_bias, &#p, #dst, scratch)?;
+    };
+    Ok(OpEmission {
+        consts: conv.em.consts,
+        call,
+        scratch: conv.em.scratch,
+    })
+}
+
+/// Emit the composed elementwise-chain call (pattern (b)): step 0 is the
+/// ANCHOR elementwise op itself (quant derived from its own tensors, the
+/// same math the per-op emitter uses), steps 1.. are the absorbed ops
+/// (kind + operand + `StepRequantize` carried by the T1.1 IR).  Steps are
+/// NEVER collapsed.
+fn emit_fused_chain(
+    model: &ParsedModel,
+    storage: &[Storage],
+    i: usize,
+    op: &ParsedOp,
+    group: &FusedGroup,
+) -> Result<OpEmission, String> {
+    let anchor_kind: FusedStepKind = match op.builtin_code {
+        0 => FusedStepKind::Add,
+        18 => FusedStepKind::Mul,
+        41 => FusedStepKind::Sub,
+        code => {
+            return Err(format!(
+                "op {i}: elementwise-chain anchor has unsupported builtin_code {code}"
+            ))
+        }
+    };
+    let fused_activation = match op.options.as_ref() {
+        Some(ParsedOptions::Add { fused_activation, .. })
+        | Some(ParsedOptions::Sub { fused_activation, .. })
+        | Some(ParsedOptions::Mul { fused_activation }) => *fused_activation,
+        None => 0,
+        other => return Err(format!("op {i}: unexpected elementwise options, got {other:?}")),
+    };
+    let in1_t = *op.inputs.first().ok_or("elementwise missing input1 tensor")?;
+    let in2_t = *op.inputs.get(1).ok_or("elementwise missing input2 tensor")?;
+    let out_t = *op.outputs.first().ok_or("elementwise missing output tensor")?;
+    let input1 = tensor_at(model.tensors(), in1_t)?;
+    let input2 = tensor_at(model.tensors(), in2_t)?;
+    let output = tensor_at(model.tensors(), out_t)?;
+    let num_elements = flat_len(&input1.shape)? as i32;
+    if flat_len(&input2.shape)? != num_elements as usize
+        || flat_len(&output.shape)? != num_elements as usize
+    {
+        return Err(format!(
+            "op {i}: elementwise input1/input2/output element counts must match"
+        ));
+    }
+    let local_kind = match anchor_kind {
+        FusedStepKind::Add | FusedStepKind::Sub => ElementwiseKind::AddSub,
+        FusedStepKind::Mul => ElementwiseKind::Mul,
+        _ => unreachable!("anchor is ADD/SUB/MUL"),
+    };
+    let q = elementwise_quant(input1, input2, output, local_kind)?;
+    let out_scale = tensor_scale(output)?;
+    let (act_min, act_max) = act_range(fused_activation, out_scale, q.out_off);
+    let (anchor_operand, anchor_operand_consts) = operand_data(
+        model,
+        storage,
+        in2_t,
+        &Ident::new(&format!("CHAIN_OPERAND_{i}_0"), proc_macro2::Span::call_site()),
+    )?;
+
+    let mut steps = Vec::with_capacity(group.elementwise_chain.len() + 1);
+    let mut consts = anchor_operand_consts;
+    let anchor_kind_enum = chain_step_kind_enum(anchor_kind);
+    let q_in1_off = q.in1_off;
+    let q_in2_off = q.in2_off;
+    let q_out_off = q.out_off;
+    let q_ls = q.left_shift;
+    let q_i1m = q.input1_multiplier;
+    let q_i1s = q.input1_shift;
+    let q_i2m = q.input2_multiplier;
+    let q_i2s = q.input2_shift;
+    let q_om = q.output_multiplier;
+    let q_os = q.output_shift;
+    steps.push(quote! {
+        ::hematite_core::op_params::ElementwiseChainStep {
+            kind: #anchor_kind_enum,
+            operand: #anchor_operand,
+            input1_offset: #q_in1_off,
+            input2_offset: #q_in2_off,
+            output_offset: #q_out_off,
+            output_multiplier: #q_om,
+            output_shift: #q_os,
+            left_shift: #q_ls,
+            input1_multiplier: #q_i1m,
+            input1_shift: #q_i1s,
+            input2_multiplier: #q_i2m,
+            input2_shift: #q_i2s,
+            quantized_activation_min: #act_min,
+            quantized_activation_max: #act_max,
+        }
+    });
+    for (k, absorbed) in group.elementwise_chain.iter().enumerate() {
+        let k1 = k + 1;
+        let kind = chain_step_kind_enum(absorbed.kind);
+        let (op_expr, op_consts) = match absorbed.operand_tensor {
+            u32::MAX => (quote!(None), Vec::new()),
+            t => {
+                let (e, c) = operand_data(
+                    model,
+                    storage,
+                    t,
+                    &Ident::new(&format!("CHAIN_OPERAND_{i}_{k1}"), proc_macro2::Span::call_site()),
+                )?;
+                (quote!(Some(#e)), c)
+            }
+        };
+        consts.extend(op_consts);
+        let rq = &absorbed.requantize;
+        let (amin, amax) = chain_step_act_range(model, absorbed)?;
+        let rq_in1_off = rq.input1_offset;
+        let rq_in2_off = rq.input2_offset;
+        let rq_out_off = rq.output_offset;
+        let rq_ls = rq.left_shift;
+        let rq_i1m = rq.input1_multiplier;
+        let rq_i1s = rq.input1_shift;
+        let rq_i2m = rq.input2_multiplier;
+        let rq_i2s = rq.input2_shift;
+        let rq_om = rq.output_multiplier;
+        let rq_os = rq.output_shift;
+        steps.push(quote! {
+            ::hematite_core::op_params::ElementwiseChainStep {
+                kind: #kind,
+                operand: #op_expr,
+                input1_offset: #rq_in1_off,
+                input2_offset: #rq_in2_off,
+                output_offset: #rq_out_off,
+                output_multiplier: #rq_om,
+                output_shift: #rq_os,
+                left_shift: #rq_ls,
+                input1_multiplier: #rq_i1m,
+                input1_shift: #rq_i1s,
+                input2_multiplier: #rq_i2m,
+                input2_shift: #rq_i2s,
+                quantized_activation_min: #amin,
+                quantized_activation_max: #amax,
+            }
+        });
+    }
+    let src = src_expr(storage, in1_t as usize)?;
+    let dst = dst_expr(storage, group.output_tensor as usize)?;
+    let p = Ident::new(&format!("CHAIN_PARAMS_{i}"), proc_macro2::Span::call_site());
+    let call = quote! {
+        let #p = ::hematite_core::op_params::ElementwiseChainParams {
+            num_elements: #num_elements,
+            steps: &[ #(#steps),* ],
+        };
+        backend.fused_elementwise_chain(#src, &#p, #dst)?;
+    };
+    Ok(OpEmission {
+        consts,
+        call,
+        scratch: 0,
+    })
+}
+
+/// Clamp range of an absorbed chain step: the step op's own
+/// `fused_activation` field against its output tensor quant (mirrors the
+/// per-op elementwise emission; identity when the field is NONE).
+fn chain_step_act_range(
+    model: &ParsedModel,
+    absorbed: &AbsorbedElementwise,
+) -> Result<(i32, i32), String> {
+    let op = model
+        .ops()
+        .get(absorbed.op_index)
+        .ok_or_else(|| format!("absorbed op {} out of range", absorbed.op_index))?;
+    let fused = match op.options.as_ref() {
+        Some(ParsedOptions::Add { fused_activation, .. })
+        | Some(ParsedOptions::Sub { fused_activation, .. })
+        | Some(ParsedOptions::Mul { fused_activation }) => *fused_activation,
+        _ => 0,
+    };
+    Ok(act_range(
+        fused,
+        f64::from(absorbed.output_scale),
+        absorbed.output_zero_point as i32,
+    ))
+}
+
+/// Emit the composed pool-with-fold call (pattern (d)) for a pool anchor.
+///
+/// Reaches emission only once an input-fold group's fused==unfused
+/// verification passes (T2 groups stay per-op); the composed params embed
+/// the anchor `PoolParams` (re-referencing `emit_pool`'s const) plus the
+/// fold's per-op elementwise quant.
+fn emit_fused_pool_fold(
+    model: &ParsedModel,
+    storage: &[Storage],
+    i: usize,
+    op: &ParsedOp,
+    group: &FusedGroup,
+) -> Result<OpEmission, String> {
+    let fold = group
+        .input_fold
+        .as_ref()
+        .ok_or_else(|| format!("op {i}: pool-fold group without input_fold"))?;
+    let pool_kind = match op.builtin_code {
+        1 => quote!(::hematite_core::op_params::PoolKind::Average),
+        17 => quote!(::hematite_core::op_params::PoolKind::Max),
+        code => {
+            return Err(format!(
+                "op {i}: pool-fold anchor has unsupported builtin_code {code}"
+            ))
+        }
+    };
+    let pool = emit_pool(model, storage, i, op, quote!(average_pool_2d))?;
+    let p_name = Ident::new(&format!("POOL_PARAMS_{i}"), proc_macro2::Span::call_site());
+
+    let fold_op = model
+        .ops()
+        .get(fold.op_index)
+        .ok_or_else(|| format!("op {i}: fold op {} out of range", fold.op_index))?;
+    let fold_out_t = *fold_op
+        .outputs
+        .first()
+        .ok_or_else(|| format!("op {i}: fold op missing output tensor"))?;
+    let fold_out = tensor_at(model.tensors(), fold_out_t)?;
+    let in1 = tensor_at(model.tensors(), fold.folded_input_tensor)?;
+    let in2 = tensor_at(model.tensors(), fold.operand_tensor)?;
+    let q = elementwise_quant(
+        in1,
+        in2,
+        fold_out,
+        if fold.builtin == 18 { ElementwiseKind::Mul } else { ElementwiseKind::AddSub },
+    )?;
+    let num_elements = flat_len(&in1.shape)? as i32;
+    let (operand, operand_consts) = operand_data(
+        model,
+        storage,
+        fold.operand_tensor,
+        &Ident::new(&format!("FOLD_OPERAND_{i}"), proc_macro2::Span::call_site()),
+    )?;
+    let op_zp = tensor_zp(in2)? as i64;
+    let in_zp = fold.input_zero_point;
+    let out_zp = tensor_zp(fold_out)? as i64;
+    let folded_scale = fold.folded_scale;
+    let fold_builtin = fold.builtin;
+    let q_ls = q.left_shift;
+    let q_om = q.output_multiplier;
+    let q_os = q.output_shift;
+    let q_i1m = q.input1_multiplier;
+    let q_i1s = q.input1_shift;
+    let q_i2m = q.input2_multiplier;
+    let q_i2s = q.input2_shift;
+
+    let src = src_expr(storage, fold.folded_input_tensor as usize)?;
+    let dst = dst_expr(storage, group.output_tensor as usize)?;
+    let p = Ident::new(&format!("FUSED_POOL_PARAMS_{i}"), proc_macro2::Span::call_site());
+    let call = quote! {
+        let #p = ::hematite_core::op_params::FoldedPoolParams {
+            pool: #p_name,
+            pool_kind: #pool_kind,
+            fold: Some(::hematite_core::op_params::PoolInputFold {
+                builtin: #fold_builtin,
+                operand_data: #operand,
+                operand_zero_point: #op_zp,
+                input_zero_point: #in_zp,
+                output_zero_point: #out_zp,
+                folded_scale: #folded_scale,
+                left_shift: #q_ls,
+                output_multiplier: #q_om,
+                output_shift: #q_os,
+                input1_multiplier: #q_i1m,
+                input1_shift: #q_i1s,
+                input2_multiplier: #q_i2m,
+                input2_shift: #q_i2s,
+                num_elements: #num_elements,
+            }),
+            activation: ::hematite_core::op_params::ActivationEpilogueParams {
+                kind: ::hematite_core::op_params::ComposedActivation::None,
+                input_offset: 0,
+                output_offset: 0,
+                output_multiplier: 0,
+                output_shift: 0,
+                quantized_activation_min: -128,
+                quantized_activation_max: 127,
+            },
+        };
+        backend.fused_pool_with_fold(#src, &#p, #dst, scratch)?;
+    };
+    let mut consts = pool.consts;
+    consts.extend(operand_consts);
+    Ok(OpEmission {
+        consts,
+        call,
+        scratch: num_elements.max(0) as usize,
     })
 }
 
@@ -1740,6 +2443,98 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/../models/sine.tflite"
     ));
+
+    /// All six zoo models, same paths as the fused-pattern profile
+    /// (optimize/profile.rs) and model_validation.rs.
+    const HELLO_WORLD_TFLITE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/zoo/sine_regression/hello_world_int8.tflite"
+    ));
+    const KWS_TFLITE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/zoo/keyword_spotting/kws_micro_speech_int8.tflite"
+    ));
+    const ANOMALY_TFLITE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/zoo/anomaly_detect/anomaly_detect_int8.tflite"
+    ));
+    const PERSON_DETECT_TFLITE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/zoo/person_detect_vww/person_detect_int8.tflite"
+    ));
+    const MOBILENET_V2_TFLITE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/zoo/mobilenetv2_cls/mobilenet_v2_1.0_224_int8.tflite"
+    ));
+
+    /// T1.2 regression: for a model with zero composed groups the fused
+    /// emission must be byte-identical (token-identical) to the unfused
+    /// per-op emission — every one of the 5 non-mv2 zoo models qualifies.
+    #[test]
+    fn fused_emission_byte_identical_when_no_composed_groups() {
+        for (name, bytes) in [
+            ("sine", SINE_TFLITE),
+            ("hello_world", HELLO_WORLD_TFLITE),
+            ("kws", KWS_TFLITE),
+            ("anomaly_detect", ANOMALY_TFLITE),
+            ("person_detect", PERSON_DETECT_TFLITE),
+        ] {
+            let model = flatbuffer::parse(bytes).unwrap_or_else(|e| panic!("{name}: parse: {e}"));
+            let schedule = crate::optimize::fusion::fuse(&model);
+            assert!(
+                schedule.groups.iter().all(|g| composed_kind(g).is_none()),
+                "{name}: expected zero composed groups"
+            );
+            let fused = emit_model_fused(&model, &schedule)
+                .unwrap_or_else(|e| panic!("{name}: fused emit: {e}"))
+                .to_string();
+            let unfused = emit_model(&model)
+                .unwrap_or_else(|e| panic!("{name}: unfused emit: {e}"))
+                .to_string();
+            assert_eq!(fused, unfused, "{name}: fused emission diverged from per-op");
+        }
+    }
+
+    /// W0 profile pins (fused-profile.md): mv2 84 ops → 74 groups, 10
+    /// residual-add groups, 10 eliminated tensors — the ONLY composed
+    /// groups in the zoo.  The fused emission collapses each to one
+    /// `fused_conv2d` call and stays unsafe-free.
+    #[test]
+    fn mobilenet_fused_schedule_matches_w0_profile() {
+        let model = flatbuffer::parse(MOBILENET_V2_TFLITE).expect("mv2 parses");
+        let schedule = crate::optimize::fusion::fuse(&model);
+        assert_eq!(schedule.total_ops, 84);
+        assert_eq!(schedule.groups.len(), 74);
+        assert_eq!(schedule.fused_op_count(), 10);
+        let residual_groups = schedule
+            .groups
+            .iter()
+            .filter(|g| g.residual_add.is_some())
+            .count();
+        assert_eq!(residual_groups, 10);
+        let eliminated: usize = schedule.groups.iter().map(|g| g.eliminated_tensors.len()).sum();
+        assert_eq!(eliminated, 10);
+        assert!(
+            schedule.groups.iter().all(|g| !g.requires_verification),
+            "mv2: all groups must be T1 (no verification obligation)"
+        );
+        let composed = schedule
+            .groups
+            .iter()
+            .filter(|g| composed_kind(g).is_some())
+            .count();
+        assert_eq!(composed, 10);
+
+        let fused = emit_model_fused(&model, &schedule).expect("mv2 fused emits");
+        let fused_s: String = fused.to_string().chars().filter(|c| !c.is_whitespace()).collect();
+        let unfused = emit_model(&model).expect("mv2 unfused emits");
+        let unfused_s: String = unfused.to_string().chars().filter(|c| !c.is_whitespace()).collect();
+
+        assert_eq!(fused_s.matches("backend.fused_conv2d(").count(), 10);
+        assert!(!unfused_s.contains("backend.fused_conv2d("));
+        assert!(!fused_s.contains("unsafe"), "generated code must be unsafe-free");
+        assert!(!unfused_s.contains("unsafe"), "generated code must be unsafe-free");
+    }
 
     #[test]
     fn sine_model_emits_fc_call_sequence() {
