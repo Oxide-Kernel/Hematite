@@ -29,16 +29,32 @@
 //!   this file — see the `scratch_need_*` helpers below).  Generated code
 //!   sizes the scratch array with this const — never `[0u8; B::scratch()]`
 //!   inside a `const fn` (unstable const-trait-call trap).
+//!
+//! ## T1.3 — liveness arena
+//!
+//! When `optimize::arena::plan_arena` succeeds for the model (every
+//! intermediate fits `MAX_INTERNAL`), the per-tensor stack arrays collapse
+//! into ONE `#[repr(C, align(16))] struct Arena { data: [i8; ARENA_LEN] }`
+//! local sized to the planner's liveness peak, indexed at compile-time
+//! offsets.  Each op call borrows its disjoint slices via nested
+//! `split_at_mut` (safe, no `unsafe` in generated code); the planner
+//! guarantees a single op's input/output slices never overlap because they
+//! are simultaneously live.  Models the planner rejects (mobilenet_v2: a
+//! single 224×224×32 activation exceeds the 512 KiB budget) keep per-tensor
+//! stack emission — bit-exact, just larger (evidence:
+//! `local-notes/evidence/composed-kernels/t13-arena.md`).
 
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::Ident;
 
 use crate::flatbuffer::{ParsedModel, ParsedOp, ParsedOptions, ParsedTensor, QuantInfo, TensorType};
+use crate::optimize::arena::plan_arena;
 use crate::optimize::fusion::{
     AbsorbedElementwise, ElementwiseKind as FusedStepKind, FusedActivationKind, FusedGroup,
     FusedSchedule,
 };
+use hematite_memory::{ArenaPlan, OFFSET_NONE};
 
 /// Emit the full model wrapper for `subgraph[0]` of a parsed model — the
 /// plain **unfused** per-op straight-line sequence (no fusion schedule).
@@ -66,11 +82,31 @@ pub(crate) fn emit_model_fused(
     emit_model_with(model, Some(schedule))
 }
 
+/// T1.3 test arm — fused emission with the liveness arena DISABLED
+/// (per-tensor stack arrays, exactly the pre-T1.3 layout): the `stack` arm
+/// of the arena-vs-stack bit-exactness gate (`#[model_stack]`).
+pub(crate) fn emit_model_stack_fused(
+    model: &ParsedModel,
+    schedule: &FusedSchedule,
+) -> Result<TokenStream, String> {
+    emit_model_with_options(model, Some(schedule), false)
+}
+
 /// Shared emission core: `schedule: None` is the unfused path; `Some` routes
 /// composed groups through the `fused_*` backend calls (T1.2).
 fn emit_model_with(
     model: &ParsedModel,
     schedule: Option<&FusedSchedule>,
+) -> Result<TokenStream, String> {
+    emit_model_with_options(model, schedule, true)
+}
+
+/// `arena_enabled: false` forces per-tensor stack emission even when the
+/// planner succeeds — the `#[model_stack]` test arm.
+fn emit_model_with_options(
+    model: &ParsedModel,
+    schedule: Option<&FusedSchedule>,
+    arena_enabled: bool,
 ) -> Result<TokenStream, String> {
     if model.subgraph_count() != 1 {
         return Err(format!(
@@ -126,6 +162,25 @@ fn emit_model_with(
         }
     }
 
+    // ── T1.3: liveness arena over the intermediates ────────────────────────
+    // One `#[repr(C, align(16))] struct Arena { data: [i8; ARENA_LEN] }`
+    // local replaces the per-tensor stack arrays whenever the planner
+    // succeeds AND covers every emitted intermediate.  On planner rejection
+    // (mobilenet_v2: a single 224²×32 activation exceeds MAX_INTERNAL) the
+    // emitter falls back to per-tensor stack locals — bit-exact, just
+    // larger (see local-notes/evidence/composed-kernels/t13-arena.md).
+    let arena_plan = if arena_enabled { arena_plan_for(model, &storage) } else { None };
+    let lens: Option<Vec<usize>> = match &arena_plan {
+        Some(_) => Some(
+            tensors
+                .iter()
+                .map(|t| flat_len(&t.shape))
+                .collect::<Result<Vec<usize>, String>>()?,
+        ),
+        None => None,
+    };
+    let arena_peak = arena_plan.as_ref().map(|p| p.peak_arena_bytes).unwrap_or(0);
+
     // ── Emit per-op consts + calls (straight-line, execution order) ────────
     // With a schedule, each op is either (a) an anchor of a composed group
     // → one `fused_*` call, (b) absorbed into a composed group → skipped, or
@@ -137,47 +192,82 @@ fn emit_model_with(
         if plan.as_ref().is_some_and(|p| p.absorbed[i]) {
             continue;
         }
+        let mut actx = ArenaCtx::new(arena_plan.as_ref(), lens.as_deref().unwrap_or(&[]));
+        actx.op = i;
         let em = match plan.as_ref().and_then(|p| p.anchor_group[i]) {
             Some(gi) => {
                 let group = &schedule.expect("anchor_group implies a schedule").groups[gi];
                 match composed_kind(group) {
-                    Some(ComposedKind::Conv) => emit_fused_conv(model, &storage, i, op, group)?,
-                    Some(ComposedKind::Chain) => emit_fused_chain(model, &storage, i, op, group)?,
-                    Some(ComposedKind::PoolFold) => {
-                        emit_fused_pool_fold(model, &storage, i, op, group)?
+                    Some(ComposedKind::Conv) => {
+                        emit_fused_conv(model, &storage, &mut actx, i, op, group)?
                     }
-                    None => emit_op(model, &storage, i, op)?,
+                    Some(ComposedKind::Chain) => {
+                        emit_fused_chain(model, &storage, &mut actx, i, op, group)?
+                    }
+                    Some(ComposedKind::PoolFold) => {
+                        emit_fused_pool_fold(model, &storage, &mut actx, i, op, group)?
+                    }
+                    None => emit_op(model, &storage, &mut actx, i, op)?,
                 }
             }
-            None => emit_op(model, &storage, i, op)?,
+            None => emit_op(model, &storage, &mut actx, i, op)?,
         };
         consts.extend(em.consts);
-        calls.push(em.call);
+        calls.push(actx.wrap(em.call));
         scratch_max = scratch_max.max(em.scratch);
     }
 
-    // ── Intermediate stack-array types ──────────────────────────────────────
-    // Eliminated tensors (single-use intermediates absorbed into composed
-    // groups) get no stack array — their data never materializes.
+    // ── Intermediate storage: arena local OR per-tensor stack arrays ───────
+    // Arena mode: every intermediate lives in `Arena.data` at a const
+    // offset (the planner covers all of them — `arena_plan_for` checked).
+    // Fallback mode: per-tensor `#[repr(C, align(16))]` stack locals, as
+    // before T1.3.  Eliminated tensors (absorbed into composed groups) get
+    // no storage in either mode.
     let mut tensor_types: Vec<TokenStream> = Vec::new();
     let mut tensor_locals: Vec<TokenStream> = Vec::new();
-    for s in &storage {
-        if let Storage::Tensor { idx } = s {
-            if plan.as_ref().is_some_and(|p| p.eliminated[*idx]) {
-                continue;
-            }
-            let len = flat_len(&tensors[*idx].shape)?;
-            let ty = Ident::new(&format!("TENSOR_{idx}"), proc_macro2::Span::call_site());
-            let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
-            tensor_types.push(quote! {
+    let arena_ty: Option<TokenStream> = match &arena_plan {
+        Some(p) if p.peak_arena_bytes > 0 => {
+            let peak = p.peak_arena_bytes;
+            Some(quote! {
+                /// Intermediate-tensor arena (T1.3): ONE 16-byte-aligned
+                /// array sized to the liveness peak; every intermediate
+                /// indexes it at a compile-time offset.
                 #[repr(C, align(16))]
-                struct #ty {
-                    data: [i8; #len],
+                struct Arena {
+                    data: [i8; #peak],
                 }
-            });
-            tensor_locals.push(quote! {
-                let mut #var = #ty { data: [0i8; #len] };
-            });
+            })
+        }
+        _ => None,
+    };
+    let arena_local: Option<TokenStream> = match &arena_plan {
+        Some(p) if p.peak_arena_bytes > 0 => {
+            let peak = p.peak_arena_bytes;
+            Some(quote! {
+                let mut arena = Arena { data: [0i8; #peak] };
+            })
+        }
+        _ => None,
+    };
+    if arena_plan.is_none() {
+        for s in &storage {
+            if let Storage::Tensor { idx } = s {
+                if plan.as_ref().is_some_and(|p| p.eliminated[*idx]) {
+                    continue;
+                }
+                let len = flat_len(&tensors[*idx].shape)?;
+                let ty = Ident::new(&format!("TENSOR_{idx}"), proc_macro2::Span::call_site());
+                let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
+                tensor_types.push(quote! {
+                    #[repr(C, align(16))]
+                    struct #ty {
+                        data: [i8; #len],
+                    }
+                });
+                tensor_locals.push(quote! {
+                    let mut #var = #ty { data: [0i8; #len] };
+                });
+            }
         }
     }
 
@@ -243,6 +333,13 @@ fn emit_model_with(
             /// * [`::hematite_core::KernelError::ScratchTooSmall`] if
             ///   `scratch.len()` is below [`SCRATCH_LEN`] — the macro-time
             ///   max over ops of their documented scratch need.
+            ///
+            /// The intermediate-tensor arena is ALWAYS the internal
+            /// [`ARENA_LEN`]-byte stack local: the caller's `scratch` is
+            /// `&mut [u8]` and the arena is `[i8; ARENA_LEN]`, and reusing
+            /// it would require a byte-type cast that generated code must
+            /// never contain (T1.3 evidence).  `scratch` covers only the
+            /// per-op kernel scratch.
             pub fn predict_with_scratch(
                 #receiver,
                 input: &[i8; INPUT_LEN],
@@ -252,6 +349,7 @@ fn emit_model_with(
                 if scratch.len() < SCRATCH_LEN {
                     return Err(::hematite_core::KernelError::ScratchTooSmall);
                 }
+                #arena_local
                 #(#tensor_locals)*
                 #backend_bind
                 #(#calls)*
@@ -264,7 +362,11 @@ fn emit_model_with(
         pub const INPUT_LEN: usize = #input_len_ts;
         pub const OUTPUT_LEN: usize = #output_len_ts;
         pub const SCRATCH_LEN: usize = #scratch_ts;
+        /// Intermediate-tensor arena size in bytes (liveness peak, T1.3);
+        /// 0 when the model fell back to per-tensor stack emission.
+        pub const ARENA_LEN: usize = #arena_peak;
         #(#consts)*
+        #arena_ty
         #(#tensor_types)*
         #wrapper
     })
@@ -343,16 +445,141 @@ fn fused_plan(schedule: &FusedSchedule, op_count: usize, tensor_count: usize) ->
     FusedPlan { anchor_group, absorbed, eliminated }
 }
 
+// ---------------------------------------------------------------------------
+// T1.3 — liveness-arena emission
+// ---------------------------------------------------------------------------
+
+/// Compute the T1.3 arena plan for a model, or fall back to per-tensor
+/// stack emission when the planner rejects it.
+///
+/// Fallback triggers: planner error (mobilenet_v2's single 224²×32
+/// activation exceeds `MAX_INTERNAL`) or incomplete coverage (any
+/// intermediate the emitter will materialize has no arena slot — the
+/// planner keeps zero-size / never-written tensors out).  The fallback
+/// emits exactly the pre-T1.3 per-tensor code, bit-exact.
+fn arena_plan_for(model: &ParsedModel<'_>, storage: &[Storage]) -> Option<ArenaPlan> {
+    let plan = plan_arena(model).ok()?;
+    if plan.peak_arena_bytes == 0 {
+        return None;
+    }
+    for (t, s) in storage.iter().enumerate() {
+        if matches!(s, Storage::Tensor { .. }) && plan.offsets[t] == OFFSET_NONE {
+            return None;
+        }
+    }
+    Some(plan)
+}
+
+/// Per-call arena slice bookkeeping (T1.3).
+///
+/// The arena is ONE `[i8; ARENA_LEN]` local; each op call borrows the
+/// disjoint slices it touches through nested `split_at_mut` (safe, const
+/// offsets).  The planner guarantees a single op's slices never overlap:
+/// its inputs and output are simultaneously live at that op.  [`wrap`]
+/// prefixes the call statement with the borrows.
+struct ArenaCtx<'a> {
+    /// Arena emission active (plan succeeded and covers all intermediates).
+    on: bool,
+    /// Tensor idx → arena byte offset.
+    offsets: &'a [usize],
+    /// Tensor flat lens (byte counts), index-aligned with `offsets`.
+    lens: &'a [usize],
+    /// (slice ident, offset, len) registered for the current call.
+    regions: Vec<(Ident, usize, usize)>,
+    /// Op index — names the slice idents uniquely.
+    op: usize,
+}
+
+impl<'a> ArenaCtx<'a> {
+    fn new(plan: Option<&'a ArenaPlan>, lens: &'a [usize]) -> Self {
+        let (on, offsets) = match plan {
+            Some(p) => (true, &p.offsets[..]),
+            None => (false, &[][..]),
+        };
+        Self { on, offsets, lens, regions: Vec::new(), op: 0 }
+    }
+
+    /// Arena off: every slice lookup returns `None`, so callers emit the
+    /// per-tensor `tensor_N.data` expressions (fallback mode).
+    fn inactive() -> Self {
+        Self { on: false, offsets: &[], lens: &[], regions: Vec::new(), op: 0 }
+    }
+
+    /// Register the arena slice for tensor `t`, deduped by (offset, len) so
+    /// repeated references to one tensor share a borrow.  `None` when the
+    /// arena is off or the tensor is not arena-backed (caller falls back to
+    /// the per-tensor local).
+    fn slice(&mut self, t: usize) -> Option<(Ident, usize, usize)> {
+        if !self.on {
+            return None;
+        }
+        let off = *self.offsets.get(t)?;
+        if off == OFFSET_NONE {
+            return None;
+        }
+        let len = *self.lens.get(t)?;
+        if let Some(existing) = self.regions.iter().find(|(_, o, l)| *o == off && *l == len) {
+            return Some(existing.clone());
+        }
+        let ident = Ident::new(
+            &format!("arena_slice_{}_{}", self.op, self.regions.len()),
+            proc_macro2::Span::call_site(),
+        );
+        let entry = (ident, off, len);
+        self.regions.push(entry.clone());
+        Some(entry)
+    }
+
+    /// Prefix a call with the nested `split_at_mut` borrows its slices need.
+    ///
+    /// Regions are sorted by offset; each is carved as `(gap, slice)` from
+    /// the remaining tail, so the slice idents are disjoint borrows of
+    /// `arena.data`.  All split indices are compile-time consts within
+    /// `[0, ARENA_LEN)` — no panic paths.
+    fn wrap(&self, call: TokenStream) -> TokenStream {
+        if !self.on || self.regions.is_empty() {
+            return call;
+        }
+        let mut regions = self.regions.clone();
+        regions.sort_by_key(|(_, off, _)| *off);
+        let last = regions.len() - 1;
+        let mut lets: Vec<TokenStream> = Vec::with_capacity(regions.len() * 2);
+        let mut prev_end = 0usize;
+        for (k, (ident, off, len)) in regions.iter().enumerate() {
+            let gap = if k == 0 { *off } else { off - prev_end };
+            if k == 0 {
+                lets.push(quote!(let (_, rest) = arena.data.split_at_mut(#gap);));
+            } else {
+                lets.push(quote!(let (_, rest) = rest.split_at_mut(#gap);));
+            }
+            if k == last {
+                lets.push(quote!(let (#ident, _) = rest.split_at_mut(#len);));
+            } else {
+                lets.push(quote!(let (#ident, rest) = rest.split_at_mut(#len);));
+            }
+            prev_end = off + len;
+        }
+        quote!({ #(#lets)* #call })
+    }
+}
+
 /// `&tensor_N.data` for an intermediate tensor — the composed params'
 /// runtime operand slices (the residual, chain operands) must point at the
-/// generated stack arrays.  Fusion guarantees the residual is a computed
+/// generated storage.  Fusion guarantees the residual is a computed
 /// intermediate (never a const / model I/O).
-fn tensor_ref_expr(storage: &[Storage], t: usize) -> Result<TokenStream, String> {
+fn tensor_ref_expr(
+    ctx: &mut ArenaCtx,
+    storage: &[Storage],
+    t: usize,
+) -> Result<TokenStream, String> {
     match storage.get(t).ok_or_else(|| format!("tensor index {t} out of range"))? {
-        Storage::Tensor { idx } => {
-            let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
-            Ok(quote!(&#var.data))
-        }
+        Storage::Tensor { idx } => match ctx.slice(*idx) {
+            Some((ident, _, _)) => Ok(quote!(&#ident[..])),
+            None => {
+                let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
+                Ok(quote!(&#var.data))
+            }
+        },
         _ => Err(format!(
             "tensor {t} must be an intermediate stack array for composed params"
         )),
@@ -360,11 +587,13 @@ fn tensor_ref_expr(storage: &[Storage], t: usize) -> Result<TokenStream, String>
 }
 
 /// Runtime operand slice for a composed param struct: an emitted const for
-/// buffer-backed tensors, `&tensor_N.data` for intermediates, `&input[..]`
-/// for model inputs.  (The T4.1 per-op emitter rejects constant operands —
-/// "deferred to T4.2a fusion" — the composed paths are where they land.)
+/// buffer-backed tensors, the arena slice / `&tensor_N.data` for
+/// intermediates, `&input[..]` for model inputs.  (The T4.1 per-op emitter
+/// rejects constant operands — "deferred to T4.2a fusion" — the composed
+/// paths are where they land.)
 fn operand_data(
     model: &ParsedModel,
+    ctx: &mut ArenaCtx,
     storage: &[Storage],
     t: u32,
     name: &Ident,
@@ -377,10 +606,13 @@ fn operand_data(
             let c = weight_const(model, t, name)?;
             Ok((quote!(&#name.0), vec![c]))
         }
-        Storage::Tensor { idx } => {
-            let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
-            Ok((quote!(&#var.data), Vec::new()))
-        }
+        Storage::Tensor { idx } => match ctx.slice(*idx) {
+            Some((ident, _, _)) => Ok((quote!(&#ident[..]), Vec::new())),
+            None => {
+                let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
+                Ok((quote!(&#var.data), Vec::new()))
+            }
+        },
         Storage::Input { start, len } => {
             let end = start + len;
             Ok((quote!(&input[#start..#end]), Vec::new()))
@@ -438,16 +670,23 @@ enum Storage {
 }
 
 /// Expression naming a tensor as a kernel *input* (immutable `&[i8]`).
-fn src_expr(storage: &[Storage], t: usize) -> Result<TokenStream, String> {
+fn src_expr(
+    ctx: &mut ArenaCtx,
+    storage: &[Storage],
+    t: usize,
+) -> Result<TokenStream, String> {
     match storage.get(t).ok_or_else(|| format!("tensor index {t} out of range"))? {
         Storage::Input { start, len } => {
             let end = start + len;
             Ok(quote!(&input[#start..#end]))
         }
-        Storage::Tensor { idx } => {
-            let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
-            Ok(quote!(&#var.data))
-        }
+        Storage::Tensor { idx } => match ctx.slice(*idx) {
+            Some((ident, _, _)) => Ok(quote!(&#ident[..])),
+            None => {
+                let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
+                Ok(quote!(&#var.data))
+            }
+        },
         Storage::Const => Err(format!(
             "tensor {t} is a constant (buffer-backed) but is used as a runtime op input; \
              constant data inputs are not supported in T4.1 (deferred to T4.2a fusion)"
@@ -457,16 +696,23 @@ fn src_expr(storage: &[Storage], t: usize) -> Result<TokenStream, String> {
 }
 
 /// Expression naming a tensor as a kernel *output* (`&mut [i8]`).
-fn dst_expr(storage: &[Storage], t: usize) -> Result<TokenStream, String> {
+fn dst_expr(
+    ctx: &mut ArenaCtx,
+    storage: &[Storage],
+    t: usize,
+) -> Result<TokenStream, String> {
     match storage.get(t).ok_or_else(|| format!("tensor index {t} out of range"))? {
         Storage::Output { start, len } => {
             let end = start + len;
             Ok(quote!(&mut output[#start..#end]))
         }
-        Storage::Tensor { idx } => {
-            let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
-            Ok(quote!(&mut #var.data))
-        }
+        Storage::Tensor { idx } => match ctx.slice(*idx) {
+            Some((ident, _, _)) => Ok(quote!(&mut #ident[..])),
+            None => {
+                let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
+                Ok(quote!(&mut #var.data))
+            }
+        },
         _ => Err(format!("tensor {t} cannot be an op output (model input or const)")),
     }
 }
@@ -941,29 +1187,30 @@ pub fn depthwise_scratch_need_codegen(
 fn emit_op(
     model: &ParsedModel,
     storage: &[Storage],
+    ctx: &mut ArenaCtx,
     i: usize,
     op: &ParsedOp,
 ) -> Result<OpEmission, String> {
     match op.builtin_code {
-        0 => emit_elementwise(model, storage, i, op, quote!(add), ElementwiseKind::AddSub),
-        1 => emit_pool(model, storage, i, op, quote!(average_pool_2d)),
-        3 => emit_conv2d(model, storage, i, op).map(|c| c.em),
-        4 => emit_depthwise(model, storage, i, op),
-        9 => emit_fully_connected(model, storage, i, op),
-        17 => emit_pool(model, storage, i, op, quote!(max_pool_2d)),
-        18 => emit_elementwise(model, storage, i, op, quote!(mul), ElementwiseKind::Mul),
-        19 => emit_activation(model, storage, i, op, quote!(relu), 1),
-        21 => emit_activation(model, storage, i, op, quote!(relu6), 3),
-        22 => emit_reshape(model, storage, i, op),
-        25 => emit_softmax(model, storage, i, op),
-        34 => emit_pad(model, storage, i, op),
-        39 => emit_transpose(model, storage, i, op),
-        40 => emit_mean(model, storage, i, op),
-        41 => emit_elementwise(model, storage, i, op, quote!(sub), ElementwiseKind::AddSub),
-        54 => emit_prelu(model, storage, i, op),
-        97 => emit_resize(model, storage, i, op),
-        98 => emit_leaky_relu(model, storage, i, op),
-        117 => emit_activation(model, storage, i, op, quote!(hard_swish), 0),
+        0 => emit_elementwise(model, storage, ctx, i, op, quote!(add), ElementwiseKind::AddSub),
+        1 => emit_pool(model, storage, ctx, i, op, quote!(average_pool_2d)),
+        3 => emit_conv2d(model, storage, ctx, i, op).map(|c| c.em),
+        4 => emit_depthwise(model, storage, ctx, i, op),
+        9 => emit_fully_connected(model, storage, ctx, i, op),
+        17 => emit_pool(model, storage, ctx, i, op, quote!(max_pool_2d)),
+        18 => emit_elementwise(model, storage, ctx, i, op, quote!(mul), ElementwiseKind::Mul),
+        19 => emit_activation(model, storage, ctx, i, op, quote!(relu), 1),
+        21 => emit_activation(model, storage, ctx, i, op, quote!(relu6), 3),
+        22 => emit_reshape(model, storage, ctx, i, op),
+        25 => emit_softmax(model, storage, ctx, i, op),
+        34 => emit_pad(model, storage, ctx, i, op),
+        39 => emit_transpose(model, storage, ctx, i, op),
+        40 => emit_mean(model, storage, ctx, i, op),
+        41 => emit_elementwise(model, storage, ctx, i, op, quote!(sub), ElementwiseKind::AddSub),
+        54 => emit_prelu(model, storage, ctx, i, op),
+        97 => emit_resize(model, storage, ctx, i, op),
+        98 => emit_leaky_relu(model, storage, ctx, i, op),
+        117 => emit_activation(model, storage, ctx, i, op, quote!(hard_swish), 0),
         code => Err(format!(
             "unsupported operator (builtin_code={code}) in subgraph[0]; T4.1 dispatches only the \
              in-scope op set (conv2d, depthwise_conv2d, fully_connected, average_pool_2d, \
@@ -974,7 +1221,7 @@ fn emit_op(
     }
 }
 
-fn emit_conv2d(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<ConvEmission, String> {
+fn emit_conv2d(model: &ParsedModel, storage: &[Storage], ctx: &mut ArenaCtx, i: usize, op: &ParsedOp) -> Result<ConvEmission, String> {
     let opts = match op.options.as_ref() {
         Some(ParsedOptions::Conv2D {
             padding,
@@ -1039,8 +1286,8 @@ fn emit_conv2d(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp
                 quantized_activation_max: #act_max,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.conv2d(#src, &#w_name.0, &#b_name, &#p_name, #dst, scratch)?;
     };
@@ -1077,7 +1324,7 @@ fn emit_conv2d(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp
     })
 }
 
-fn emit_depthwise(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
+fn emit_depthwise(model: &ParsedModel, storage: &[Storage], ctx: &mut ArenaCtx, i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
     let opts = match op.options.as_ref() {
         Some(ParsedOptions::DepthwiseConv2D {
             padding,
@@ -1152,8 +1399,8 @@ fn emit_depthwise(model: &ParsedModel, storage: &[Storage], i: usize, op: &Parse
                 quantized_activation_max: #act_max,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.depthwise_conv2d(#src, &#w_name.0, &#b_name, &#p_name, #dst, scratch)?;
     };
@@ -1180,7 +1427,7 @@ fn emit_depthwise(model: &ParsedModel, storage: &[Storage], i: usize, op: &Parse
     })
 }
 
-fn emit_fully_connected(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
+fn emit_fully_connected(model: &ParsedModel, storage: &[Storage], ctx: &mut ArenaCtx, i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
     let opts = match op.options.as_ref() {
         Some(ParsedOptions::FullyConnected {
             fused_activation,
@@ -1231,8 +1478,8 @@ fn emit_fully_connected(model: &ParsedModel, storage: &[Storage], i: usize, op: 
                 quantized_activation_max: #act_max,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.fully_connected(#src, &#w_name.0, &#b_name, &#p_name, #dst, scratch)?;
     };
@@ -1296,6 +1543,7 @@ fn fc_dimensions(
 fn emit_pool(
     model: &ParsedModel,
     storage: &[Storage],
+    ctx: &mut ArenaCtx,
     i: usize,
     op: &ParsedOp,
     method: TokenStream,
@@ -1340,8 +1588,8 @@ fn emit_pool(
                 quantized_activation_max: #act_max,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.#method(#src, &#p_name, #dst)?;
     };
@@ -1352,7 +1600,7 @@ fn emit_pool(
     })
 }
 
-fn emit_softmax(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
+fn emit_softmax(model: &ParsedModel, storage: &[Storage], ctx: &mut ArenaCtx, i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
     // TFLM int8 softmax only supports beta = 1.0; a SoftmaxOptions table
     // carrying exactly that (the converter default) is accepted and ignored.
     match op.options.as_ref() {
@@ -1403,8 +1651,8 @@ fn emit_softmax(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedO
                 quantized_activation_max: 127,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.softmax(#src, &#p_name, #dst, scratch)?;
     };
@@ -1420,6 +1668,7 @@ fn emit_softmax(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedO
 fn emit_activation(
     model: &ParsedModel,
     storage: &[Storage],
+    ctx: &mut ArenaCtx,
     i: usize,
     op: &ParsedOp,
     method: TokenStream,
@@ -1468,8 +1717,8 @@ fn emit_activation(
                 output_multiplier_exponent: 0,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.#method(#src, &#p_name, #dst)?;
     };
@@ -1483,6 +1732,7 @@ fn emit_activation(
 fn emit_leaky_relu(
     model: &ParsedModel,
     storage: &[Storage],
+    ctx: &mut ArenaCtx,
     i: usize,
     op: &ParsedOp,
 ) -> Result<OpEmission, String> {
@@ -1530,8 +1780,8 @@ fn emit_leaky_relu(
                 output_multiplier_exponent: 0,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.leaky_relu(#src, &#p_name, #dst)?;
     };
@@ -1545,6 +1795,7 @@ fn emit_leaky_relu(
 fn emit_prelu(
     model: &ParsedModel,
     storage: &[Storage],
+    ctx: &mut ArenaCtx,
     i: usize,
     op: &ParsedOp,
 ) -> Result<OpEmission, String> {
@@ -1597,8 +1848,8 @@ fn emit_prelu(
                 output_multiplier_exponent: 0,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.prelu(#src, &#p_name, #dst)?;
     };
@@ -1674,6 +1925,7 @@ fn elementwise_quant(
 fn emit_elementwise(
     model: &ParsedModel,
     storage: &[Storage],
+    ctx: &mut ArenaCtx,
     i: usize,
     op: &ParsedOp,
     method: TokenStream,
@@ -1732,9 +1984,9 @@ fn emit_elementwise(
                 quantized_activation_max: #act_max,
             };
     };
-    let src1 = src_expr(storage, in1_t as usize)?;
-    let src2 = src_expr(storage, in2_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src1 = src_expr(ctx, storage, in1_t as usize)?;
+    let src2 = src_expr(ctx, storage, in2_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.#method(#src1, #src2, &#p_name, #dst)?;
     };
@@ -1760,11 +2012,17 @@ fn emit_elementwise(
 fn emit_fused_conv(
     model: &ParsedModel,
     storage: &[Storage],
+    ctx: &mut ArenaCtx,
     i: usize,
     op: &ParsedOp,
     group: &FusedGroup,
 ) -> Result<OpEmission, String> {
-    let conv = emit_conv2d(model, storage, i, op)?;
+    // The per-op conv emission inside the composed path registers slices
+    // for the anchor's OWN src/dst — discarded with the call; only its
+    // consts and scratch are reused.  A throwaway ctx keeps those slices
+    // out of the fused call's region list (the fused call re-registers the
+    // slices it actually references).
+    let conv = emit_conv2d(model, storage, &mut ArenaCtx::inactive(), i, op)?;
     let in_t = *op.inputs.first().ok_or("conv2d missing input tensor")?;
     let out_t = *op.outputs.first().ok_or("conv2d missing output tensor")?;
     let output = tensor_at(model.tensors(), out_t)?;
@@ -1774,7 +2032,7 @@ fn emit_fused_conv(
     let residual_ts = match &group.residual_add {
         Some(res) => {
             let r_t = tensor_at(model.tensors(), res.residual_tensor)?;
-            let r_expr = tensor_ref_expr(storage, res.residual_tensor as usize)?;
+            let r_expr = tensor_ref_expr(ctx, storage, res.residual_tensor as usize)?;
             let r_scale = tensor_scale(r_t)? as f32;
             let r_zp = tensor_zp(r_t)? as i64;
             let r_out_scale = res.output_scale;
@@ -1844,8 +2102,8 @@ fn emit_fused_conv(
             ),
         };
 
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, group.output_tensor as usize)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, group.output_tensor as usize)?;
     let conv_params = &conv.params;
     let conv_mult = &conv.mult;
     let conv_shift = &conv.shift;
@@ -1887,6 +2145,7 @@ fn emit_fused_conv(
 fn emit_fused_chain(
     model: &ParsedModel,
     storage: &[Storage],
+    ctx: &mut ArenaCtx,
     i: usize,
     op: &ParsedOp,
     group: &FusedGroup,
@@ -1932,6 +2191,7 @@ fn emit_fused_chain(
     let (act_min, act_max) = act_range(fused_activation, out_scale, q.out_off);
     let (anchor_operand, anchor_operand_consts) = operand_data(
         model,
+        ctx,
         storage,
         in2_t,
         &Ident::new(&format!("CHAIN_OPERAND_{i}_0"), proc_macro2::Span::call_site()),
@@ -1975,8 +2235,9 @@ fn emit_fused_chain(
             u32::MAX => (quote!(None), Vec::new()),
             t => {
                 let (e, c) = operand_data(
-                    model,
-                    storage,
+        model,
+        ctx,
+        storage,
                     t,
                     &Ident::new(&format!("CHAIN_OPERAND_{i}_{k1}"), proc_macro2::Span::call_site()),
                 )?;
@@ -2015,8 +2276,8 @@ fn emit_fused_chain(
             }
         });
     }
-    let src = src_expr(storage, in1_t as usize)?;
-    let dst = dst_expr(storage, group.output_tensor as usize)?;
+    let src = src_expr(ctx, storage, in1_t as usize)?;
+    let dst = dst_expr(ctx, storage, group.output_tensor as usize)?;
     let p = Ident::new(&format!("CHAIN_PARAMS_{i}"), proc_macro2::Span::call_site());
     let call = quote! {
         let #p = ::hematite_core::op_params::ElementwiseChainParams {
@@ -2065,6 +2326,7 @@ fn chain_step_act_range(
 fn emit_fused_pool_fold(
     model: &ParsedModel,
     storage: &[Storage],
+    ctx: &mut ArenaCtx,
     i: usize,
     op: &ParsedOp,
     group: &FusedGroup,
@@ -2082,7 +2344,7 @@ fn emit_fused_pool_fold(
             ))
         }
     };
-    let pool = emit_pool(model, storage, i, op, quote!(average_pool_2d))?;
+    let pool = emit_pool(model, storage, ctx, i, op, quote!(average_pool_2d))?;
     let p_name = Ident::new(&format!("POOL_PARAMS_{i}"), proc_macro2::Span::call_site());
 
     let fold_op = model
@@ -2105,6 +2367,7 @@ fn emit_fused_pool_fold(
     let num_elements = flat_len(&in1.shape)? as i32;
     let (operand, operand_consts) = operand_data(
         model,
+        ctx,
         storage,
         fold.operand_tensor,
         &Ident::new(&format!("FOLD_OPERAND_{i}"), proc_macro2::Span::call_site()),
@@ -2122,8 +2385,8 @@ fn emit_fused_pool_fold(
     let q_i2m = q.input2_multiplier;
     let q_i2s = q.input2_shift;
 
-    let src = src_expr(storage, fold.folded_input_tensor as usize)?;
-    let dst = dst_expr(storage, group.output_tensor as usize)?;
+    let src = src_expr(ctx, storage, fold.folded_input_tensor as usize)?;
+    let dst = dst_expr(ctx, storage, group.output_tensor as usize)?;
     let p = Ident::new(&format!("FUSED_POOL_PARAMS_{i}"), proc_macro2::Span::call_site());
     let call = quote! {
         let #p = ::hematite_core::op_params::FoldedPoolParams {
@@ -2166,7 +2429,7 @@ fn emit_fused_pool_fold(
     })
 }
 
-fn emit_mean(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
+fn emit_mean(model: &ParsedModel, storage: &[Storage], ctx: &mut ArenaCtx, i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
     let (axis, keep_dims) = match op.options.as_ref() {
         Some(ParsedOptions::Mean { axis, keep_dims }) => (axis.clone(), *keep_dims),
         other => return Err(format!("op {i}: expected Mean options, got {other:?}")),
@@ -2213,8 +2476,8 @@ fn emit_mean(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) 
                 quantized_activation_max: 127,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.mean(#src, &#p_name, #dst)?;
     };
@@ -2225,7 +2488,7 @@ fn emit_mean(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) 
     })
 }
 
-fn emit_reshape(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
+fn emit_reshape(model: &ParsedModel, storage: &[Storage], ctx: &mut ArenaCtx, i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
     let out_t = *op.outputs.first().ok_or("reshape missing output tensor")?;
     let in_t = *op.inputs.first().ok_or("reshape missing input tensor")?;
     let output = tensor_at(model.tensors(), out_t)?;
@@ -2261,8 +2524,8 @@ fn emit_reshape(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedO
                 shape_count: #shape_count,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.reshape(#src, &#p_name, #dst)?;
     };
@@ -2275,7 +2538,7 @@ fn emit_reshape(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedO
 
 /// PAD — the padding amounts come from a const int32 tensor of shape
 /// `[rank, 2]` (`[before, after]` per dim); the kernel pads with value 0.
-fn emit_pad(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
+fn emit_pad(model: &ParsedModel, storage: &[Storage], ctx: &mut ArenaCtx, i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
     let in_t = *op.inputs.first().ok_or("pad missing input tensor")?;
     let pad_t = *op.inputs.get(1).ok_or("pad missing padding tensor")?;
     let out_t = *op.outputs.first().ok_or("pad missing output tensor")?;
@@ -2322,8 +2585,8 @@ fn emit_pad(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -
                 right_padding_count: #count,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.pad(#src, &#p_name, #dst)?;
     };
@@ -2336,7 +2599,7 @@ fn emit_pad(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -
 
 /// TRANSPOSE — the permutation comes from a const int32 tensor of length
 /// `rank`; the kernel computes the output shape from the permuted input.
-fn emit_transpose(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
+fn emit_transpose(model: &ParsedModel, storage: &[Storage], ctx: &mut ArenaCtx, i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
     let in_t = *op.inputs.first().ok_or("transpose missing input tensor")?;
     let perm_t = *op.inputs.get(1).ok_or("transpose missing perm tensor")?;
     let out_t = *op.outputs.first().ok_or("transpose missing output tensor")?;
@@ -2381,8 +2644,8 @@ fn emit_transpose(model: &ParsedModel, storage: &[Storage], i: usize, op: &Parse
                 perm_count: #perm_count,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.transpose(#src, &#p_name, #dst)?;
     };
@@ -2393,7 +2656,7 @@ fn emit_transpose(model: &ParsedModel, storage: &[Storage], i: usize, op: &Parse
     })
 }
 
-fn emit_resize(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {    let (align_corners, half_pixel_centers) = match op.options.as_ref() {
+fn emit_resize(model: &ParsedModel, storage: &[Storage], ctx: &mut ArenaCtx, i: usize, op: &ParsedOp) -> Result<OpEmission, String> {    let (align_corners, half_pixel_centers) = match op.options.as_ref() {
         Some(ParsedOptions::ResizeNearest {
             align_corners,
             half_pixel_centers,
@@ -2417,8 +2680,8 @@ fn emit_resize(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp
                 half_pixel_centers: #half_pixel_centers as i32,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.resize_nearest(#src, &#p_name, #dst)?;
     };
@@ -2466,6 +2729,73 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/../models/zoo/mobilenetv2_cls/mobilenet_v2_1.0_224_int8.tflite"
     ));
+
+    /// T1.3 — the emitted `ARENA_LEN` const must equal the planner's peak
+    /// for every arena-emitting model, the arena must be 16-byte aligned,
+    /// and NO `unsafe` / `static mut` may leak into either emission mode.
+    /// mobilenet_v2 falls back to per-tensor arrays (a single 224²×32
+    /// activation exceeds MAX_INTERNAL) — its ARENA_LEN is 0.
+    #[test]
+    fn emitted_arena_len_matches_plan_peak() {
+        use crate::optimize::arena::plan_arena;
+        let cases: [(&str, &[u8], usize); 6] = [
+            ("sine", SINE_TFLITE, 0), // no intermediates
+            ("hello_world", HELLO_WORLD_TFLITE, 32),
+            ("kws", KWS_TFLITE, 5_968),
+            ("anomaly_detect", ANOMALY_TFLITE, 272),
+            ("person_detect", PERSON_DETECT_TFLITE, 55_296),
+            ("mobilenet_v2", MOBILENET_V2_TFLITE, 0), // fallback: Oversized
+        ];
+        for (name, bytes, expected) in cases {
+            let model = flatbuffer::parse(bytes).unwrap_or_else(|e| panic!("{name}: parse: {e}"));
+            let peak = plan_arena(&model).map(|p| p.peak_arena_bytes).unwrap_or(0);
+            assert_eq!(peak, expected, "{name}: plan peak (t13-arena.md)");
+            let ts = emit_model(&model).unwrap_or_else(|e| panic!("{name}: emit: {e}"));
+            let s: String = ts.to_string().chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                s.contains(&format!("ARENA_LEN:usize={peak}usize")),
+                "{name}: ARENA_LEN const wrong: {s}"
+            );
+            let arena_mode = peak > 0;
+            assert_eq!(
+                s.contains("structArena{data:[i8;"),
+                arena_mode,
+                "{name}: arena struct presence wrong"
+            );
+            assert_eq!(
+                s.contains("split_at_mut"),
+                arena_mode,
+                "{name}: arena borrows presence wrong"
+            );
+            assert!(
+                s.contains("align(16))"),
+                "{name}: 16-byte alignment missing (SIMD gate)"
+            );
+            assert!(!s.contains("unsafe"), "{name}: unsafe leaked into generated code");
+            assert!(!s.contains("staticmut"), "{name}: static mut leaked into generated code");
+            if name == "mobilenet_v2" {
+                assert!(
+                    s.contains("structTENSOR_"),
+                    "mobilenet_v2: fallback must keep per-tensor arrays"
+                );
+            }
+        }
+    }
+
+    /// T1.3 — the stack arm (`emit_model_stack`) must NOT emit the arena for
+    /// a model that arena-emits, and must stay unsafe/static-mut-free.
+    #[test]
+    fn stack_emission_has_no_arena() {
+        let model = flatbuffer::parse(KWS_TFLITE).expect("kws parses");
+        let schedule = crate::optimize::fusion::fuse(&model);
+        let ts = emit_model_stack_fused(&model, &schedule).expect("kws stack emits");
+        let s: String = ts.to_string().chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(!s.contains("structArena"), "stack arm must not emit the arena");
+        assert!(s.contains("ARENA_LEN:usize=0usize"), "stack arm: ARENA_LEN must be 0");
+        assert!(s.contains("structTENSOR_"), "stack arm must emit per-tensor arrays");
+        assert!(!s.contains("unsafe"), "stack arm: unsafe leaked");
+        assert!(!s.contains("staticmut"), "stack arm: static mut leaked");
+    }
 
     /// T1.2 regression: for a model with zero composed groups the fused
     /// emission must be byte-identical (token-identical) to the unfused

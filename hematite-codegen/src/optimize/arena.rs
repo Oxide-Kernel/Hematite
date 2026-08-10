@@ -462,13 +462,14 @@ mod tests {
 
     #[test]
     fn arena_offsets_contract_violations_error_before_planning() {
-        // 65 tensors exceed the planner's MAX_TENSORS arrays.
+        // 256 tensors exceed the planner's MAX_TENSORS arrays (T1.3 raised
+        // the cap from 64 to 255 for the wide zoo subgraphs).
         let many_tensors: Vec<ParsedTensor<'static>> =
-            (0..65).map(|_| tensor("t", &[1], INT8)).collect();
+            (0..256).map(|_| tensor("t", &[1], INT8)).collect();
         let ops = vec![op(&[0], &[1])];
         let err = plan_from_pieces(&many_tensors, &ops, &[0], &[1])
-            .expect_err("65 tensors exceed MAX_TENSORS");
-        assert_eq!(err, ArenaError::TooManyTensors { count: 65 });
+            .expect_err("256 tensors exceed MAX_TENSORS");
+        assert_eq!(err, ArenaError::TooManyTensors { count: 256 });
 
         // An op with 5 real inputs exceeds MAX_IO_PER_OP.
         let tensors = vec![
@@ -517,6 +518,65 @@ mod tests {
         assert_eq!(plan.tensor_count, 4);
         for off in plan.offsets.iter().take(4) {
             assert_eq!(*off, OFFSET_NONE);
+        }
+    }
+
+    /// All six zoo models, same paths as the fused-pattern profile
+    /// (optimize/profile.rs) and model_validation.rs.
+    const SINE_TFLITE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/sine.tflite"
+    ));
+    const HELLO_WORLD_TFLITE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/zoo/sine_regression/hello_world_int8.tflite"
+    ));
+    const KWS_TFLITE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/zoo/keyword_spotting/kws_micro_speech_int8.tflite"
+    ));
+    const ANOMALY_TFLITE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/zoo/anomaly_detect/anomaly_detect_int8.tflite"
+    ));
+    const PERSON_DETECT_TFLITE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/zoo/person_detect_vww/person_detect_int8.tflite"
+    ));
+    const MOBILENET_V2_TFLITE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/zoo/mobilenetv2_cls/mobilenet_v2_1.0_224_int8.tflite"
+    ));
+
+    /// T1.3 — per-model arena peak pinned from `plan_arena` over the real
+    /// zoo models (recorded in local-notes/evidence/composed-kernels/t13-arena.md).
+    /// Every arena-emitted model must fit MAX_INTERNAL = 512 KiB; models
+    /// that exceed it (mobilenet_v2: the 224×224×32 first-conv activation
+    /// alone is ~1.6 MiB) keep per-tensor stack emission instead.
+    #[test]
+    fn arena_peaks_pinned_for_zoo_models() {
+        let cases: [(&str, &[u8], Result<usize, ArenaError>); 6] = [
+            ("sine", SINE_TFLITE, Ok(0)),
+            ("hello_world", HELLO_WORLD_TFLITE, Ok(32)),
+            ("kws", KWS_TFLITE, Ok(5_968)),
+            ("anomaly_detect", ANOMALY_TFLITE, Ok(272)),
+            ("person_detect", PERSON_DETECT_TFLITE, Ok(55_296)),
+            ("mobilenet_v2", MOBILENET_V2_TFLITE, Err(ArenaError::Layout(LayoutError::Oversized))),
+        ];
+        for (name, bytes, expected) in cases {
+            let model = parse(bytes).unwrap_or_else(|e| panic!("{name}: parse: {e}"));
+            let got = plan_arena(&model).map(|p| p.peak_arena_bytes);
+            assert_eq!(
+                got,
+                expected,
+                "{name}: arena peak diverged from the pinned value (T1.3 evidence)"
+            );
+            if let Ok(peak) = got {
+                assert!(
+                    peak <= MAX_INTERNAL,
+                    "{name}: arena peak {peak} exceeds the 512 KiB device budget"
+                );
+            }
         }
     }
 }

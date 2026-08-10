@@ -35,7 +35,7 @@ pub(crate) mod optimize;
 #[proc_macro_attribute]
 pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
     let proc_item = proc_macro2::TokenStream::from(item);
-    parse_and_emit_impl(attr, proc_item, true).into()
+    parse_and_emit_impl(attr, proc_item, true, true).into()
 }
 
 /// Test-support attribute: identical to [`model`], but emits the UNFUSED
@@ -44,17 +44,29 @@ pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn model_unfused(attr: TokenStream, item: TokenStream) -> TokenStream {
     let proc_item = proc_macro2::TokenStream::from(item);
-    parse_and_emit_impl(attr, proc_item, false).into()
+    parse_and_emit_impl(attr, proc_item, false, true).into()
+}
+
+/// Test-support attribute: identical to [`model`] (fused schedule honored)
+/// but with the T1.3 liveness arena DISABLED — intermediates are per-tensor
+/// stack arrays, the `stack` arm of the arena-vs-stack bit-exactness gate.
+#[proc_macro_attribute]
+pub fn model_stack(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let proc_item = proc_macro2::TokenStream::from(item);
+    parse_and_emit_impl(attr, proc_item, true, false).into()
 }
 
 /// Read + parse the model and route through the emitter, all within one
 /// scope so the parsed model (which borrows the file bytes) stays alive
 /// through emission.  `fused: true` precomputes the fusion schedule and
 /// passes it to the emitter (T1.2); `false` emits per-op only.
+/// `arena: true` enables the T1.3 liveness arena for intermediates;
+/// `false` forces per-tensor stack arrays (`#[model_stack]` test arm).
 fn parse_and_emit_impl(
     attr: TokenStream,
     proc_item: proc_macro2::TokenStream,
     fused: bool,
+    arena: bool,
 ) -> proc_macro2::TokenStream {
     let path = match model_path_from_attr(&attr) {
         Ok(p) => p,
@@ -81,7 +93,11 @@ fn parse_and_emit_impl(
     };
     let emitted = if fused {
         let schedule = optimize::fusion::fuse(&model);
-        generate::emit_model_fused(&model, &schedule)
+        if arena {
+            generate::emit_model_fused(&model, &schedule)
+        } else {
+            generate::emit_model_stack_fused(&model, &schedule)
+        }
     } else {
         generate::emit_model(&model)
     };
