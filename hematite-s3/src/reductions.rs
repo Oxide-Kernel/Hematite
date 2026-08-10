@@ -282,7 +282,14 @@ fn mean_accx_dispatch(
     if needs_channel_pad && positions * padded_c > 4096 {
         return Ok(false);
     }
-    let mut accs = [0i32; 256];
+    // EE.VLD.128 / EE.VST.128 require 16-byte alignment (depthwise enforces
+    // it with `(off + 15) & !15`); misaligned VST silently zeroed accs on
+    // device (task-21 finding — const-test with a 16-aligned static passed).
+    #[repr(align(16))]
+    struct AlignedStage([i8; 4096]);
+    #[repr(align(16))]
+    struct AlignedAccs([i32; 256]);
+    let mut accs = AlignedAccs([0i32; 256]);
     let count = (in_h * in_w) as i32;
     let mult = params.output_multiplier;
     let shift = params.output_shift;
@@ -294,12 +301,12 @@ fn mean_accx_dispatch(
     // local scoped to the branch below would be dropped (stack slot reused)
     // before `mean_reduce` reads it, producing a dangling input pointer
     // (task-18 device finding: all-zero lane sums).
-    let mut padded_stage = [0i8; 4096];
+    let mut padded_stage = AlignedStage([0i8; 4096]);
     let k_input: *const i8;
     unsafe {
         if needs_channel_pad {
             let src = input.as_ptr();
-            let dst = padded_stage.as_mut_ptr();
+            let dst = padded_stage.0.as_mut_ptr();
             for pos in 0..positions {
                 core::ptr::copy_nonoverlapping(
                     src.add(pos * in_c),
@@ -307,15 +314,15 @@ fn mean_accx_dispatch(
                     in_c,
                 );
             }
-            k_input = padded_stage.as_ptr();
+            k_input = padded_stage.0.as_ptr();
         } else {
             k_input = input.as_ptr();
         }
-        reduction_simd::mean_reduce(k_input, accs.as_mut_ptr(), positions, padded_c);
+        reduction_simd::mean_reduce(k_input, accs.0.as_mut_ptr(), positions, padded_c);
     }
 
     for oc in 0..in_c {
-        let acc = accs[oc];
+        let acc = accs.0[oc];
         let averaged = if count == 0 { 0 } else { round_half_away_zero(acc, count) };
         let scaled = multiply_by_quantized_multiplier(averaged, mult, shift);
         let val = (scaled + out_off).max(act_min).min(act_max);

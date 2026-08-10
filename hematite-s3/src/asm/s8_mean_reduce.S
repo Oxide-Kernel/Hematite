@@ -17,13 +17,13 @@
 #
 # Restriction: in_c % 16 == 0 (the caller zero-pads the channel dimension up
 # to 16 in scratch when in_c % 16 != 0), in_c >= 16, positions >= 1,
-# input/ones 16-byte aligned, acc_out 4-byte aligned.
+# input/ones/acc_out 16-byte aligned (EE.VLD.128 / EE.VST.128 require it).
 #
 # ABI (windowed, 5 args — caller a10..a14 = callee a2..a6):
 #   s8_mean_reduce(input, ones, acc_out, positions, in_c)
 #     a2=input (flattened [positions, in_c], 16-aligned)
 #     a3=ones (16 bytes 0x01, 16-aligned)
-#     a4=acc_out (in_c int32, 4-aligned; advances 4*16 bytes per group)
+#     a4=acc_out (in_c int32, 16-aligned; advances 4*16 bytes per group)
 #     a5=positions (number of spatial positions summed)
 #     a6=in_c (multiple of 16, >= 16)
 #   Clobbers a8..a15 + q0/q1/q3/q6; preserves a2/a3/a4.

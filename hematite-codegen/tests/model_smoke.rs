@@ -492,10 +492,14 @@ fn sine_model_predict_with_mock_backend() {
 
     // predict_with_scratch: sized scratch array, caller-provided output.
     let mut out_buf = [0i8; 1];
-    let mut scratch = [0u8; 0];
+    let mut scratch = [0u8; 4];
     let r = model.predict_with_scratch(&[5], &mut out_buf, &mut scratch);
     assert_eq!(r, Ok(()));
     assert_eq!(out_buf, [2]);
+
+    let mut tiny = [0u8; 0];
+    let r2 = model.predict_with_scratch(&[5], &mut out_buf, &mut tiny);
+    assert_eq!(r2, Err(hematite_core::KernelError::ScratchTooSmall));
 }
 
 #[test]

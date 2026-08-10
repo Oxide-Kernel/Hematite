@@ -970,6 +970,186 @@ fn bench_mv2real_model(clock: &mut RealClock, canary: &mut StackCanary) {
         panic!("mv2real model: {}", e.describe());
     }
 }
+
+/// Profile Model C (mv2real) per-layer s3 CCOUNT deltas (todo-21).
+///
+/// One untimed full s3 run populates every layer's input buffer; each layer
+/// is then timed alone via `run_repeated` (N>=10, min/median).
+fn profile_mv2real_s3_layers(canary: &mut StackCanary) {
+    let arena = unsafe { &mut SRAM_ARENA.0[..] };
+    let mut bufs = match crate::model_mv2real::carve_mv2real_into(arena) {
+        Ok(b) => b,
+        Err(_) => panic!("arena too small for MV2REAL layer profile"),
+    };
+    #[repr(align(16))]
+    struct AlignedScratch([u8; 16384]);
+    let mut scratch = AlignedScratch([0u8; 16384]);
+    crate::model_mv2real::fill_pattern_mv2real(
+        bufs.input, bufs.l1w, bufs.l1b, bufs.l2w, bufs.l2b, bufs.l3w, bufs.l3b, bufs.l4w, bufs.l4b,
+        bufs.l5w, bufs.l5b, bufs.l6w, bufs.l6b,
+    );
+    let _ = crate::model_mv2real::run_mv2real_s3(&mut bufs, &mut scratch.0[..]);
+    let cfg = BenchmarkConfig::default();
+    let mut clock = RealClock;
+
+    let mut rows: [(&str, u64); 6] = [("", 0); 6];
+
+    let log = run_repeated(
+        &mut clock,
+        &mut || {
+            let _ = hematite_s3::conv3x3::conv2d_3x3(bufs.input, bufs.l1w, bufs.l1b, &crate::model_mv2real::C1_PARAMS, bufs.l1out, &mut scratch.0[..]);
+        },
+        &cfg,
+    );
+    rows[0] = ("L1 conv3x3 s2", summarize(&log).map(|s| s.min_cycles).unwrap_or(0));
+
+    let log = run_repeated(
+        &mut clock,
+        &mut || {
+            let _ = hematite_s3::depthwise::depthwise_conv2d(bufs.l1out, bufs.l2w, bufs.l2b, &crate::model_mv2real::C2_PARAMS, bufs.l2out, &mut scratch.0[..]);
+        },
+        &cfg,
+    );
+    rows[1] = ("L2 depthwise s1", summarize(&log).map(|s| s.min_cycles).unwrap_or(0));
+
+    let log = run_repeated(
+        &mut clock,
+        &mut || {
+            let _ = hematite_s3::conv1x1::conv2d_1x1(bufs.l2out, bufs.l3w, bufs.l3b, &crate::model_mv2real::C3_PARAMS, bufs.l3out, &mut scratch.0[..]);
+        },
+        &cfg,
+    );
+    rows[2] = ("L3 conv1x1", summarize(&log).map(|s| s.min_cycles).unwrap_or(0));
+
+    let log = run_repeated(
+        &mut clock,
+        &mut || {
+            let _ = hematite_s3::depthwise::depthwise_conv2d(bufs.l3out, bufs.l4w, bufs.l4b, &crate::model_mv2real::C4_PARAMS, bufs.l4out, &mut scratch.0[..]);
+        },
+        &cfg,
+    );
+    rows[3] = ("L4 depthwise s2", summarize(&log).map(|s| s.min_cycles).unwrap_or(0));
+
+    let log = run_repeated(
+        &mut clock,
+        &mut || {
+            let _ = hematite_s3::conv1x1::conv2d_1x1(bufs.l4out, bufs.l5w, bufs.l5b, &crate::model_mv2real::C5_PARAMS, bufs.l5out, &mut scratch.0[..]);
+        },
+        &cfg,
+    );
+    rows[4] = ("L5 conv1x1", summarize(&log).map(|s| s.min_cycles).unwrap_or(0));
+
+    let log = run_repeated(
+        &mut clock,
+        &mut || {
+            let _ = hematite_s3::gemm::fully_connected(bufs.l5out, bufs.l6w, bufs.l6b, &crate::model_mv2real::C6_PARAMS, bufs.out, &mut scratch.0[..]);
+        },
+        &cfg,
+    );
+    rows[5] = ("L6 fc", summarize(&log).map(|s| s.min_cycles).unwrap_or(0));
+
+    firmware_log!("mv2real per-layer s3 (min cyc):");
+    for (name, cyc) in rows {
+        firmware_log!("  {} {}", name, cyc);
+    }
+
+    // Raw-kernel floor probes (todo-21): time the bare asm kernel calls with
+    // NO Rust per-pixel dispatch / requantize, to split kernel floor vs
+    // dispatcher overhead for Model C's shapes.
+    #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+    {
+        let mut ccount = crate::timing::read_ccount;
+        // L1 shape: conv3x3 fast16, out_c=32, row_delta=(17-3)*16=224.
+        let n = 64u32;
+        let t0 = ccount();
+        let mut sink: u32 = 0;
+        for _ in 0..n {
+            unsafe {
+                hematite_s3::accx::accx_conv3x3(
+                    bufs.input.as_ptr(),
+                    bufs.l1w.as_ptr(),
+                    bufs.l1b.as_ptr() as *const i32 as *mut i32,
+                    16,
+                    32,
+                    224,
+                );
+            }
+            sink = sink.wrapping_add(1);
+        }
+        let t1 = ccount();
+        firmware_log!(
+            "probe accx_conv3x3 L1 shape: {} cyc/call (n={})",
+            (t1 - t0) / n,
+            n
+        );
+        // L3 shape: conv1x1 in_c=32, out_c=64.
+        let t0 = ccount();
+        for _ in 0..n {
+            unsafe {
+                hematite_s3::accx::accx_conv1x1(
+                    bufs.input.as_ptr(),
+                    bufs.l1w.as_ptr(),
+                    bufs.l1b.as_ptr() as *const i32 as *mut i32,
+                    32,
+                    64,
+                );
+            }
+            sink = sink.wrapping_add(1);
+        }
+        let t1 = ccount();
+        firmware_log!(
+            "probe accx_conv1x1 L3 shape: {} cyc/call (n={})",
+            (t1 - t0) / n,
+            n
+        );
+        // L5 shape: conv1x1 in_c=64, out_c=128.
+        let t0 = ccount();
+        for _ in 0..n {
+            unsafe {
+                hematite_s3::accx::accx_conv1x1(
+                    bufs.input.as_ptr(),
+                    bufs.l1w.as_ptr(),
+                    bufs.l1b.as_ptr() as *const i32 as *mut i32,
+                    64,
+                    128,
+                );
+            }
+            sink = sink.wrapping_add(1);
+        }
+        let t1 = ccount();
+        firmware_log!(
+            "probe accx_conv1x1 L5 shape: {} cyc/call (n={})",
+            (t1 - t0) / n,
+            n
+        );
+        // L2 depthwise shape: in_c=32, out_c=32, row_delta=(8-3)*32=160.
+        let t0 = ccount();
+        for _ in 0..n {
+            unsafe {
+                hematite_s3::accx::accx_depthwise(
+                    bufs.input.as_ptr(),
+                    bufs.l1w.as_ptr(),
+                    bufs.l1b.as_ptr() as *const i32 as *mut i32,
+                    32,
+                    32,
+                    160,
+                );
+            }
+            sink = sink.wrapping_add(1);
+        }
+        let t1 = ccount();
+        firmware_log!(
+            "probe accx_depthwise L2 shape: {} cyc/call (n={})",
+            (t1 - t0) / n,
+            n
+        );
+        let _ = sink;
+    }
+
+    if let Err(e) = canary.verify() {
+        panic!("mv2real layer profile: {}", e.describe());
+    }
+}
  
 /// Emit a report row (defmt/RTT on hardware, UART0 under `qemu`).
 ///
@@ -1233,6 +1413,7 @@ pub fn run_benchmarks() -> ! {
     bench_cnn_model(&mut clock, &mut canary);
     bench_mv2_model(&mut clock, &mut canary);
     bench_mv2real_model(&mut clock, &mut canary);
+    profile_mv2real_s3_layers(&mut canary);
 
     // 5.5 Model-level registry — real zoo runners (todo 19). Runs before the
     // kernel loop for the same reason the A/B/C benches do: the loop ends in

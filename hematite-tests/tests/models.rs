@@ -139,7 +139,7 @@ mod models_sine_smoke {
             assert_bit_exact(&out, &models::sine::EXPECTED_OUTPUT, "sine_smoke");
 
             let mut out_buf = [0i8; 1];
-            let mut scratch = [0u8; 0];
+            let mut scratch = [0u8; 4];
             let r = model.predict_with_scratch(&models::sine::INPUT_DATA, &mut out_buf, &mut scratch);
             assert_eq!(r, Ok(()));
             assert_bit_exact(&out_buf, &models::sine::EXPECTED_OUTPUT, "sine_smoke_scratch");

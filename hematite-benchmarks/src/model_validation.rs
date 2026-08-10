@@ -137,9 +137,25 @@ mod model_sine {
     pub struct SineModel;
 }
 
+/// Carve `len` bytes of scratch from the 256 KB SRAM bench arena.
+///
+/// Validation runs before the kernel benches carve the arena (boot order), so
+/// the arena is free here. Generated `predict()` would size its own stack
+/// scratch from the model's real `SCRATCH_LEN` (up to ~34 KB for kws), which
+/// overflows the ~65 KB device stack once validation frames are counted — the
+/// validation path therefore goes through `predict_with_scratch` with an
+/// arena-backed buffer.
+fn carve_scratch(len: usize) -> &'static mut [u8] {
+    let base = unsafe { core::ptr::addr_of_mut!(crate::firmware::SRAM_ARENA) as *mut u8 };
+    let n = len.min(256 * 1024);
+    unsafe { core::slice::from_raw_parts_mut(base, n) }
+}
+
 fn validate_sine() {
     let m = model_sine::Model::<RefBackend>::new(RefBackend);
-    let out = m.predict(&model_sine::golden::INPUT_DATA);
+    let mut out = [0i8; model_sine::OUTPUT_LEN];
+    let scratch = carve_scratch(model_sine::SCRATCH_LEN);
+    let _ = m.predict_with_scratch(&model_sine::golden::INPUT_DATA, &mut out, scratch);
     report(&compare("sine", &out, &model_sine::golden::EXPECTED_OUTPUT));
 }
 
@@ -159,7 +175,9 @@ mod model_hello_world {
 
 fn validate_hello_world() {
     let m = model_hello_world::Model::<RefBackend>::new(RefBackend);
-    let out = m.predict(&model_hello_world::golden::INPUT_DATA);
+    let mut out = [0i8; model_hello_world::OUTPUT_LEN];
+    let scratch = carve_scratch(model_hello_world::SCRATCH_LEN);
+    let _ = m.predict_with_scratch(&model_hello_world::golden::INPUT_DATA, &mut out, scratch);
     report(&compare(
         "hello_world_int8",
         &out,
@@ -183,7 +201,9 @@ mod model_kws {
 
 fn validate_kws() {
     let m = model_kws::Model::<RefBackend>::new(RefBackend);
-    let out = m.predict(&model_kws::golden::INPUT_DATA);
+    let mut out = [0i8; model_kws::OUTPUT_LEN];
+    let scratch = carve_scratch(model_kws::SCRATCH_LEN);
+    let _ = m.predict_with_scratch(&model_kws::golden::INPUT_DATA, &mut out, scratch);
     report(&compare(
         "kws_micro_speech_int8",
         &out,
@@ -207,7 +227,9 @@ mod model_anomaly {
 
 fn validate_anomaly() {
     let m = model_anomaly::Model::<RefBackend>::new(RefBackend);
-    let out = m.predict(&model_anomaly::golden::INPUT_DATA);
+    let mut out = [0i8; model_anomaly::OUTPUT_LEN];
+    let scratch = carve_scratch(model_anomaly::SCRATCH_LEN);
+    let _ = m.predict_with_scratch(&model_anomaly::golden::INPUT_DATA, &mut out, scratch);
     report(&compare(
         "anomaly_detect_int8",
         &out,
@@ -353,10 +375,18 @@ fn report_s3(name: &'static str, s3_out: &[i8], ref_out: &[i8], golden: &[i8]) {
 }
 
 fn validate_s3_sine() {
-    let s3_out = model_sine::Model::<S3Backend>::new(S3Backend)
-        .predict(&model_sine::golden::INPUT_DATA);
-    let ref_out = model_sine::Model::<RefBackend>::new(RefBackend)
-        .predict(&model_sine::golden::INPUT_DATA);
+    let mut s3_out = [0i8; model_sine::OUTPUT_LEN];
+    {
+        let scratch = carve_scratch(model_sine::SCRATCH_LEN);
+        let _ = model_sine::Model::<S3Backend>::new(S3Backend)
+            .predict_with_scratch(&model_sine::golden::INPUT_DATA, &mut s3_out, scratch);
+    }
+    let mut ref_out = [0i8; model_sine::OUTPUT_LEN];
+    {
+        let scratch = carve_scratch(model_sine::SCRATCH_LEN);
+        let _ = model_sine::Model::<RefBackend>::new(RefBackend)
+            .predict_with_scratch(&model_sine::golden::INPUT_DATA, &mut ref_out, scratch);
+    }
     report_s3(
         "sine",
         &s3_out,
@@ -366,10 +396,18 @@ fn validate_s3_sine() {
 }
 
 fn validate_s3_hello_world() {
-    let s3_out = model_hello_world::Model::<S3Backend>::new(S3Backend)
-        .predict(&model_hello_world::golden::INPUT_DATA);
-    let ref_out = model_hello_world::Model::<RefBackend>::new(RefBackend)
-        .predict(&model_hello_world::golden::INPUT_DATA);
+    let mut s3_out = [0i8; model_hello_world::OUTPUT_LEN];
+    {
+        let scratch = carve_scratch(model_hello_world::SCRATCH_LEN);
+        let _ = model_hello_world::Model::<S3Backend>::new(S3Backend)
+            .predict_with_scratch(&model_hello_world::golden::INPUT_DATA, &mut s3_out, scratch);
+    }
+    let mut ref_out = [0i8; model_hello_world::OUTPUT_LEN];
+    {
+        let scratch = carve_scratch(model_hello_world::SCRATCH_LEN);
+        let _ = model_hello_world::Model::<RefBackend>::new(RefBackend)
+            .predict_with_scratch(&model_hello_world::golden::INPUT_DATA, &mut ref_out, scratch);
+    }
     report_s3(
         "hello_world_int8",
         &s3_out,
@@ -379,10 +417,18 @@ fn validate_s3_hello_world() {
 }
 
 fn validate_s3_kws() {
-    let s3_out =
-        model_kws::Model::<S3Backend>::new(S3Backend).predict(&model_kws::golden::INPUT_DATA);
-    let ref_out =
-        model_kws::Model::<RefBackend>::new(RefBackend).predict(&model_kws::golden::INPUT_DATA);
+    let mut s3_out = [0i8; model_kws::OUTPUT_LEN];
+    {
+        let scratch = carve_scratch(model_kws::SCRATCH_LEN);
+        let _ = model_kws::Model::<S3Backend>::new(S3Backend)
+            .predict_with_scratch(&model_kws::golden::INPUT_DATA, &mut s3_out, scratch);
+    }
+    let mut ref_out = [0i8; model_kws::OUTPUT_LEN];
+    {
+        let scratch = carve_scratch(model_kws::SCRATCH_LEN);
+        let _ = model_kws::Model::<RefBackend>::new(RefBackend)
+            .predict_with_scratch(&model_kws::golden::INPUT_DATA, &mut ref_out, scratch);
+    }
     report_s3(
         "kws_micro_speech_int8",
         &s3_out,
@@ -392,10 +438,18 @@ fn validate_s3_kws() {
 }
 
 fn validate_s3_anomaly() {
-    let s3_out = model_anomaly::Model::<S3Backend>::new(S3Backend)
-        .predict(&model_anomaly::golden::INPUT_DATA);
-    let ref_out = model_anomaly::Model::<RefBackend>::new(RefBackend)
-        .predict(&model_anomaly::golden::INPUT_DATA);
+    let mut s3_out = [0i8; model_anomaly::OUTPUT_LEN];
+    {
+        let scratch = carve_scratch(model_anomaly::SCRATCH_LEN);
+        let _ = model_anomaly::Model::<S3Backend>::new(S3Backend)
+            .predict_with_scratch(&model_anomaly::golden::INPUT_DATA, &mut s3_out, scratch);
+    }
+    let mut ref_out = [0i8; model_anomaly::OUTPUT_LEN];
+    {
+        let scratch = carve_scratch(model_anomaly::SCRATCH_LEN);
+        let _ = model_anomaly::Model::<RefBackend>::new(RefBackend)
+            .predict_with_scratch(&model_anomaly::golden::INPUT_DATA, &mut ref_out, scratch);
+    }
     report_s3(
         "anomaly_detect_int8",
         &s3_out,

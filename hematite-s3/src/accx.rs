@@ -434,7 +434,7 @@ mod device {
 }
 
 #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
-pub(crate) use device::*;
+pub use device::*;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Per-params uniform-scale cache (todo 16: prepared-path reuse on the public

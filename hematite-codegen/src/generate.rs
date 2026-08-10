@@ -23,8 +23,10 @@
 //!   params zero-point, exactly like the golden fixtures (all fixtures use
 //!   zp = 0, so these reduce to 0 there).
 //! * Scratch: a **macro-time** const, `SCRATCH_LEN`, computed as the max over
-//!   ops of the documented per-op scratch need (every `*_scratch_size` in the
-//!   current kernel set defaults to `0` → `SCRATCH_LEN = 0`).  Generated code
+//!   ops of the per-op scratch need recomputed from the parsed op params (the
+//!   S3 backend's `conv1x1_scratch_need` / `conv3x3_scratch_need` /
+//!   `depthwise_scratch_need` / `softmax_scratch_size` formulas, mirrored in
+//!   this file — see the `scratch_need_*` helpers below).  Generated code
 //!   sizes the scratch array with this const — never `[0u8; B::scratch()]`
 //!   inside a `const fn` (unstable const-trait-call trap).
 
@@ -192,9 +194,9 @@ pub(crate) fn emit_model(model: &ParsedModel) -> Result<TokenStream, String> {
     };
 
     Ok(quote! {
-        const INPUT_LEN: usize = #input_len_ts;
-        const OUTPUT_LEN: usize = #output_len_ts;
-        const SCRATCH_LEN: usize = #scratch_ts;
+        pub const INPUT_LEN: usize = #input_len_ts;
+        pub const OUTPUT_LEN: usize = #output_len_ts;
+        pub const SCRATCH_LEN: usize = #scratch_ts;
         #(#consts)*
         #(#tensor_types)*
         #wrapper
@@ -451,9 +453,21 @@ fn i32_le_lit(bytes: &[u8]) -> Result<TokenStream, String> {
     Ok(quote!([ #(#vals),* ]))
 }
 
+/// Emit an int8 weight/alpha const guaranteed 16-byte aligned.
+///
+/// The ACCX/FC SIMD dispatch gates on `(w_ptr as usize) % 16 == 0` — a plain
+/// `const W: [i8; N]` has alignment 1, so zoo-model weights (emitted consts)
+/// silently fell back to scalar while synthetic bench weights (carved into the
+/// 16-aligned arena) engaged SIMD. Wrapping in a `#[repr(C, align(16))]`
+/// struct forces the const data's alignment; call sites reference `&W.0`.
 fn const_i8(name: &Ident, bytes: &[u8], len: usize) -> TokenStream {
     let vals = i8_lit(bytes);
-    quote!(const #name: [i8; #len] = #vals;)
+    let ty = Ident::new(&format!("{name}Ty"), proc_macro2::Span::call_site());
+    quote! {
+        #[repr(C, align(16))]
+        struct #ty([i8; #len]);
+        const #name: #ty = #ty(#vals);
+    }
 }
 
 fn const_i32(name: &Ident, values: &[i32]) -> TokenStream {
@@ -534,7 +548,8 @@ fn bias_const(
 struct OpEmission {
     consts: Vec<TokenStream>,
     call: TokenStream,
-    /// Documented scratch need for this op (kernel `*_scratch_size` default 0).
+    /// Macro-time scratch bytes this op needs (mirrors the S3 backend's
+    /// `*_scratch_size` formulas; 0 when the op never touches scratch).
     scratch: usize,
 }
 
@@ -578,6 +593,99 @@ fn conv_quant(
         act_min,
         act_max,
     })
+}
+
+// ── Macro-time scratch-need computation ────────────────────────────────────
+//
+// The `KernelBackend` trait's `*_scratch_size` associated functions cannot be
+// called from this proc-macro (it runs at host compile time against a generic
+// `B`). Instead we recompute the S3 backend's documented scratch formulas
+// (hematite-s3/src/backend.rs, `conv1x1_scratch_need`,
+// `conv3x3_scratch_need`, `depthwise_scratch_need`, `softmax_scratch_size`)
+// directly from the parsed op params, which the macro always has. Backends
+// that ignore scratch (e.g. `RefBackend`) are unaffected — a larger
+// `SCRATCH_LEN` only sizes a stack array they never read. Keep these formulas
+// in sync with backend.rs.
+
+/// Round a channel count up to the TIE728 SIMD group width (16 lanes).
+const fn pad16(c: usize) -> usize {
+    (c + 15) & !15
+}
+
+/// Scratch bytes for a 1×1 conv (`conv1x1_scratch_need`).
+fn conv1x1_scratch_need_codegen(out_c: usize, input_offset: i32) -> usize {
+    let wsum = if input_offset != 0 { out_c * 4 } else { 0 };
+    out_c * 4 + wsum
+}
+
+/// Scratch bytes for the general conv path (`conv3x3_scratch_need`).
+fn conv3x3_scratch_need_codegen(
+    in_h: usize,
+    in_w: usize,
+    in_c: usize,
+    out_h: usize,
+    out_w: usize,
+    out_c: usize,
+    filter_h: i32,
+    filter_w: i32,
+    stride_h: i32,
+    stride_w: i32,
+    dil_h: i32,
+    dil_w: i32,
+    input_offset: i32,
+) -> usize {
+    let dilated_filter_h = (filter_h - 1) * dil_h + 1;
+    let dilated_filter_w = (filter_w - 1) * dil_w + 1;
+    let pad_total_h =
+        ((out_h as i32 - 1) * stride_h + dilated_filter_h - in_h as i32).max(0) as usize;
+    let pad_total_w =
+        ((out_w as i32 - 1) * stride_w + dilated_filter_w - in_w as i32).max(0) as usize;
+    let padded_c = pad16(in_c);
+    let needs_pad = pad_total_h > 0 || pad_total_w > 0 || padded_c != in_c;
+    let wsum = if input_offset != 0 { out_c * 4 } else { 0 };
+    if needs_pad {
+        let pad_input_len = (in_h + pad_total_h) * (in_w + pad_total_w) * padded_c;
+        let pad_weights_len = out_c * 9 * padded_c;
+        pad_input_len + pad_weights_len + out_c * 4 + wsum
+    } else {
+        out_c * 4 + wsum
+    }
+}
+
+/// Scratch bytes for the depthwise path (`depthwise_scratch_need`).
+#[allow(clippy::too_many_arguments)]
+fn depthwise_scratch_need_codegen(
+    in_h: usize,
+    in_w: usize,
+    in_c: usize,
+    out_h: usize,
+    out_w: usize,
+    out_c: usize,
+    filter_h: i32,
+    filter_w: i32,
+    stride_h: i32,
+    stride_w: i32,
+    dil_h: i32,
+    dil_w: i32,
+    input_offset: i32,
+) -> usize {
+    let dilated_filter_h = (filter_h - 1) * dil_h + 1;
+    let dilated_filter_w = (filter_w - 1) * dil_w + 1;
+    let pad_total_h =
+        ((out_h as i32 - 1) * stride_h + dilated_filter_h - in_h as i32).max(0) as usize;
+    let pad_total_w =
+        ((out_w as i32 - 1) * stride_w + dilated_filter_w - in_w as i32).max(0) as usize;
+    let padded_c = pad16(in_c);
+    let needs_channel_pad = padded_c != in_c;
+    let needs_pad = pad_total_h > 0 || pad_total_w > 0 || needs_channel_pad;
+    let wsum = if input_offset != 0 { out_c * 4 } else { 0 };
+    if needs_pad {
+        let pad_input_len = (in_h + pad_total_h) * (in_w + pad_total_w) * padded_c;
+        let pad_filter_len = if needs_channel_pad { 9 * padded_c } else { 0 };
+        pad_input_len + pad_filter_len + padded_c * 4 + wsum
+    } else {
+        out_c * 4 + wsum
+    }
 }
 
 fn emit_op(
@@ -636,10 +744,12 @@ fn emit_conv2d(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp
     let input = tensor_at(model.tensors(), in_t)?;
     let weights = tensor_at(model.tensors(), w_t)?;
     let output = tensor_at(model.tensors(), out_t)?;
-    let input_shape = arr4(shape4(&input.shape)?);
+    let input_raw = shape4(&input.shape)?;
+    let input_shape = arr4(input_raw);
     let filter_raw = shape4(&weights.shape)?;
     let filter_shape = arr4(filter_raw);
-    let output_shape = arr4(shape4(&output.shape)?);
+    let output_raw = shape4(&output.shape)?;
+    let output_shape = arr4(output_raw);
     let out_channels = filter_raw[0] as usize;
     let q = conv_quant(input, weights, output, out_channels, fused_activation)?;
     let input_offset = q.input_offset;
@@ -682,12 +792,31 @@ fn emit_conv2d(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp
     let src = src_expr(storage, in_t as usize)?;
     let dst = dst_expr(storage, out_t as usize)?;
     let call = quote! {
-        backend.conv2d(#src, &#w_name, &#b_name, &#p_name, #dst, scratch)?;
+        backend.conv2d(#src, &#w_name.0, &#b_name, &#p_name, #dst, scratch)?;
+    };
+    let scratch = if filter_raw[1] == 1 && filter_raw[2] == 1 {
+        conv1x1_scratch_need_codegen(out_channels, input_offset)
+    } else {
+        conv3x3_scratch_need_codegen(
+            input_raw[1].max(0) as usize,
+            input_raw[2].max(0) as usize,
+            input_raw[3].max(0) as usize,
+            output_raw[1].max(0) as usize,
+            output_raw[2].max(0) as usize,
+            output_raw[3].max(0) as usize,
+            filter_raw[1],
+            filter_raw[2],
+            stride_h,
+            stride_w,
+            dilation_h,
+            dilation_w,
+            input_offset,
+        )
     };
     Ok(OpEmission {
         consts: vec![weights_c, bias_c, mult_c, shift_c, params_c],
         call,
-        scratch: 0,
+        scratch,
     })
 }
 
@@ -720,10 +849,12 @@ fn emit_depthwise(model: &ParsedModel, storage: &[Storage], i: usize, op: &Parse
     let input = tensor_at(model.tensors(), in_t)?;
     let weights = tensor_at(model.tensors(), w_t)?;
     let output = tensor_at(model.tensors(), out_t)?;
-    let input_shape = arr4(shape4(&input.shape)?);
+    let input_raw = shape4(&input.shape)?;
+    let input_shape = arr4(input_raw);
     let filter_raw = shape4(&weights.shape)?;
     let filter_shape = arr4(filter_raw);
-    let output_shape = arr4(shape4(&output.shape)?);
+    let output_raw = shape4(&output.shape)?;
+    let output_shape = arr4(output_raw);
     let out_channels = filter_raw[3] as usize;
     let q = conv_quant(input, weights, output, out_channels, fused_activation)?;
     let input_offset = q.input_offset;
@@ -767,12 +898,27 @@ fn emit_depthwise(model: &ParsedModel, storage: &[Storage], i: usize, op: &Parse
     let src = src_expr(storage, in_t as usize)?;
     let dst = dst_expr(storage, out_t as usize)?;
     let call = quote! {
-        backend.depthwise_conv2d(#src, &#w_name, &#b_name, &#p_name, #dst, scratch)?;
+        backend.depthwise_conv2d(#src, &#w_name.0, &#b_name, &#p_name, #dst, scratch)?;
     };
+    let scratch = depthwise_scratch_need_codegen(
+        input_raw[1].max(0) as usize,
+        input_raw[2].max(0) as usize,
+        input_raw[3].max(0) as usize,
+        output_raw[1].max(0) as usize,
+        output_raw[2].max(0) as usize,
+        output_raw[3].max(0) as usize,
+        filter_raw[1],
+        filter_raw[2],
+        stride_h,
+        stride_w,
+        dilation_h,
+        dilation_w,
+        input_offset,
+    );
     Ok(OpEmission {
         consts: vec![weights_c, bias_c, mult_c, shift_c, params_c],
         call,
-        scratch: 0,
+        scratch,
     })
 }
 
@@ -830,13 +976,15 @@ fn emit_fully_connected(model: &ParsedModel, storage: &[Storage], i: usize, op: 
     let src = src_expr(storage, in_t as usize)?;
     let dst = dst_expr(storage, out_t as usize)?;
     let call = quote! {
-        backend.fully_connected(#src, &#w_name, &#b_name, &#p_name, #dst, scratch)?;
+        backend.fully_connected(#src, &#w_name.0, &#b_name, &#p_name, #dst, scratch)?;
     };
     let _ = batches;
+    let out_dim = output_dim as usize;
+    let fc_scratch = out_dim * 4 + if input_offset != 0 { out_dim * 4 } else { 0 };
     Ok(OpEmission {
         consts: vec![weights_c, bias_c, mult_c, shift_c, params_c],
         call,
-        scratch: 0,
+        scratch: fc_scratch,
     })
 }
 
@@ -993,7 +1141,7 @@ fn emit_softmax(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedO
     Ok(OpEmission {
         consts: vec![params_c],
         call,
-        scratch: 0,
+        scratch: (row_size.max(0) as usize) * 4,
     })
 }
 
@@ -1167,7 +1315,7 @@ fn emit_prelu(
                 output_multiplier_identity: 0,
                 output_shift_identity: 0,
                 alpha_offset: #alpha_zp,
-                alpha_data: &#a_name,
+                alpha_data: &#a_name.0,
                 output_multiplier_1: #m1,
                 output_shift_1: #s1,
                 output_multiplier_2: #m2,
@@ -1577,11 +1725,15 @@ mod tests {
         assert!(s.contains("INPUT_LEN:usize=1usize"));
         assert!(s.contains("OUTPUT_LEN:usize=1usize"));
 
-        // Scratch computed at macro time — kernels' *_scratch_size default 0.
-        assert!(s.contains("SCRATCH_LEN:usize=0usize"));
+        // Scratch computed at macro time — FC 1→1, input_offset 0 →
+        // output_dim*4 + 0 = 4 (mirrors the gemm ACCX `need` formula).
+        assert!(s.contains("SCRATCH_LEN:usize=4usize"));
 
-        // Weight/bias consts from buffer bytes.
-        assert!(s.contains("WEIGHTS_0:[i8;1usize]=[51i8]"), "weight const wrong: {s}");
+        // Weight/bias consts from buffer bytes. Weights are wrapped in a
+        // `#[repr(C, align(16))]` struct so the ACCX/FC SIMD `w_ptr % 16 == 0`
+        // alignment gate engages (see `const_i8`).
+        assert!(s.contains("structWEIGHTS_0Ty([i8;1usize])"), "weight wrapper missing: {s}");
+        assert!(s.contains("constWEIGHTS_0:WEIGHTS_0Ty=WEIGHTS_0Ty([51i8])"), "weight const wrong: {s}");
         assert!(s.contains("BIAS_0:[i32;1usize]=[-3i32]"), "bias const wrong: {s}");
 
         // FC params: input_dim=1, output_dim=1, per-channel quant
