@@ -619,6 +619,7 @@ fn conv1x1_scratch_need_codegen(out_c: usize, input_offset: i32) -> usize {
 }
 
 /// Scratch bytes for the general conv path (`conv3x3_scratch_need`).
+#[allow(clippy::too_many_arguments)]
 fn conv3x3_scratch_need_codegen(
     in_h: usize,
     in_w: usize,
