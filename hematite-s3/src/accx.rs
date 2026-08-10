@@ -272,14 +272,37 @@ pub(crate) fn requantize_1x1(ctx: &mut ReqCtx<'_>) {
             }
         }
     } else {
-        // Per-channel mult/shift — the general path.
+        // Per-channel mult/shift — the general path, with an inline
+        // single-pass fast-scale detect (todo 16). When the FIRST channel's
+        // pair is the identity/half-round scale, channels sharing that pair
+        // use the proven bit-identical fast forms instead of the i64
+        // `multiply_by_quantized_multiplier`. There is NO upfront O(n)
+        // uniform_scale scan here — this is the bit-exact no-scan path the
+        // public conv1x1 / fc dispatches use (the prepared handles pass the
+        // once-computed uniform hint and take the faster branches above).
+        let m0 = ctx.multipliers.first().copied().unwrap_or(0);
+        let s0 = ctx.shifts.first().copied().unwrap_or(0);
+        let fast = m0 == 1 << 30 && (s0 == 0 || s0 == 1);
         for (oc, &raw) in ctx.accs.iter().enumerate() {
+            let m = unsafe { *ctx.multipliers.get_unchecked(oc) };
+            let s = unsafe { *ctx.shifts.get_unchecked(oc) };
             let acc = raw + unsafe { *ctx.bias.get_unchecked(oc) };
-            let scaled = multiply_by_quantized_multiplier(
-                acc,
-                unsafe { *ctx.multipliers.get_unchecked(oc) },
-                unsafe { *ctx.shifts.get_unchecked(oc) },
-            );
+            let scaled = if fast && m == m0 && s == s0 {
+                if s0 == 1 {
+                    // Identity scale: scaled == acc.
+                    acc
+                } else {
+                    // (acc + 1) >> 1 via the overflow-free 32-bit form
+                    // `srai(acc,1) + (acc&1)` — bit-identical to the i64
+                    // reference for every i32 acc (see the
+                    // `half_round_overflow_free_form_matches_i64_reference`
+                    // test) and far cheaper than i64 arithmetic on 32-bit
+                    // Xtensa (the i64 form cost ~2x an upfront scan).
+                    (acc >> 1).wrapping_add(acc & 1)
+                }
+            } else {
+                multiply_by_quantized_multiplier(acc, m, s)
+            };
             let c = clamp(scaled + out_offset, act_min, act_max);
             unsafe {
                 *ctx.output.get_unchecked_mut(out_base + oc) = saturating_cast(c);
@@ -413,6 +436,89 @@ mod device {
 #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
 pub(crate) use device::*;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-params uniform-scale cache (todo 16: prepared-path reuse on the public
+// API). The ACCX dispatchers used to re-run the O(out_c) uniform_scale scan on
+// EVERY call — the dominant per-call overhead (~1100 cyc for 64ch on device,
+// flash-load bound). The prepared handles cache the hint at construction, but
+// `Model::<S3Backend>` / the bench call the PUBLIC free functions, which get
+// fresh params every call and would re-scan each time. This tiny cache makes
+// the scan happen ONCE per params identity.
+//
+// Soundness: keyed on the params address AND the mult/shift slice pointers; a
+// hit is only trusted when all three match the cached entry, so a transient
+// (stack) params that reuses an address with different arrays misses and
+// recomputes. The cache therefore assumes callers never mutate a mult/shift
+// array IN PLACE across calls — true for every workspace caller (the arrays
+// are `const` statics: spec.rs MULT_*/SHIFT_*, codegen-emitted consts;
+// simd_validation's stack params point at those same consts). The hint only
+// selects a bit-exact requantize fast path — it never changes the output.
+//
+// Device-only and single-threaded (the firmware runs one task on one core;
+// the cache is never touched from an interrupt handler), so a `static mut` is
+// sound here and the host (where SIMD is compiled out) never sees it.
+#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+mod scale_cache {
+    const CAP: usize = 8;
+
+    #[derive(Clone, Copy)]
+    struct Entry {
+        key: usize,
+        mult: usize,
+        shift: usize,
+        hint: (i32, i32),
+    }
+
+    static mut ENTRIES: [Option<Entry>; CAP] = [None; CAP];
+    static mut NEXT: usize = 0;
+
+    /// Look up the cached hint for `(key, mult, shift)`, if present.
+    ///
+    /// # Safety
+    /// Single-threaded callers only (see module doc).
+    pub unsafe fn lookup(key: usize, mult: *const i32, shift: *const i32) -> Option<(i32, i32)> {
+        let entries = core::ptr::addr_of!(ENTRIES);
+        for i in 0..CAP {
+            let e = &*(*entries).as_ptr().add(i);
+            if let Some(e) = e {
+                if e.key == key && e.mult == mult as usize && e.shift == shift as usize {
+                    return Some(e.hint);
+                }
+            }
+        }
+        None
+    }
+
+    /// Insert (or round-robin replace) the hint for `(key, mult, shift)`.
+    ///
+    /// # Safety
+    /// Single-threaded callers only (see module doc).
+    pub unsafe fn insert(key: usize, mult: *const i32, shift: *const i32, hint: (i32, i32)) {
+        let slot = &mut *(*core::ptr::addr_of_mut!(ENTRIES)).as_mut_ptr().add(NEXT % CAP);
+        *slot = Some(Entry { key, mult: mult as usize, shift: shift as usize, hint });
+        NEXT = NEXT.wrapping_add(1);
+    }
+}
+
+/// Uniform-scale hint for an ACCX dispatch, computed once per params identity
+/// and cached thereafter (todo 16). `i32::MIN` shift = per-channel (the
+/// requantize epilogue then selects fast scales inline per channel).
+///
+/// Device-only: the host path never dispatches SIMD.
+#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+pub(crate) fn uniform_hint(params_key: usize, mult: &[i32], shift: &[i32]) -> (i32, i32) {
+    unsafe {
+        if let Some(h) = scale_cache::lookup(params_key, mult.as_ptr(), shift.as_ptr()) {
+            return h;
+        }
+    }
+    let hint = uniform_scale(mult, shift).unwrap_or((0, i32::MIN));
+    unsafe {
+        scale_cache::insert(params_key, mult.as_ptr(), shift.as_ptr(), hint);
+    }
+    hint
+}
+
 #[cfg(test)]
 mod tests {
     extern crate alloc;
@@ -510,6 +616,61 @@ mod tests {
         for (oc, &g) in got.iter().enumerate() {
             let want = ref_requantize(accs[oc], bias[oc], muls[oc], shifts[oc], 7, -100, 100);
             assert_eq!(g, want, "per-channel channel {oc}: fast {g} != ref {want}");
+        }
+    }
+
+    /// The todo-16 inline fast-scale detect (the per-channel arm with no
+    /// upfront scan): the FIRST channel's pair is a fast scale but later
+    /// channels mix other fast pairs, a hoisted-uniform candidate, and an
+    /// arbitrary scale — every channel must still equal the i64 reference.
+    #[test]
+    fn detect_arm_partial_fast_mix_matches_reference() {
+        let accs: Vec<i32> = (0..64)
+            .map(|i| {
+                let x = (i as i64 * 40503) % (1 << 20) - (1 << 19); // ~±512k
+                x as i32
+            })
+            .collect();
+        let bias: Vec<i32> = (0..64).map(|i| (i as i32) * 40503 - 50_000).collect();
+
+        // Channel 0: identity fast pair (1<<30, 1) — primes the detect.
+        // Channels 1..=7: (1<<30, 0) — ALSO fast pairs, but != the first pair,
+        // so they must take the general multiply path (not the identity form).
+        // Channels 8..=15: (1<<30, 2) — hoisted-uniform candidate → general.
+        // Channels 16..: arbitrary per-channel scales.
+        let muls: Vec<i32> = (0..64)
+            .map(|i| {
+                if i < 16 {
+                    1 << 30
+                } else {
+                    (1 << 30) - (i as i32) * 7919
+                }
+            })
+            .collect();
+        let shifts: Vec<i32> = (0..64)
+            .map(|i| {
+                if i == 0 {
+                    1
+                } else if i < 8 {
+                    0
+                } else if i < 16 {
+                    2
+                } else if i % 2 == 0 {
+                    0
+                } else {
+                    1
+                }
+            })
+            .collect();
+
+        let got = run_fast_path(&accs, &bias, &muls, &shifts, 3, -100, 100, None);
+        for (oc, &g) in got.iter().enumerate() {
+            let want = ref_requantize(accs[oc], bias[oc], muls[oc], shifts[oc], 3, -100, 100);
+            assert_eq!(
+                g, want,
+                "detect-arm channel {oc} (m={},s={}): fast {g} != ref {want}",
+                muls[oc], shifts[oc]
+            );
         }
     }
 

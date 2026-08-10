@@ -59,9 +59,13 @@ pub(crate) struct FcAccxCtx<'a> {
 ///
 /// Returns `Ok(true)` when the ACCX path handled the layer, `Ok(false)` when
 /// the layer is not ACCX-eligible (caller falls through to scalar).
+///
+/// `uniform` is the precomputed uniform-scale hint `(mult, shift)` —
+/// `i32::MIN` shift means "per-channel" (the requantize epilogue selects the
+/// fast scale inline, no upfront O(n) scan; todo 16).
 #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
 #[inline(never)]
-fn fc_accx_dispatch(ctx: &mut FcAccxCtx<'_>) -> Result<bool, KernelError> {
+fn fc_accx_dispatch(ctx: &mut FcAccxCtx<'_>, uniform: (i32, i32)) -> Result<bool, KernelError> {
     let params = ctx.params;
     let input_dim = params.input_dim as usize;
     let output_dim = params.output_dim as usize;
@@ -103,10 +107,7 @@ fn fc_accx_dispatch(ctx: &mut FcAccxCtx<'_>) -> Result<bool, KernelError> {
     let act_min = params.quantized_activation_min;
     let act_max = params.quantized_activation_max;
     let out_offset = params.output_offset;
-    let (uniform_mult, uniform_shift) = match crate::accx::uniform_scale(multipliers, shifts) {
-        Some((m, s)) => (m, s),
-        None => (0, i32::MIN),
-    };
+    let (uniform_mult, uniform_shift) = uniform;
 
     unsafe {
         crate::accx::accx_conv1x1(in_ptr, w_ptr, accs, input_dim, output_dim);
@@ -144,6 +145,12 @@ pub struct PreparedFc {
     /// Whether the bespoke ACCX SIMD kernel is eligible on this target.
     accx: bool,
     params: &'static FullyConnectedParams<'static>,
+    /// Cached uniform-scale hint `(mult, shift)`; `i32::MIN` shift = per-channel.
+    /// Computed once at construction so `run` never re-scans the per-channel
+    /// arrays (the per-call cost is otherwise O(output_dim) per call).
+    /// Read only by the device dispatch (host: SIMD compiled out).
+    #[allow(dead_code)]
+    uniform: (i32, i32),
 }
 
 impl PreparedFc {
@@ -152,7 +159,10 @@ impl PreparedFc {
         let output_dim = params.output_dim as usize;
         let accx = cfg!(all(target_arch = "xtensa", not(feature = "qemu")))
             && crate::accx::accx_eligible_1x1(input_dim, output_dim);
-        Ok(Self { accx, params })
+        let uniform =
+            crate::accx::uniform_scale(params.output_multiplier_per_channel, params.output_shift_per_channel)
+                .unwrap_or((0, i32::MIN));
+        Ok(Self { accx, params, uniform })
     }
 
     #[inline]
@@ -178,7 +188,7 @@ impl PreparedFc {
                 output,
                 scratch,
             };
-            if fc_accx_dispatch(&mut accx_ctx)? {
+            if fc_accx_dispatch(&mut accx_ctx, self.uniform)? {
                 return Ok(());
             }
         }
@@ -217,10 +227,6 @@ pub fn fully_connected(
         return Err(KernelError::ShapeMismatch);
     }
 
-    // ── Per-channel multiplier / shift slices ───────────────────────────
-    let multipliers = params.output_multiplier_per_channel;
-    let shifts = params.output_shift_per_channel;
-
     // ── ACCX SIMD dispatch (device-only; compiled out entirely on host) ──
     // Bespoke ACCX kernel: exact 32-bit dot product per output unit, then a
     // bit-exact TFLite requantize in Rust. Bit-exact vs the scalar path.
@@ -230,8 +236,17 @@ pub fn fully_connected(
     // kernel depends on (confirmed by direct instruction-level bisection —
     // see local-notes/notepads/hematite-nn/problems.md). QEMU builds fall through to
     // the scalar path; real hardware still gets SIMD.
+    //
+    // `uniform_hint` is cached per params identity (todo 16): the O(output_dim)
+    // uniform_scale scan runs once per unique params, so repeated public-API
+    // calls skip it.
     #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
     {
+        let hint = crate::accx::uniform_hint(
+            params as *const _ as usize,
+            params.output_multiplier_per_channel,
+            params.output_shift_per_channel,
+        );
         let mut accx_ctx = FcAccxCtx {
             input,
             weights,
@@ -240,10 +255,34 @@ pub fn fully_connected(
             output,
             scratch,
         };
-        if fc_accx_dispatch(&mut accx_ctx)? {
+        if fc_accx_dispatch(&mut accx_ctx, hint)? {
             return Ok(());
         }
     }
+
+    let _ = scratch; // unused by the host path (dispatch is device-only)
+
+    fully_connected_scalar(input, weights, bias, params, output)
+}
+
+/// The scalar FC kernel, kept as a separate `#[inline(never)]` function so the
+/// public [`fully_connected`] dispatch frame stays thin (an inline scalar loop
+/// forced the SIMD path to share a huge frame with register spills — the
+/// todo-16 public-API gap). Assumes the caller validated the slice lengths.
+#[inline(never)]
+fn fully_connected_scalar(
+    input: &[i8],
+    weights: &[i8],
+    bias: &[i32],
+    params: &FullyConnectedParams,
+    output: &mut [i8],
+) -> Result<(), KernelError> {
+    let input_dim = params.input_dim as usize;
+    let output_dim = params.output_dim as usize;
+
+    // ── Per-channel multiplier / shift slices ───────────────────────────
+    let multipliers = params.output_multiplier_per_channel;
+    let shifts = params.output_shift_per_channel;
 
     // ── Accumulation loop ───────────────────────────────────────────────
     // TFLM loop order: batch(=0) → oc → accum_depth
@@ -273,8 +312,6 @@ pub fn fully_connected(
 
         output[oc] = saturating_cast(clamped);
     }
-
-    let _ = scratch; // unused by scalar path
 
     Ok(())
 }

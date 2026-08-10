@@ -111,8 +111,13 @@ pub(crate) struct Conv1x1AccxCtx<'a> {
 /// Eligibility: `input_offset == 0`, stride/dilation 1, `out_h == in_h`,
 /// `out_w == in_w` (pad 0), `in_c % 16 == 0`, `in_c >= 16`, `out_c >= 1`,
 /// all pointers 16-byte aligned, `scratch >= out_c * 4`.
+///
+/// `uniform` is the precomputed uniform-scale hint `(mult, shift)` —
+/// `i32::MIN` shift means "per-channel" (the requantize epilogue selects the
+/// fast scale inline, no upfront O(n) scan). The prepared handles cache the
+/// hint at construction; the public free functions pass `(0, i32::MIN)`.
 #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
-fn conv1x1_accx_dispatch(ctx: &mut Conv1x1AccxCtx<'_>) -> Result<bool, KernelError> {
+fn conv1x1_accx_dispatch(ctx: &mut Conv1x1AccxCtx<'_>, uniform: (i32, i32)) -> Result<bool, KernelError> {
     let params = ctx.params;
     let input_c = params.input_shape[3] as usize;
     let out_c = params.output_shape[3] as usize;
@@ -165,10 +170,7 @@ fn conv1x1_accx_dispatch(ctx: &mut Conv1x1AccxCtx<'_>) -> Result<bool, KernelErr
     let act_min = params.quantized_activation_min;
     let act_max = params.quantized_activation_max;
     let out_offset = params.output_offset;
-    let (uniform_mult, uniform_shift) = match crate::accx::uniform_scale(multipliers, shifts) {
-        Some((m, s)) => (m, s),
-        None => (0, i32::MIN),
-    };
+    let (uniform_mult, uniform_shift) = uniform;
 
     for oh in 0..out_h {
         for ow in 0..out_w {
@@ -223,6 +225,12 @@ pub struct PreparedConv1x1 {
     /// Whether the bespoke ACCX SIMD kernel is eligible on this target.
     accx: bool,
     params: &'static Conv2DParams<'static>,
+    /// Cached uniform-scale hint `(mult, shift)`; `i32::MIN` shift = per-channel.
+    /// Computed once at construction so `run` never re-scans the per-channel
+    /// arrays (the per-call cost is otherwise O(out_c) per kernel invocation).
+    /// Read only by the device dispatch (host: SIMD compiled out).
+    #[allow(dead_code)]
+    uniform: (i32, i32),
 }
 
 impl PreparedConv1x1 {
@@ -236,7 +244,10 @@ impl PreparedConv1x1 {
         let out_channels = params.output_shape[3] as usize;
         let accx = cfg!(all(target_arch = "xtensa", not(feature = "qemu")))
             && crate::accx::accx_eligible_1x1(input_c, out_channels);
-        Ok(Self { accx, params })
+        let uniform =
+            crate::accx::uniform_scale(params.output_multiplier_per_channel, params.output_shift_per_channel)
+                .unwrap_or((0, i32::MIN));
+        Ok(Self { accx, params, uniform })
     }
 
     /// Whether this layer is SIMD-eligible on the current target.
@@ -264,7 +275,7 @@ impl PreparedConv1x1 {
                 output,
                 scratch,
             };
-            if conv1x1_accx_dispatch(&mut accx_ctx)? {
+            if conv1x1_accx_dispatch(&mut accx_ctx, self.uniform)? {
                 return Ok(());
             }
         }
@@ -297,19 +308,6 @@ pub fn conv2d_1x1(
         return Err(KernelError::Unsupported);
     }
 
-    // ── Extract dimensions ──────────────────────────────────────────────
-    let input_h = params.input_shape[1];
-    let input_w = params.input_shape[2];
-    let input_c = params.input_shape[3];
-
-    let filter_h = params.filter_shape[1];
-    let filter_w = params.filter_shape[2];
-    let filter_ic = params.filter_shape[3];
-
-    let out_h = params.output_shape[1];
-    let out_w = params.output_shape[2];
-    let out_channels = params.output_shape[3];
-
     // ── Slice-length validation ─────────────────────────────────────────
     if input.len() != shape_product(&params.input_shape) {
         return Err(KernelError::ShapeMismatch);
@@ -317,15 +315,13 @@ pub fn conv2d_1x1(
     if weights.len() != shape_product(&params.filter_shape) {
         return Err(KernelError::ShapeMismatch);
     }
-    if bias.len() as i32 != out_channels {
+    if bias.len() as i32 != params.output_shape[3] {
         return Err(KernelError::ShapeMismatch);
     }
     if output.len() != shape_product(&params.output_shape) {
         return Err(KernelError::ShapeMismatch);
     }
-
-    // Channel-dimension cross-check
-    if input_c != filter_ic {
+    if params.input_shape[3] != params.filter_shape[3] {
         return Err(KernelError::ShapeMismatch);
     }
 
@@ -344,8 +340,17 @@ pub fn conv2d_1x1(
     // not a code defect, so QEMU builds fall through to the scalar path;
     // real hardware (no `qemu` feature) still gets SIMD once T5.3 validates
     // it there.
+    //
+    // `uniform_hint` is cached per params identity (todo 16): the O(out_c)
+    // uniform_scale scan runs once per unique params, so repeated public-API
+    // calls (model layers across predicts, the bench's N>=10 window) skip it.
     #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
     {
+        let hint = crate::accx::uniform_hint(
+            params as *const _ as usize,
+            params.output_multiplier_per_channel,
+            params.output_shift_per_channel,
+        );
         let mut accx_ctx = Conv1x1AccxCtx {
             input,
             weights,
@@ -354,10 +359,43 @@ pub fn conv2d_1x1(
             output,
             scratch,
         };
-        if conv1x1_accx_dispatch(&mut accx_ctx)? {
+        if conv1x1_accx_dispatch(&mut accx_ctx, hint)? {
             return Ok(());
         }
     }
+
+    let _ = scratch; // unused by the host path (dispatch is device-only)
+
+    conv2d_1x1_scalar(input, weights, bias, params, output)
+}
+
+/// The scalar 1×1 conv kernel, kept as a separate `#[inline(never)]` function
+/// so the public [`conv2d_1x1`] dispatch frame stays thin (an inline scalar
+/// loop forced the SIMD path to share a huge frame with heavy register
+/// spills — the todo-16 public-API gap).
+///
+/// Assumes the caller already validated the slice lengths (batch, input,
+/// weights, bias, output, channel cross-check).
+#[inline(never)]
+fn conv2d_1x1_scalar(
+    input: &[i8],
+    weights: &[i8],
+    bias: &[i32],
+    params: &Conv2DParams,
+    output: &mut [i8],
+) -> Result<(), KernelError> {
+    // ── Extract dimensions ──────────────────────────────────────────────
+    let input_h = params.input_shape[1];
+    let input_w = params.input_shape[2];
+    let input_c = params.input_shape[3];
+
+    let filter_h = params.filter_shape[1];
+    let filter_w = params.filter_shape[2];
+    let filter_ic = params.filter_shape[3];
+
+    let out_h = params.output_shape[1];
+    let out_w = params.output_shape[2];
+    let out_channels = params.output_shape[3];
 
     // ── Derived pad values (same formula as hematite-ref/src/conv.rs) ──
     let dilated_filter_h = (filter_h - 1) * params.dilation_height_factor + 1;
@@ -428,8 +466,6 @@ pub fn conv2d_1x1(
             }
         }
     }
-
-    let _ = scratch; // unused by scalar path
 
     Ok(())
 }
