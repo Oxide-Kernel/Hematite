@@ -46,7 +46,7 @@
 
 use hematite_core::op_params::{
     ActivationParams, ConcatParams, Conv2DParams, DepthwiseConv2DParams,
-    ElementwiseParams, FullyConnectedParams, GruParams, LstmParams,
+    ElementwiseParams, FusedConvParams, FullyConnectedParams, GruParams, LstmParams,
     MatMulParams, PadParams, PoolParams, QuantParam, ReduceParams,
     ReshapeParams, ResizeNearestParams, SliceParams, SoftmaxParams,
     SplitParams, SvdfParams, TransposeParams,
@@ -196,6 +196,25 @@ fn depthwise_scratch_need(params: &DepthwiseConv2DParams) -> usize {
     } else {
         out_c * 4 + wsum + partials
     }
+}
+
+/// Scratch bytes needed by the composed `fused_conv2d` SIMD path (T2.2).
+///
+/// EQUALS the anchor conv's own need ([`S3Backend::conv2d_scratch_size`]):
+/// the fused epilogue reads the residual tensor in place (it is a model
+/// constant / computed tensor provided as a slice — never staged) and holds
+/// the conv output in registers (never materialized), so no additional
+/// staging beyond the conv's padded-input/weights + accumulator + weight-sum
+/// buffers is required. The `RefBackend`-style decomposition forwards the same
+/// scratch to `conv2d` (hematite-ref/src/fused.rs), so the composed need ==
+/// the conv need is the parity invariant asserted by the T1.4
+/// `composed_scratch_parity` test.
+///
+/// Kept in sync with `fused_conv2d_scratch_need_codegen`
+/// (hematite-codegen/src/generate.rs).
+#[inline(always)]
+pub fn fused_conv2d_scratch_need(params: &FusedConvParams<'_>) -> usize {
+    S3Backend::conv2d_scratch_size(&params.conv)
 }
 
 impl KernelBackend for S3Backend {

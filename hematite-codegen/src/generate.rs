@@ -1191,6 +1191,38 @@ fn softmax_scratch_need_codegen(row_size: i32) -> usize {
     (row_size.max(0) as usize) * 4
 }
 
+/// Scratch bytes for a composed CONV_2D group (`fused_conv2d`, T2.2).
+///
+/// EQUALS the anchor conv's own need: the fused kernel stages nothing beyond
+/// the conv's padded-input/weights + accumulator + weight-sum buffers (the
+/// residual tensor is read in place and the conv output is register-held).
+/// Mirrors `hematite_s3::backend::fused_conv2d_scratch_need`. `emit_fused_conv`
+/// reports this value, so a composed group never under-sizes scratch vs the
+/// runtime decomposition (which forwards the same scratch to `conv2d`).
+#[allow(clippy::too_many_arguments)]
+fn fused_conv2d_scratch_need_codegen(
+    filter_h: i32,
+    filter_w: i32,
+    in_h: usize,
+    in_w: usize,
+    in_c: usize,
+    out_h: usize,
+    out_w: usize,
+    out_c: usize,
+    stride_h: i32,
+    stride_w: i32,
+    input_offset: i32,
+) -> usize {
+    if filter_h == 1 && filter_w == 1 {
+        conv1x1_scratch_need_codegen(out_c, input_offset)
+    } else {
+        conv3x3_scratch_need_codegen(
+            in_h, in_w, in_c, out_h, out_w, out_c, filter_h, filter_w,
+            stride_h, stride_w, 1, 1, input_offset,
+        )
+    }
+}
+
 fn emit_op(
     model: &ParsedModel,
     storage: &[Storage],
@@ -2036,6 +2068,32 @@ fn emit_fused_conv(
     let out_scale = tensor_scale(output)? as f32;
     let out_zp = tensor_zp(output)? as i64;
 
+    // T2.2 — the composed scratch need is the anchor conv's own need (the
+    // fused kernel stages nothing beyond the conv), computed through the
+    // explicit `fused_conv2d_scratch_need_codegen` mirror so the T1.4 parity
+    // test can assert the composed value directly. Derives the same shapes /
+    // stride / input_offset `emit_conv2d` used, so the value equals
+    // `conv.em.scratch` exactly.
+    let opts = match op.options.as_ref() {
+        Some(ParsedOptions::Conv2D {
+            stride_w,
+            stride_h,
+            fused_activation,
+            ..
+        }) => (*stride_w, *stride_h, *fused_activation),
+        other => return Err(format!("op {i}: expected Conv2D options, got {other:?}")),
+    };
+    let (stride_w, stride_h, fused_activation) = opts;
+    let w_t = *op.inputs.get(1).ok_or("conv2d missing weights tensor")?;
+    let input = tensor_at(model.tensors(), in_t)?;
+    let weights = tensor_at(model.tensors(), w_t)?;
+    let input_raw = shape4(&input.shape)?;
+    let filter_raw = shape4(&weights.shape)?;
+    let output_raw = shape4(&output.shape)?;
+    let out_channels = filter_raw[0] as usize;
+    let input_offset = conv_quant(input, weights, output, out_channels, fused_activation)?
+        .input_offset;
+
     let residual_ts = match &group.residual_add {
         Some(res) => {
             let r_t = tensor_at(model.tensors(), res.residual_tensor)?;
@@ -2140,7 +2198,19 @@ fn emit_fused_conv(
     Ok(OpEmission {
         consts: conv.em.consts,
         call,
-        scratch: conv.em.scratch,
+        scratch: fused_conv2d_scratch_need_codegen(
+            filter_raw[1],
+            filter_raw[2],
+            input_raw[1].max(0) as usize,
+            input_raw[2].max(0) as usize,
+            input_raw[3].max(0) as usize,
+            output_raw[1].max(0) as usize,
+            output_raw[2].max(0) as usize,
+            output_raw[3].max(0) as usize,
+            stride_h,
+            stride_w,
+            input_offset,
+        ),
     })
 }
 
@@ -3302,11 +3372,12 @@ mod tests {
     }
 
     use hematite_core::op_params::{
-        Conv2DParams, DepthwiseConv2DParams, FullyConnectedParams, Padding, SoftmaxParams,
+        Conv2DParams, DepthwiseConv2DParams, FusedConvParams, FullyConnectedParams, Padding,
+        SoftmaxParams,
     };
     use hematite_benchmarks::spec::KernelParams;
     use hematite_core::KernelBackend;
-    use hematite_s3::backend::{fc_scratch_need, S3Backend};
+    use hematite_s3::backend::{fc_scratch_need, fused_conv2d_scratch_need, S3Backend};
 
     // ── T1.4 — scratch parity: codegen mirrors vs S3Backend runtime ──────
     //
@@ -3513,6 +3584,39 @@ mod tests {
         *checked += 1;
     }
 
+    /// T2.2 — the fused-conv mirror must equal the runtime composed need, and
+    /// that must equal the anchor conv's own `S3Backend::conv2d_scratch_size`
+    /// (the fused kernel stages nothing beyond the conv). This is the same
+    /// equality `composed_scratch_parity` asserts over its 7-anchor grid.
+    fn check_fused_conv(p: &FusedConvParams<'_>, checked: &mut usize) {
+        let runtime = fused_conv2d_scratch_need(p);
+        let mirror = fused_conv2d_scratch_need_codegen(
+            p.conv.filter_shape[1],
+            p.conv.filter_shape[2],
+            p.conv.input_shape[1].max(0) as usize,
+            p.conv.input_shape[2].max(0) as usize,
+            p.conv.input_shape[3].max(0) as usize,
+            p.conv.output_shape[1].max(0) as usize,
+            p.conv.output_shape[2].max(0) as usize,
+            p.conv.output_shape[3].max(0) as usize,
+            p.conv.stride_height,
+            p.conv.stride_width,
+            p.conv.input_offset,
+        );
+        assert_eq!(
+            mirror, runtime,
+            "fused_conv2d in={:?} f={:?} out={:?}: codegen mirror {mirror} != S3Backend fused need {runtime}",
+            p.conv.input_shape, p.conv.filter_shape, p.conv.output_shape
+        );
+        assert_eq!(
+            runtime,
+            S3Backend::conv2d_scratch_size(&p.conv),
+            "fused_conv2d composed need {runtime} != anchor conv need {}",
+            S3Backend::conv2d_scratch_size(&p.conv)
+        );
+        *checked += 1;
+    }
+
     /// T1.4 — corpus-wide scratch parity sweep. Every mirror fn is asserted
     /// equal to the runtime S3Backend formula over (a) every machine-readable
     /// row of the per-kernel benchmark corpus (`hematite_benchmarks::spec::
@@ -3529,6 +3633,7 @@ mod tests {
         let mut n_fc = 0;
         let mut n_sm = 0;
         let mut n_pool = 0;
+        let mut n_fused = 0;
         let mut n_scratch_free = 0;
 
         // (a) spec corpus — every scratch-relevant row.
@@ -3563,10 +3668,14 @@ mod tests {
                     // no scratch method for them (runtime 0). No mirror exists.
                     n_scratch_free += 1;
                 }
+                KernelParams::FusedConv(p) => {
+                    check_fused_conv(p, &mut checked);
+                    n_fused += 1;
+                }
             }
         }
-        assert!(n_conv >= 8 && n_dw >= 13 && n_fc >= 7 && n_sm >= 1 && n_pool >= 3,
-            "corpus shrank unexpectedly: conv={n_conv} dw={n_dw} fc={n_fc} softmax={n_sm} pool={n_pool} scratch-free={n_scratch_free}");
+        assert!(n_conv >= 8 && n_dw >= 13 && n_fc >= 7 && n_sm >= 1 && n_pool >= 3 && n_fused >= 1,
+            "corpus shrank unexpectedly: conv={n_conv} dw={n_dw} fc={n_fc} softmax={n_sm} pool={n_pool} fused={n_fused} scratch-free={n_scratch_free}");
 
         // (b) widened grids (spec-corpus families + corner cases).
         // conv1x1: out_c × spatial × in_c × offset. The 1×1 formula reads only
@@ -3655,7 +3764,10 @@ mod tests {
     ///   (`RefBackend::fused_conv2d`, hematite-ref/src/fused.rs) forwards the
     ///   same scratch to `conv2d`, whose need is exactly
     ///   `S3Backend::conv2d_scratch_size`. The composed need therefore EQUALS
-    ///   the conv parity value (the absorbed add/act contribute 0).
+    ///   the conv parity value (the absorbed add/act contribute 0). The
+    ///   T2.2 SIMD path adds nothing either (residual read in place, conv
+    ///   output register-held) — asserted via the explicit
+    ///   `fused_conv2d_scratch_need_codegen` mirror below.
     /// * `fused_pool_with_fold` — `emit_fused_pool_fold` reports
     ///   `scratch: num_elements` (flat_len of the fold input = in_h·in_w·in_c);
     ///   the decomposition (hematite-ref/src/fused.rs) materializes the
@@ -3679,15 +3791,12 @@ mod tests {
             let out_w = tflite_out_dim(spatial, fw, stride, Padding::Same);
             let p = conv_params(fh, fw, in_c, out_c, spatial, spatial, out_h, out_w, stride, Padding::Same, off);
             let runtime = S3Backend::conv2d_scratch_size(&p);
-            let composed_need = if fh == 1 && fw == 1 {
-                conv1x1_scratch_need_codegen(out_c as usize, off)
-            } else {
-                conv3x3_scratch_need_codegen(
-                    spatial as usize, spatial as usize, in_c as usize,
-                    out_h as usize, out_w as usize, out_c as usize,
-                    fh, fw, stride, stride, 1, 1, off,
-                )
-            };
+            let composed_need = fused_conv2d_scratch_need_codegen(
+                fh, fw,
+                spatial as usize, spatial as usize, in_c as usize,
+                out_h as usize, out_w as usize, out_c as usize,
+                stride, stride, off,
+            );
             // emit_fused_conv → conv.em.scratch: the composed group's need IS
             // the conv mirror, and the decomposition needs exactly the conv
             // need — equality, never under-sized.

@@ -89,9 +89,11 @@
 //! dispatch routes through the device-proven paths (`avg_pool_2d_simd_ctx`).
 
 use hematite_core::op_params::{
-    ActivationParams, Conv2DParams, DepthwiseConv2DParams, ElementwiseParams,
-    FullyConnectedParams, FusedActivation, Padding, PoolParams, ReduceParams, SoftmaxParams,
+    ActivationEpilogueParams, ActivationParams, ComposedActivation, Conv2DParams,
+    DepthwiseConv2DParams, ElementwiseParams, FusedConvParams, FullyConnectedParams,
+    FusedActivation, Padding, PoolParams, ReduceParams, ResidualAddParams, SoftmaxParams,
 };
+use hematite_core::FusedKernelBackend;
 
 // ── Reporting (mirrors `model_validation.rs::{fnv1a, compare, report}`) ────
 
@@ -856,6 +858,88 @@ fn fill_pattern_slice(seed: u32, out: &mut [i8]) {
     }
 }
 
+// ── Fused conv2d (T2.2): conv + residual-ADD + activation in one pass ───────
+
+const FUSED_CONV1X1_IN: usize = 4 * 4 * 16;
+const FUSED_CONV1X1_W: usize = 16 * 1 * 1 * 16;
+const FUSED_CONV1X1_OUT: usize = 4 * 4 * 16;
+
+fn check_fused_conv2d_simd_matches_ref() {
+    // Buffers carved from the SRAM bench arena — NOT stack locals (see
+    // `arena_carve` for the task-18 OOB device finding).
+    let mut off = 0;
+    let input = arena_carve_i8(&mut off, FUSED_CONV1X1_IN);
+    let weights = arena_carve_i8(&mut off, FUSED_CONV1X1_W);
+    let want = arena_carve_i8(&mut off, FUSED_CONV1X1_OUT);
+    let got = arena_carve_i8(&mut off, FUSED_CONV1X1_OUT);
+    let residual = arena_carve_i8(&mut off, FUSED_CONV1X1_OUT);
+    let scratch = arena_carve(&mut off, 2048);
+    fill_pattern_slice(0xC0FF_EE11, input);
+    fill_pattern_slice(0x1CE5_51CE, weights);
+    fill_pattern_slice(0xABAD_1DEA, residual);
+    let bias = bias_pattern::<16>();
+    want.fill(0);
+    got.fill(0);
+    scratch.fill(0);
+    let params = FusedConvParams {
+        conv: Conv2DParams {
+            input_shape: [1, 4, 4, 16],
+            filter_shape: [16, 1, 1, 16],
+            output_shape: [1, 4, 4, 16],
+            padding: Padding::Same,
+            stride_width: 1,
+            stride_height: 1,
+            dilation_width_factor: 1,
+            dilation_height_factor: 1,
+            input_offset: 0,
+            weights_offset: 0,
+            output_offset: 5,
+            output_multiplier_per_channel: &MULT_16,
+            output_shift_per_channel: &SHIFT_16,
+            quantized_activation_min: -128,
+            quantized_activation_max: 127,
+        },
+        output_scale: 0.5,
+        output_zero_point: 5,
+        output_multiplier_per_channel: &MULT_16,
+        output_shift_per_channel: &SHIFT_16,
+        residual: Some(ResidualAddParams {
+            residual_data: residual,
+            residual_scale: 0.3,
+            residual_zero_point: -3,
+            output_scale: 0.4,
+            output_zero_point: 1,
+            input1_multiplier: 1 << 30,
+            input1_shift: 0,
+            input2_multiplier: 1_288_490_189,
+            input2_shift: -1,
+            left_shift: 20,
+            output_multiplier: 1_342_177_280,
+            output_shift: -18,
+        }),
+        activation: ActivationEpilogueParams {
+            kind: ComposedActivation::Relu,
+            input_offset: -1,
+            output_offset: 2,
+            output_multiplier: 1_342_177_280,
+            output_shift: 1,
+            quantized_activation_min: 0,
+            quantized_activation_max: 127,
+        },
+    };
+
+    let mut ref_backend = hematite_ref::RefBackend;
+    ref_backend
+        .fused_conv2d(input, weights, &bias, &params, want, scratch)
+        .expect("harness: ref fused_conv2d shape");
+    let mut s3_backend = hematite_s3::backend::S3Backend;
+    s3_backend
+        .fused_conv2d(input, weights, &bias, &params, got, scratch)
+        .expect("harness: s3 fused_conv2d shape");
+
+    report(&compare("fused_conv1x1_residual_relu", got, want));
+}
+
 fn check_fc_small_simd_matches_ref() {
     let shapes: [((usize, usize, i32), &'static str); 7] = [
         ((1, 1, 0), "fc_small_1x1"),      // sine-family
@@ -951,5 +1035,6 @@ pub fn validate_all() {
     check_fc_simd_matches_ref();
     check_fc_small_simd_matches_ref();
     check_mean_simd_matches_ref();
+    check_fused_conv2d_simd_matches_ref();
     crate::firmware::uart0_log!("=== SIMD CORRECTNESS DONE ===");
 }

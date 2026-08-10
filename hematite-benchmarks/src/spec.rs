@@ -27,8 +27,9 @@
 //! 10× internal bar (T3.0) — both attributed to the plan in `source` fields.
 
 use hematite_core::op_params::{
-    ActivationParams, Conv2DParams, DepthwiseConv2DParams, ElementwiseParams,
-    FullyConnectedParams, FusedActivation, Padding, PoolParams, SoftmaxParams,
+    ActivationEpilogueParams, ActivationParams, ComposedActivation, Conv2DParams,
+    DepthwiseConv2DParams, ElementwiseParams, FusedConvParams, FullyConnectedParams,
+    FusedActivation, Padding, PoolParams, ResidualAddParams, SoftmaxParams,
 };
 use hematite_core::KernelError;
 
@@ -98,6 +99,9 @@ pub enum OpKind {
     Add,
     Mul,
     Sub,
+    /// Composed CONV_2D + residual-ADD + activation epilogue (T2.2) — the
+    /// anchor conv's own shape; the epilogue reads the residual const tensor.
+    FusedConv2d,
 }
 
 /// A documented competitor / acceptance baseline for a row.
@@ -126,6 +130,7 @@ pub enum KernelParams {
     Pool(&'static PoolParams),
     Activation(&'static ActivationParams<'static>),
     Elementwise(&'static ElementwiseParams),
+    FusedConv(&'static FusedConvParams<'static>),
 }
 
 /// A single per-kernel benchmark row.
@@ -837,6 +842,143 @@ const SIMD_SUB_256_PARAMS: ElementwiseParams = ElementwiseParams {
     quantized_activation_max: 127,
 };
 
+// ── Composed fused-conv rows (T2.2) ──────────────────────────────────────────
+//
+// The `fused_conv2d` composed kernel: anchor conv + residual-ADD + activation
+// epilogue in ONE SIMD pass. The rows exercise the two conv-family SIMD paths
+// reachable from a `Conv2DParams` anchor (1×1 and general/3×3). Quant pairs
+// are scale-derived exactly as the T1.2 emitter derives them (StepRequantize):
+// `input1 = QuantizeMultiplier(s1/twice_max)`, `input2 =
+// QuantizeMultiplier(s2/twice_max)`, `output =
+// QuantizeMultiplier(twice_max/(2^20·s_out))` with `left_shift = 20`; the
+// residual scale deliberately differs from the conv output scale so the
+// per-input roundings are non-identity.
+
+/// Deterministic const residual pattern (LCG, full int8 range) — the residual
+/// is a model constant tensor, so it is embedded in the params const.
+const fn residual_pattern<const N: usize>(seed: u64) -> [i8; N] {
+    let mut out = [0i8; N];
+    let mut x = seed;
+    let mut i = 0;
+    while i < N {
+        x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        out[i] = (x >> 33) as i8;
+        i += 1;
+    }
+    out
+}
+
+const FUSED_RESIDUAL_256: [i8; 256] = residual_pattern::<256>(0xF0E1_D2C3);
+const FUSED_RESIDUAL_288: [i8; 288] = residual_pattern::<288>(0x0BAD_F00D);
+
+/// Anchor conv for the 1×1 fused row — full-range activation (the residual
+/// block's conv output feeds the ADD, not a fused activation).
+const SIMD_FUSED_CONV1X1_CONV: Conv2DParams<'static> = Conv2DParams {
+    input_shape: [1, 4, 4, 16],
+    filter_shape: [16, 1, 1, 16],
+    output_shape: [1, 4, 4, 16],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 5,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// Anchor conv for the 3×3 fused row — non-%16 channels (8) exercise the
+/// channel-padded staging path on device.
+const SIMD_FUSED_CONV3X3_CONV: Conv2DParams<'static> = Conv2DParams {
+    input_shape: [1, 6, 6, 8],
+    filter_shape: [8, 3, 3, 8],
+    output_shape: [1, 6, 6, 8],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: -2,
+    output_multiplier_per_channel: &MULT_8,
+    output_shift_per_channel: &SHIFT_8,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// Fused 1×1 anchor: in [1,4,4,16] → out [1,4,4,16], residual + ReLU. The
+/// conv1x1 ACCX SIMD path (in_c 16, %16) — the MobileNetV2 pointwise
+/// residual-block prototype. Conv scale 0.5 / residual 0.3 / add-out 0.4.
+const FUSED_CONV1X1_RESIDUAL_RELU_PARAMS: FusedConvParams<'static> = FusedConvParams {
+    conv: SIMD_FUSED_CONV1X1_CONV,
+    output_scale: 0.5,
+    output_zero_point: 5,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
+    residual: Some(ResidualAddParams {
+        residual_data: &FUSED_RESIDUAL_256,
+        residual_scale: 0.3,
+        residual_zero_point: -3,
+        output_scale: 0.4,
+        output_zero_point: 1,
+        input1_multiplier: 1 << 30,
+        input1_shift: 0,
+        input2_multiplier: 1_288_490_189,
+        input2_shift: -1,
+        left_shift: 20,
+        output_multiplier: 1_342_177_280,
+        output_shift: -18,
+    }),
+    activation: ActivationEpilogueParams {
+        kind: ComposedActivation::Relu,
+        input_offset: -1,
+        output_offset: 2,
+        output_multiplier: 1_342_177_280,
+        output_shift: 1,
+        quantized_activation_min: 0,
+        quantized_activation_max: 127,
+    },
+};
+
+/// Fused 3×3 anchor: in [1,6,6,8] → out [1,6,6,8] (non-%16 channels →
+/// channel-padded staging on device), residual + HardSwish. Conv scale 0.02 /
+/// residual 0.05 / add-out 0.03.
+const FUSED_CONV3X3_RESIDUAL_HSWISH_PARAMS: FusedConvParams<'static> = FusedConvParams {
+    conv: SIMD_FUSED_CONV3X3_CONV,
+    output_scale: 0.02,
+    output_zero_point: -2,
+    output_multiplier_per_channel: &MULT_8,
+    output_shift_per_channel: &SHIFT_8,
+    residual: Some(ResidualAddParams {
+        residual_data: &FUSED_RESIDUAL_288,
+        residual_scale: 0.05,
+        residual_zero_point: 7,
+        output_scale: 0.03,
+        output_zero_point: 3,
+        input1_multiplier: 1_717_986_918,
+        input1_shift: -2,
+        input2_multiplier: 1 << 30,
+        input2_shift: 0,
+        left_shift: 20,
+        output_multiplier: 1_789_569_707,
+        output_shift: -18,
+    }),
+    activation: ActivationEpilogueParams {
+        kind: ComposedActivation::HardSwish,
+        input_offset: -3,
+        output_offset: -1,
+        output_multiplier: 1_431_655_765,
+        output_shift: 0,
+        quantized_activation_min: 0,
+        quantized_activation_max: 127,
+    },
+};
+
 /// The full per-kernel benchmark table (order = report row order).
 pub const fn kernel_specs() -> &'static [KernelSpec] {
     &[
@@ -1134,6 +1276,22 @@ pub const fn kernel_specs() -> &'static [KernelSpec] {
             note: "TIE728 sub_w1_16_w2_16 SIMD row: identity contract, n=256.",
         },
         KernelSpec {
+            name: "fused_conv1x1_s8 4x4x16 residual+relu (T2.2)",
+            tier: MemoryTier::Sram,
+            op: OpKind::FusedConv2d,
+            params: KernelParams::FusedConv(&FUSED_CONV1X1_RESIDUAL_RELU_PARAMS),
+            reference: None,
+            note: "Composed conv1x1 + residual-ADD + ReLU in one pass (ACCX conv path; residual read in place, conv output register-held). The mv2 pointwise residual-block prototype.",
+        },
+        KernelSpec {
+            name: "fused_conv3x3_s8 6x6x8 residual+hardswish (T2.2)",
+            tier: MemoryTier::Sram,
+            op: OpKind::FusedConv2d,
+            params: KernelParams::FusedConv(&FUSED_CONV3X3_RESIDUAL_HSWISH_PARAMS),
+            reference: None,
+            note: "Composed 3x3 conv (non-%16 channels → channel-padded staging) + residual-ADD + HardSwish epilogue (downgraded integer formula).",
+        },
+        KernelSpec {
             name: "softmax_s8 1x1000 (SIMD)",
             tier: MemoryTier::Sram,
             op: OpKind::Softmax,
@@ -1270,6 +1428,18 @@ pub fn layout(spec: &KernelSpec) -> SpecLayout {
             weights_len: p.num_elements as usize,
             bias_len: 0,
             output_len: p.num_elements as usize,
+            transform_len: 0,
+        },
+        // The fused conv consumes the anchor conv's input/weights/bias and
+        // produces the conv output shape. The residual is a const tensor
+        // embedded in the params — no buffer region needed. transform_len 0:
+        // the fused ACCX path reads the RAW `[oc][ic]` weights (no TIE728
+        // 11cn/33cn permutation).
+        KernelParams::FusedConv(p) => SpecLayout {
+            input_len: shape_product(&p.conv.input_shape),
+            weights_len: shape_product(&p.conv.filter_shape),
+            bias_len: p.conv.filter_shape[0] as usize,
+            output_len: shape_product(&p.conv.output_shape),
             transform_len: 0,
         },
     }
@@ -1480,6 +1650,13 @@ pub fn run_kernel(spec: &KernelSpec, bufs: &mut SpecBufs<'_>, scratch: &mut [u8]
             let p = params_elementwise(spec);
             hematite_s3::elementwise::sub(bufs.input, bufs.weights, p, bufs.output, scratch)
         }
+        OpKind::FusedConv2d => {
+            let p = params_fused_conv(spec);
+            let mut backend = hematite_s3::backend::S3Backend;
+            hematite_core::FusedKernelBackend::fused_conv2d(
+                &mut backend, bufs.input, bufs.weights, bufs.bias, p, bufs.output, scratch,
+            )
+        }
     }
 }
 
@@ -1653,6 +1830,16 @@ fn run_kernel_scalar(
             };
             hematite_s3::elementwise::sub(bufs.input, bufs.weights, p, bufs.output, scratch)
         }
+        OpKind::FusedConv2d => {
+            let p = match spec.params {
+                KernelParams::FusedConv(p) => p,
+                _ => return Err(KernelError::Unsupported),
+            };
+            let mut backend = hematite_s3::backend::S3Backend;
+            hematite_core::FusedKernelBackend::fused_conv2d(
+                &mut backend, bufs.input, bufs.weights, bufs.bias, p, bufs.output, scratch,
+            )
+        }
     }
 }
 
@@ -1722,6 +1909,13 @@ pub fn prepare_kernel(spec: &KernelSpec) -> Result<PreparedKernel, KernelError> 
             )),
             _ => Err(KernelError::Unsupported),
         },
+        // The fused conv has no prepared handle: `fused_conv2d` internally
+        // dispatches the anchor conv's ACCX SIMD path (via S3Backend), so the
+        // Scalar slot (which runs the public trait method) gets SIMD on device.
+        OpKind::FusedConv2d => match spec.params {
+            KernelParams::FusedConv(_) => Ok(PreparedKernel::Scalar),
+            _ => Err(KernelError::Unsupported),
+        },
         OpKind::Softmax => Ok(PreparedKernel::Scalar),
     }
 }
@@ -1773,6 +1967,13 @@ fn params_elementwise(spec: &KernelSpec) -> &'static ElementwiseParams {
     match spec.params {
         KernelParams::Elementwise(p) => p,
         _ => panic!("spec.op elementwise requires KernelParams::Elementwise"),
+    }
+}
+#[cfg(target_arch = "xtensa")]
+fn params_fused_conv(spec: &KernelSpec) -> &'static FusedConvParams<'static> {
+    match spec.params {
+        KernelParams::FusedConv(p) => p,
+        _ => panic!("spec.op fused_conv2d requires KernelParams::FusedConv"),
     }
 }
 
@@ -1828,6 +2029,13 @@ pub fn run_ref_kernel(
         OpKind::Sub => {
             let p = params_elementwise(spec);
             hematite_ref::elementwise::sub(bufs.input, bufs.weights, p, bufs.output, scratch)
+        }
+        OpKind::FusedConv2d => {
+            let p = params_fused_conv(spec);
+            let mut backend = hematite_ref::RefBackend;
+            hematite_core::FusedKernelBackend::fused_conv2d(
+                &mut backend, bufs.input, bufs.weights, bufs.bias, p, bufs.output, scratch,
+            )
         }
     }
 }
@@ -1917,6 +2125,16 @@ mod tests {
                 };
                 hematite_s3::elementwise::sub(bufs.input, bufs.weights, p, bufs.output, scratch)
             }
+            OpKind::FusedConv2d => {
+                let p = match spec.params {
+                    KernelParams::FusedConv(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                let mut backend = hematite_s3::backend::S3Backend;
+                hematite_core::FusedKernelBackend::fused_conv2d(
+                    &mut backend, bufs.input, bufs.weights, bufs.bias, p, bufs.output, scratch,
+                )
+            }
         };
         let out_after = bufs.output.to_vec();
         bufs.output.copy_from_slice(&out);
@@ -2000,6 +2218,16 @@ mod tests {
                     _ => return Err("op/params mismatch".into()),
                 };
                 hematite_ref::elementwise::sub(bufs.input, bufs.weights, p, bufs.output, scratch)
+            }
+            OpKind::FusedConv2d => {
+                let p = match spec.params {
+                    KernelParams::FusedConv(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                let mut backend = hematite_ref::RefBackend;
+                hematite_core::FusedKernelBackend::fused_conv2d(
+                    &mut backend, bufs.input, bufs.weights, bufs.bias, p, bufs.output, scratch,
+                )
             }
         };
         let out_after = bufs.output.to_vec();

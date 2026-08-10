@@ -100,10 +100,18 @@ pub(crate) struct Conv3x3AccxCtx<'a> {
 /// weights, into `scratch`; the bit-exact TFLite requantize epilogue runs in
 /// Rust. The caller strides over the output image, one kernel call per pixel.
 ///
+/// When `fused` is `Some`, the pixel loop runs the composed conv+residual-ADD+
+/// activation epilogue ([`crate::fused::fused_epilogue`]) on the raw i32
+/// accumulators instead of the standalone requantize — the T2.2 fused-conv
+/// SIMD path. The `input_offset` fold still runs first in both branches.
+///
 /// Returns `Ok(true)` when the ACCX path handled the layer, `Ok(false)` when
 /// the layer is not ACCX-eligible (caller falls through to scalar).
 #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
-fn conv3x3_accx_dispatch(ctx: &mut Conv3x3AccxCtx<'_>) -> Result<bool, KernelError> {
+pub(crate) fn conv3x3_accx_dispatch(
+    ctx: &mut Conv3x3AccxCtx<'_>,
+    fused: Option<&crate::fused::FusedConvAccxParams<'_>>,
+) -> Result<bool, KernelError> {
     let params = ctx.params;
     let input_c = params.input_shape[3] as usize;
     let out_c = params.output_shape[3] as usize;
@@ -297,19 +305,29 @@ fn conv3x3_accx_dispatch(ctx: &mut Conv3x3AccxCtx<'_>) -> Result<bool, KernelErr
                 }
             }
             let acc_slice = unsafe { core::slice::from_raw_parts_mut(accs, out_c) };
-            crate::accx::requantize_1x1(&mut crate::accx::ReqCtx {
-                accs: acc_slice,
-                bias: ctx.bias,
-                multipliers,
-                shifts,
-                output_offset: out_offset,
-                act_min,
-                act_max,
-                out_base: po,
-                output: ctx.output,
-                uniform_mult,
-                uniform_shift,
-            });
+            match fused {
+                Some(fp) => {
+                    // T2.2 fused path: composed conv+residual-ADD+activation
+                    // epilogue on the raw accumulators (conv output register-
+                    // held, never materialized).
+                    crate::fused::fused_epilogue(fp, ctx.output, acc_slice, po);
+                }
+                None => {
+                    crate::accx::requantize_1x1(&mut crate::accx::ReqCtx {
+                        accs: acc_slice,
+                        bias: ctx.bias,
+                        multipliers,
+                        shifts,
+                        output_offset: out_offset,
+                        act_min,
+                        act_max,
+                        out_base: po,
+                        output: ctx.output,
+                        uniform_mult,
+                        uniform_shift,
+                    });
+                }
+            }
         }
     }
     Ok(true)
@@ -358,7 +376,7 @@ impl PreparedConv3x3 {
                 output,
                 scratch,
             };
-            if conv3x3_accx_dispatch(&mut accx_ctx)? {
+            if conv3x3_accx_dispatch(&mut accx_ctx, None)? {
                 return Ok(());
             }
         }
@@ -467,7 +485,7 @@ pub fn conv2d_3x3(
             output,
             scratch,
         };
-        if conv3x3_accx_dispatch(&mut accx_ctx)? {
+        if conv3x3_accx_dispatch(&mut accx_ctx, None)? {
             return Ok(());
         }
     }

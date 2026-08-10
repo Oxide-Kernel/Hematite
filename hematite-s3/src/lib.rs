@@ -11,6 +11,7 @@ pub mod backend;
 pub mod conv1x1;
 pub mod accx;
 pub mod elementwise;
+pub mod fused;
 pub mod conv3x3;
 pub mod data_movement;
 pub mod depthwise;

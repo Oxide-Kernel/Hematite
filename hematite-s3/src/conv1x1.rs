@@ -108,6 +108,11 @@ pub(crate) struct Conv1x1AccxCtx<'a> {
 /// 16-bit products) so the output is bit-identical to the scalar reference for
 /// any per-channel `mult`/`shift`/offset/activation and any `out_c`.
 ///
+/// When `fused` is `Some`, the pixel loop runs the composed conv+residual-ADD+
+/// activation epilogue ([`crate::fused::fused_epilogue`]) on the raw i32
+/// accumulators instead of the standalone requantize — the T2.2 fused-conv
+/// SIMD path. The `input_offset` fold still runs first in both branches.
+///
 /// Eligibility: `input_offset == 0`, stride/dilation 1, `out_h == in_h`,
 /// `out_w == in_w` (pad 0), `in_c % 16 == 0`, `in_c >= 16`, `out_c >= 1`,
 /// all pointers 16-byte aligned, `scratch >= out_c * 4`.
@@ -115,9 +120,14 @@ pub(crate) struct Conv1x1AccxCtx<'a> {
 /// `uniform` is the precomputed uniform-scale hint `(mult, shift)` —
 /// `i32::MIN` shift means "per-channel" (the requantize epilogue selects the
 /// fast scale inline, no upfront O(n) scan). The prepared handles cache the
-/// hint at construction; the public free functions pass `(0, i32::MIN)`.
+/// hint at construction; the public free functions pass `(0, i32::MIN)`. It is
+/// unused by the fused branch.
 #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
-fn conv1x1_accx_dispatch(ctx: &mut Conv1x1AccxCtx<'_>, uniform: (i32, i32)) -> Result<bool, KernelError> {
+pub(crate) fn conv1x1_accx_dispatch(
+    ctx: &mut Conv1x1AccxCtx<'_>,
+    uniform: (i32, i32),
+    fused: Option<&crate::fused::FusedConvAccxParams<'_>>,
+) -> Result<bool, KernelError> {
     let params = ctx.params;
     let input_c = params.input_shape[3] as usize;
     let out_c = params.output_shape[3] as usize;
@@ -193,19 +203,29 @@ fn conv1x1_accx_dispatch(ctx: &mut Conv1x1AccxCtx<'_>, uniform: (i32, i32)) -> R
                 }
             }
             let acc_slice = unsafe { core::slice::from_raw_parts_mut(accs, out_c) };
-            crate::accx::requantize_1x1(&mut crate::accx::ReqCtx {
-                accs: acc_slice,
-                bias: ctx.bias,
-                multipliers,
-                shifts,
-                output_offset: out_offset,
-                act_min,
-                act_max,
-                out_base: px_out,
-                output: ctx.output,
-                uniform_mult,
-                uniform_shift,
-            });
+            match fused {
+                Some(fp) => {
+                    // T2.2 fused path: composed conv+residual-ADD+activation
+                    // epilogue on the raw accumulators (conv output register-
+                    // held, never materialized).
+                    crate::fused::fused_epilogue(fp, ctx.output, acc_slice, px_out);
+                }
+                None => {
+                    crate::accx::requantize_1x1(&mut crate::accx::ReqCtx {
+                        accs: acc_slice,
+                        bias: ctx.bias,
+                        multipliers,
+                        shifts,
+                        output_offset: out_offset,
+                        act_min,
+                        act_max,
+                        out_base: px_out,
+                        output: ctx.output,
+                        uniform_mult,
+                        uniform_shift,
+                    });
+                }
+            }
         }
     }
     Ok(true)
@@ -275,7 +295,7 @@ impl PreparedConv1x1 {
                 output,
                 scratch,
             };
-            if conv1x1_accx_dispatch(&mut accx_ctx, self.uniform)? {
+            if conv1x1_accx_dispatch(&mut accx_ctx, self.uniform, None)? {
                 return Ok(());
             }
         }
@@ -359,7 +379,7 @@ pub fn conv2d_1x1(
             output,
             scratch,
         };
-        if conv1x1_accx_dispatch(&mut accx_ctx, hint)? {
+        if conv1x1_accx_dispatch(&mut accx_ctx, hint, None)? {
             return Ok(());
         }
     }
