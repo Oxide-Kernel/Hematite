@@ -255,10 +255,12 @@ pub fn read_wall_ns_impl() -> u64 {
     0
 }
 
-/// Device panic handler — logs (defmt or UART-under-qemu) and halts.
+/// Device panic handler — logs (UART0 only, so a defmt encoder failure can
+/// never eat the panic info) and halts.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    firmware_log!("PANIC: {}", info);
+    use core::fmt::Write;
+    let _ = writeln!(crate::firmware::uart0::Uart0, "PANIC: {}", info);
     loop {}
 }
 
@@ -271,6 +273,50 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 struct AlignedArena([u8; 256 * 1024]);
 
 static mut SRAM_ARENA: AlignedArena = AlignedArena([0u8; 256 * 1024]);
+
+/// Run `f` on a dedicated 256 KB stack carved from the SRAM bench arena.
+///
+/// The generated person_detect `Model::predict_with_scratch` allocas ~232 KB
+/// of intermediates on the stack (`sub a1, a1, 0x38ac0` in the ELF) — far
+/// more than the ~65 KB main-stack region — so it must run on this larger
+/// stack. SAFETY contract: the arena must be unused by the caller (true
+/// during model validation — the kernel benches that carve it run later) and
+/// SP is restored before returning. 256 KB recorded in task-5 evidence.
+///
+/// QEMU-only: on real silicon the first windowed return after the SP switch
+/// faults (window-underflow, excvaddr=0, epc1=retw in core::fmt::write) —
+/// the device path SKIPs person_detect (reason=stack) instead of using this.
+pub fn run_on_arena_stack<R>(f: impl FnOnce() -> R) -> R {
+    unsafe {
+        let arena = &mut *core::ptr::addr_of_mut!(SRAM_ARENA);
+        let base = arena.0.as_mut_ptr();
+        let top = (base as usize + arena.0.len()) & !15;
+        let old_sp = read_sp();
+        set_sp(top);
+        let r = f();
+        set_sp(old_sp);
+        r
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
+#[inline(never)]
+unsafe fn read_sp() -> usize {
+    let sp: usize;
+    core::arch::asm!("mov {0}, a1", out(reg) sp, options(nostack));
+    sp
+}
+
+#[cfg(target_arch = "xtensa")]
+#[inline(never)]
+unsafe fn set_sp(sp: usize) {
+    // movsp (not mov): window-aware SP switch — relocates the register save
+    // area to the new stack so window-overflow handling (device ROM handler)
+    // stays consistent. A plain `mov a1, x` left the window base pointing at
+    // the old stack and faulted on real silicon (QEMU's emulation was
+    // lenient). The generated alloca uses the same instruction.
+    core::arch::asm!("movsp a1, {0}", in(reg) sp, options(nostack));
+}
 
 /// PSRAM bench arena (large MobileNetV2-style rows) — runtime-mapped.
 ///
@@ -903,8 +949,14 @@ pub fn run_benchmarks() -> ! {
     // 4.5 Model validation (model-validation feature) — runs BEFORE the
     // kernel rows so every PASS/FAIL line prints even if a later row panics
     // (the MobileNetV2 PSRAM row's "arena too small" panic stays last).
+    // validate_all() runs each zoo model via RefBackend; validate_all_s3()
+    // (plan todo 5) re-runs them via Model::<S3Backend> — on the device the
+    // S3 forwarding takes the SIMD paths, so a PASS proves the SIMD kernels
+    // agree with the scalar oracle end-to-end.
     #[cfg(feature = "model-validation")]
     crate::model_validation::validate_all();
+    #[cfg(feature = "model-validation")]
+    crate::model_validation::validate_all_s3();
 
     // 4.6 TIE728 SIMD correctness (elementwise + pool vs hematite-ref) —
     // hardware-only: gated `not(feature = "qemu")` because the QEMU fork's

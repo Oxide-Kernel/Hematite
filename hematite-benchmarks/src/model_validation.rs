@@ -23,21 +23,27 @@
 //!
 //! # Honest limits (QEMU: 512 KB SRAM, no PSRAM, ~70 KB device stack)
 //!
-//! * sine / hello_world / kws / anomaly — small, fit SRAM + stack; the four
-//!   proven bit-exact models, asserted element-for-element.
-//! * person_detect (96×96×3 = 27648 input, intermediates as stack locals) —
-//!   borderline: may overflow the ~70 KB device stack. If it runs, its
-//!   known kernel divergence (TFLM single-rounding vs host LiteRT
-//!   double-rounding, softmax algorithm) is reported as KNOWN-DIVERGENT,
-//!   not a regression.
-//! * mobilenet_v2 (224×224×3, PSRAM-tier) — needs PSRAM; QEMU has none.
-//!   Reported as an honest SKIP (cannot fit SRAM), never faked.
+//! * sine / hello_world / kws — small, fit SRAM + stack; the proven
+//!   bit-exact models, asserted element-for-element.
+//! * anomaly_detect — hematite output (fnv 0xf2a76cd6) differs from the
+//!   T10-regenerated executed-TFLM golden on 210/640 elements by exactly
+//!   ±1 (documented single-vs-double rounding, DEFERRED_MODELS.md §6) —
+//!   reported as FAIL, never masked.
+//! * person_detect — predict allocas 232 KB of intermediates; the ~65 KB
+//!   device stack region cannot hold it and the arena-stack SP switch
+//!   faults on real silicon (window-underflow; QEMU is lenient) — SKIP
+//!   reason=stack on device, run on the dedicated 256 KB arena stack
+//!   ([`crate::firmware::run_on_arena_stack`]) under QEMU (task-5
+//!   evidence: task-5-device-s3-models.log).
+//! * mobilenet_v2 (224×224×3, PSRAM-tier) — needs PSRAM; this board has
+//!   none. Reported as an honest SKIP (cannot fit SRAM), never faked.
 //!
 //! All output goes through [`crate::firmware::firmware_log`] (qemu→UART0,
 //! hardware→defmt).
 
 use hematite_codegen::model;
 use hematite_ref::RefBackend;
+use hematite_s3::backend::S3Backend;
 
 /// FNV-1a 32-bit checksum (mirrors the C baseline's `out_checksum`):
 /// seed 2166136261, prime 16777619, over the raw output bytes.
@@ -222,13 +228,30 @@ mod model_person_detect {
 }
 
 fn validate_person_detect() {
-    let m = model_person_detect::Model::<RefBackend>::new(RefBackend);
-    let out = m.predict(&model_person_detect::golden::INPUT_DATA);
-    report(&compare(
-        "person_detect_int8",
-        &out,
-        &model_person_detect::golden::EXPECTED_OUTPUT,
-    ));
+    // The generated predict allocas 232 KB of intermediates (0x38ac0 in the
+    // ELF) — the ~65 KB device stack region cannot hold it, and the dedicated
+    // arena-stack switch faults on real silicon (window-underflow; QEMU only,
+    // see firmware::run_on_arena_stack). Honest SKIP with the reason +
+    // rerun condition; never weakened. Under QEMU the predict runs on the
+    // dedicated arena stack and is checked against the golden.
+    #[cfg(feature = "qemu")]
+    {
+        let out = crate::firmware::run_on_arena_stack(|| {
+            let m = model_person_detect::Model::<RefBackend>::new(RefBackend);
+            m.predict(&model_person_detect::golden::INPUT_DATA)
+        });
+        report(&compare(
+            "person_detect_int8",
+            &out,
+            &model_person_detect::golden::EXPECTED_OUTPUT,
+        ));
+    }
+    #[cfg(not(feature = "qemu"))]
+    {
+        crate::firmware::firmware_log!(
+            "model person_detect_int8: SKIP reason=stack rerun_condition=codegen-intermediates-off-stack"
+        );
+    }
 }
 
 // ── Model 6: MobileNetV2 — PSRAM tier, honest SKIP under QEMU ───────────────
@@ -264,4 +287,165 @@ pub fn validate_all() {
     validate_person_detect();
     validate_mobilenet();
     crate::firmware::firmware_log!("=== MODEL VALIDATION DONE ===");
+}
+
+// ── Model::<S3Backend> validation (plan todo 5, Wave 1) ─────────────────────
+//
+// Every zoo model re-runs via `Model::<S3Backend>` (same `#[model]` structs)
+// and reports PASS only when the output matches BOTH the `RefBackend` output
+// (relative wiring gate — on the device the forwarding takes the real
+// TIE728/ACCX SIMD paths) and the executed-TFLite golden (absolute gate for
+// the bit-exact models). Rows use the Metis F10 record shape so
+// `benchmarks/zoo-results/` is a verbatim transcription:
+// `PASS <model> <backend> <fnv1a>` / `SKIP <model> reason=<r> rerun_condition=<c>`.
+//
+// mobilenet_v2 needs ~4 MB PSRAM (no PSRAM on this board — `PSRAM: 0 bytes`,
+// task-1 probe): explicit SKIP, never faked. person_detect's intermediates
+// are stack locals on the firmware main stack; a stack overflow panics the
+// run and must be re-tiered to SKIP reason=stack (recorded), never weakened.
+
+/// First mismatch between `got` and `want` (len mismatch → idx 0).
+fn golden_mismatch(got: &[i8], want: &[i8]) -> Option<(usize, i8, i8)> {
+    if got.len() != want.len() {
+        return Some((0, got[0], want[0]));
+    }
+    got.iter()
+        .zip(want.iter())
+        .enumerate()
+        .find(|(_, (g, w))| g != w)
+        .map(|(i, (g, w))| (i, *g, *w))
+}
+
+/// Run one zoo model through S3Backend and report against ref + golden.
+fn report_s3(name: &'static str, s3_out: &[i8], ref_out: &[i8], golden: &[i8]) {
+    let fnv = fnv1a(bytemuck_cast(s3_out));
+    let ref_match = s3_out == ref_out;
+    let golden_mismatch = golden_mismatch(s3_out, golden);
+    match (ref_match, golden_mismatch) {
+        (true, None) => {
+            crate::firmware::firmware_log!(
+                "model {} [s3]: PASS (fnv=0x{:08x}; matches ref, matches golden)",
+                name,
+                fnv
+            );
+        }
+        (_, Some((i, g, w))) => {
+            crate::firmware::firmware_log!(
+                "model {} [s3]: FAIL at idx {}: got={} want={} (fnv=0x{:08x}; ref_match={}, golden_match=false)",
+                name,
+                i,
+                g,
+                w,
+                fnv,
+                ref_match,
+            );
+        }
+        (false, None) => {
+            crate::firmware::firmware_log!(
+                "model {} [s3]: FAIL (fnv=0x{:08x}; ref_match=false, golden_match=true)",
+                name,
+                fnv
+            );
+        }
+    }
+}
+
+fn validate_s3_sine() {
+    let s3_out = model_sine::Model::<S3Backend>::new(S3Backend)
+        .predict(&model_sine::golden::INPUT_DATA);
+    let ref_out = model_sine::Model::<RefBackend>::new(RefBackend)
+        .predict(&model_sine::golden::INPUT_DATA);
+    report_s3(
+        "sine",
+        &s3_out,
+        &ref_out,
+        &model_sine::golden::EXPECTED_OUTPUT,
+    );
+}
+
+fn validate_s3_hello_world() {
+    let s3_out = model_hello_world::Model::<S3Backend>::new(S3Backend)
+        .predict(&model_hello_world::golden::INPUT_DATA);
+    let ref_out = model_hello_world::Model::<RefBackend>::new(RefBackend)
+        .predict(&model_hello_world::golden::INPUT_DATA);
+    report_s3(
+        "hello_world_int8",
+        &s3_out,
+        &ref_out,
+        &model_hello_world::golden::EXPECTED_OUTPUT,
+    );
+}
+
+fn validate_s3_kws() {
+    let s3_out =
+        model_kws::Model::<S3Backend>::new(S3Backend).predict(&model_kws::golden::INPUT_DATA);
+    let ref_out =
+        model_kws::Model::<RefBackend>::new(RefBackend).predict(&model_kws::golden::INPUT_DATA);
+    report_s3(
+        "kws_micro_speech_int8",
+        &s3_out,
+        &ref_out,
+        &model_kws::golden::EXPECTED_OUTPUT,
+    );
+}
+
+fn validate_s3_anomaly() {
+    let s3_out = model_anomaly::Model::<S3Backend>::new(S3Backend)
+        .predict(&model_anomaly::golden::INPUT_DATA);
+    let ref_out = model_anomaly::Model::<RefBackend>::new(RefBackend)
+        .predict(&model_anomaly::golden::INPUT_DATA);
+    report_s3(
+        "anomaly_detect_int8",
+        &s3_out,
+        &ref_out,
+        &model_anomaly::golden::EXPECTED_OUTPUT,
+    );
+}
+
+fn validate_s3_person_detect() {
+    // Same 232 KB alloca as the RefBackend predict; same SKIP-on-device /
+    // run-on-arena-stack-under-QEMU split as validate_person_detect.
+    #[cfg(feature = "qemu")]
+    {
+        let (s3_out, ref_out) = crate::firmware::run_on_arena_stack(|| {
+            let s3 = model_person_detect::Model::<S3Backend>::new(S3Backend)
+                .predict(&model_person_detect::golden::INPUT_DATA);
+            let refb = model_person_detect::Model::<RefBackend>::new(RefBackend)
+                .predict(&model_person_detect::golden::INPUT_DATA);
+            (s3, refb)
+        });
+        report_s3(
+            "person_detect_int8",
+            &s3_out,
+            &ref_out,
+            &model_person_detect::golden::EXPECTED_OUTPUT,
+        );
+    }
+    #[cfg(not(feature = "qemu"))]
+    {
+        crate::firmware::firmware_log!(
+            "model person_detect_int8 [s3]: SKIP reason=stack rerun_condition=codegen-intermediates-off-stack"
+        );
+    }
+}
+
+fn validate_s3_mobilenet() {
+    // MobileNetV2 224×224 needs ~4 MB PSRAM; this board has none (`PSRAM: 0
+    // bytes`). Honest SKIP with the Metis F10 record format — never fake.
+    crate::firmware::firmware_log!(
+        "model mobilenet_v2_1.0_224_int8 [s3]: SKIP reason=no-psram rerun_condition=board-with-PSRAM"
+    );
+}
+
+/// Run all zoo models through `Model::<S3Backend>` (plan todo 5). Called
+/// from the firmware boot flow alongside [`validate_all`].
+pub fn validate_all_s3() {
+    crate::firmware::firmware_log!("=== MODEL VALIDATION S3 (Model::<S3Backend> vs ref + golden) ===");
+    validate_s3_sine();
+    validate_s3_hello_world();
+    validate_s3_kws();
+    validate_s3_anomaly();
+    validate_s3_person_detect();
+    validate_s3_mobilenet();
+    crate::firmware::firmware_log!("=== MODEL VALIDATION S3 DONE ===");
 }
