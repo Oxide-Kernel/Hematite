@@ -113,9 +113,27 @@ macro_rules! firmware_log {
     }};
 }
 
-// Re-export so sibling device modules (e.g. model_validation) can log through
-// the same path (qemu→UART0, hardware→defmt).
-pub(crate) use firmware_log;
+/// Log one report line: UART0 ONLY (no defmt/RTT).
+///
+/// The validation sections (model_validation, simd_validation) use this
+/// instead of [`firmware_log`]: defmt-rtt's global logger is NOT reentrant
+/// across exceptions — an exception landing inside a defmt write window makes
+/// the exception handler's `defmt::panic!` hit `defmt logger taken
+/// reentrantly` (defmt-rtt-0.4.2 lib.rs:139) and mask the real root cause
+/// (task-5 evidence: the SIMD-correctness section died exactly that way on
+/// its first line).  UART0 direct-register writes are interrupt/exception
+/// safe, and RTT is unreadable on this board anyway (no JTAG probe — the
+/// USB-UART is the only evidence transport), so dropping defmt here loses
+/// nothing while eliminating the panic class.
+macro_rules! uart0_log {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        let _ = writeln!(crate::firmware::uart0::Uart0, $($arg)*);
+    }};
+}
+
+// Re-export so sibling device modules can log through the same path.
+pub(crate) use uart0_log;
 
 /// Display/Format adapter for `Option<u64>` so the same report row renders
 /// through both `core::fmt` (qemu UART path) and `defmt` (hardware RTT path).
@@ -255,12 +273,119 @@ pub fn read_wall_ns_impl() -> u64 {
     0
 }
 
+/// Exception-handler wrapper (activated by linking with
+/// `-Wl,--wrap=__user_exception`): receives (EXCCAUSE, save-frame pointer)
+/// from xtensa-lx-rt's vector trampoline and panics with the raw cause +
+/// registers, so the REAL exception lands on UART0 via the panic handler.
+/// esp-hal's own `__user_exception` is compiled with the defmt feature and
+/// writes the exception info to RTT only (invisible on this board), and its
+/// defmt write double-faults when the trap-frame pointer is corrupt —
+/// masking the original cause as "defmt logger taken reentrantly" (task-8
+/// finding). `#[no_mangle]` with no normal reference: inert without --wrap.
+#[cfg(target_arch = "xtensa")]
+#[unsafe(no_mangle)]
+unsafe extern "C" fn __wrap___user_exception(cause: u32, frame: *const u32) {
+    use core::fmt::Write;
+    let _ = writeln!(
+        crate::firmware::uart0::Uart0,
+        "EXCEPTION cause=0x{:08x} (EXCCAUSE {}):",
+        cause,
+        cause
+    );
+    // xtensa-lx-rt Context layout (no float-save-restore): [0] PC, [1] PS,
+    // [2] A0, [3] A1(SP), [4..19] A2..A15, [20] SAR, [21] EXCCAUSE,
+    // [22] EXCVADDR, [23] LBEG, [24] LEND, [25] LCOUNT.
+    // SAFETY: the vector passed a valid save-frame pointer (sp-based);
+    // reading 26 u32s is within the saved context.
+    for i in 0..26 {
+        let v = unsafe { frame.add(i).read() };
+        match i {
+            0 => writeln!(crate::firmware::uart0::Uart0, "  PC=0x{:08x}", v),
+            1 => writeln!(crate::firmware::uart0::Uart0, "  PS=0x{:08x}", v),
+            3 => writeln!(crate::firmware::uart0::Uart0, "  SP=0x{:08x}", v),
+            22 => writeln!(crate::firmware::uart0::Uart0, "  EXCVADDR=0x{:08x}", v),
+            2 | 21 | 23 | 24 | 25 => writeln!(crate::firmware::uart0::Uart0, "  r{:02}=0x{:08x}", i, v),
+            _ => write!(crate::firmware::uart0::Uart0, "  r{:02}=0x{:08x}", i, v),
+        }
+        .ok();
+        if i % 4 == 3 {
+            let _ = writeln!(crate::firmware::uart0::Uart0);
+        }
+    }
+    let _ = writeln!(crate::firmware::uart0::Uart0);
+    panic!("exception");
+}
+
 /// Device panic handler — logs (UART0 only, so a defmt encoder failure can
 /// never eat the panic info) and halts.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     use core::fmt::Write;
     let _ = writeln!(crate::firmware::uart0::Uart0, "PANIC: {}", info);
+    // Mirror the defmt-RTT up-channel buffer to UART0: esp-hal's exception
+    // handler (compiled with the defmt feature) writes the exception frame
+    // (cause + trap frame, RZCOBS-encoded) to RTT before calling
+    // `__defmt_default_panic`, and RTT is unreadable on this board (no JTAG
+    // probe) — without the dump the real exception cause stays invisible
+    // behind the "explicit panic" tail (task-8 finding). The bytes decode
+    // offline: RZCOBS → varint format tag → args.
+    #[cfg(not(feature = "qemu"))]
+    {
+        #[repr(C)]
+        struct RttChannel {
+            name: *const u8,
+            buffer: *mut u8,
+            size: usize,
+            write: usize,
+            read: usize,
+            flags: usize,
+        }
+        #[repr(C)]
+        struct RttHeader {
+            id: [u8; 16],
+            max_up_channels: usize,
+            max_down_channels: usize,
+            up_channel: RttChannel,
+        }
+        // SAFETY: defmt-rtt's `_SEGGER_RTT` is a no_mangle static with this
+        // exact repr(C) layout (defmt-rtt-0.4.2 src/lib.rs + channel.rs);
+        // the panic path is single-threaded and the device is halted anyway.
+        unsafe {
+            extern "C" {
+                #[link_name = "_SEGGER_RTT"]
+                static SEGGER_RTT: RttHeader;
+            }
+            // The defmt RttEncoder.taken flag sits at SRAM_ARENA end + 4
+            // (linker layout; task-8 finding: an out-of-bounds write past the
+            // arena — e.g. the conv3x3 check's SIMD path — clobbers it to 1,
+            // which makes the next defmt acquire panic "taken reentrantly").
+            let arena_ptr = core::ptr::addr_of!(SRAM_ARENA) as usize;
+            let enc_taken = core::ptr::read_volatile((arena_ptr + 256 * 1024 + 4) as *const u8);
+            let _ = writeln!(
+                crate::firmware::uart0::Uart0,
+                "defmt RTT_ENCODER.taken = {} (arena end 0x{:08x})",
+                enc_taken,
+                arena_ptr + 256 * 1024
+            );
+            let ch = &SEGGER_RTT.up_channel;
+            let write = ch.write;
+            let size = ch.size.min(1024);
+            let n = write.min(size);
+            if !ch.buffer.is_null() && n > 0 {
+                let bytes = core::slice::from_raw_parts(ch.buffer, n);
+                let _ = write!(crate::firmware::uart0::Uart0, "RTT dump ({} bytes):", n);
+                for (i, b) in bytes.iter().enumerate() {
+                    if i % 16 == 0 {
+                        let _ = write!(crate::firmware::uart0::Uart0, "\n{:04x}: ", i);
+                    }
+                    let _ = write!(crate::firmware::uart0::Uart0, "{:02x} ", b);
+                }
+                let _ = writeln!(crate::firmware::uart0::Uart0);
+            } else {
+                let _ = writeln!(crate::firmware::uart0::Uart0, "RTT buffer empty");
+            }
+        }
+    }
     loop {}
 }
 
@@ -269,10 +394,15 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 /// 16-byte aligned so the TIE728 SIMD path's `input` pointer (the arena base,
 /// carve offset 0) satisfies the kernels' alignment gate — `[u8; N]` alone
 /// has alignment 1, which silently drops the bench rows to the scalar path.
+///
+/// `pub(crate)`: the validation sections (simd_validation) carve their big
+/// buffers from this arena while it is unused (the kernel benches carve it
+/// later) — a static hoist of those buffers would grow `.bss` and shrink the
+/// 65 KB device stack (task-8 finding).
 #[repr(align(16))]
-struct AlignedArena([u8; 256 * 1024]);
+pub(crate) struct AlignedArena(pub(crate) [u8; 256 * 1024]);
 
-static mut SRAM_ARENA: AlignedArena = AlignedArena([0u8; 256 * 1024]);
+pub(crate) static mut SRAM_ARENA: AlignedArena = AlignedArena([0u8; 256 * 1024]);
 
 /// Run `f` on a dedicated 256 KB stack carved from the SRAM bench arena.
 ///

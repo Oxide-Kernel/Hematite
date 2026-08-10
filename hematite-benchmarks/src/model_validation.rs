@@ -38,8 +38,10 @@
 //! * mobilenet_v2 (224×224×3, PSRAM-tier) — needs PSRAM; this board has
 //!   none. Reported as an honest SKIP (cannot fit SRAM), never faked.
 //!
-//! All output goes through [`crate::firmware::firmware_log`] (qemu→UART0,
-//! hardware→defmt).
+//! All output goes through [`crate::firmware::uart0_log`] (UART0 only — no
+//! defmt/RTT: the defmt logger is not reentrant across exceptions and its
+//! reentrancy panic masked the simd_validation root cause in task 5; RTT is
+//! unreadable on this board anyway).
 
 use hematite_codegen::model;
 use hematite_ref::RefBackend;
@@ -103,10 +105,10 @@ fn bytemuck_cast(v: &[i8]) -> &[u8] {
 fn report(r: &ModelResult) {
     match (r.pass, r.mismatch) {
         (true, _) => {
-            crate::firmware::firmware_log!("model {}: PASS (fnv=0x{:08x})", r.name, r.fnv);
+            crate::firmware::uart0_log!("model {}: PASS (fnv=0x{:08x})", r.name, r.fnv);
         }
         (false, Some((i, g, w))) => {
-            crate::firmware::firmware_log!(
+            crate::firmware::uart0_log!(
                 "model {}: FAIL at idx {}: got={} want={} (fnv=0x{:08x})",
                 r.name,
                 i,
@@ -116,7 +118,7 @@ fn report(r: &ModelResult) {
             );
         }
         (false, None) => {
-            crate::firmware::firmware_log!("model {}: FAIL (fnv=0x{:08x})", r.name, r.fnv);
+            crate::firmware::uart0_log!("model {}: FAIL (fnv=0x{:08x})", r.name, r.fnv);
         }
     }
 }
@@ -248,7 +250,7 @@ fn validate_person_detect() {
     }
     #[cfg(not(feature = "qemu"))]
     {
-        crate::firmware::firmware_log!(
+        crate::firmware::uart0_log!(
             "model person_detect_int8: SKIP reason=stack rerun_condition=codegen-intermediates-off-stack"
         );
     }
@@ -272,21 +274,21 @@ fn validate_mobilenet() {
     // MobileNetV2 224×224 needs ~4 MB PSRAM (input + all intermediates as
     // stack locals); QEMU has no PSRAM and the device SRAM is ~512 KB with a
     // ~70 KB stack. It cannot run here — report an honest SKIP, never fake.
-    crate::firmware::firmware_log!(
+    crate::firmware::uart0_log!(
         "model mobilenet_v2_1.0_224_int8: SKIP (needs PSRAM; not present under QEMU)"
     );
 }
 
 /// Run all model validations. Called first from the firmware boot flow.
 pub fn validate_all() {
-    crate::firmware::firmware_log!("=== MODEL VALIDATION (executed-TFLite goldens) ===");
+    crate::firmware::uart0_log!("=== MODEL VALIDATION (executed-TFLite goldens) ===");
     validate_sine();
     validate_hello_world();
     validate_kws();
     validate_anomaly();
     validate_person_detect();
     validate_mobilenet();
-    crate::firmware::firmware_log!("=== MODEL VALIDATION DONE ===");
+    crate::firmware::uart0_log!("=== MODEL VALIDATION DONE ===");
 }
 
 // ── Model::<S3Backend> validation (plan todo 5, Wave 1) ─────────────────────
@@ -323,14 +325,14 @@ fn report_s3(name: &'static str, s3_out: &[i8], ref_out: &[i8], golden: &[i8]) {
     let golden_mismatch = golden_mismatch(s3_out, golden);
     match (ref_match, golden_mismatch) {
         (true, None) => {
-            crate::firmware::firmware_log!(
+            crate::firmware::uart0_log!(
                 "model {} [s3]: PASS (fnv=0x{:08x}; matches ref, matches golden)",
                 name,
                 fnv
             );
         }
         (_, Some((i, g, w))) => {
-            crate::firmware::firmware_log!(
+            crate::firmware::uart0_log!(
                 "model {} [s3]: FAIL at idx {}: got={} want={} (fnv=0x{:08x}; ref_match={}, golden_match=false)",
                 name,
                 i,
@@ -341,7 +343,7 @@ fn report_s3(name: &'static str, s3_out: &[i8], ref_out: &[i8], golden: &[i8]) {
             );
         }
         (false, None) => {
-            crate::firmware::firmware_log!(
+            crate::firmware::uart0_log!(
                 "model {} [s3]: FAIL (fnv=0x{:08x}; ref_match=false, golden_match=true)",
                 name,
                 fnv
@@ -423,7 +425,7 @@ fn validate_s3_person_detect() {
     }
     #[cfg(not(feature = "qemu"))]
     {
-        crate::firmware::firmware_log!(
+        crate::firmware::uart0_log!(
             "model person_detect_int8 [s3]: SKIP reason=stack rerun_condition=codegen-intermediates-off-stack"
         );
     }
@@ -432,7 +434,7 @@ fn validate_s3_person_detect() {
 fn validate_s3_mobilenet() {
     // MobileNetV2 224×224 needs ~4 MB PSRAM; this board has none (`PSRAM: 0
     // bytes`). Honest SKIP with the Metis F10 record format — never fake.
-    crate::firmware::firmware_log!(
+    crate::firmware::uart0_log!(
         "model mobilenet_v2_1.0_224_int8 [s3]: SKIP reason=no-psram rerun_condition=board-with-PSRAM"
     );
 }
@@ -440,12 +442,12 @@ fn validate_s3_mobilenet() {
 /// Run all zoo models through `Model::<S3Backend>` (plan todo 5). Called
 /// from the firmware boot flow alongside [`validate_all`].
 pub fn validate_all_s3() {
-    crate::firmware::firmware_log!("=== MODEL VALIDATION S3 (Model::<S3Backend> vs ref + golden) ===");
+    crate::firmware::uart0_log!("=== MODEL VALIDATION S3 (Model::<S3Backend> vs ref + golden) ===");
     validate_s3_sine();
     validate_s3_hello_world();
     validate_s3_kws();
     validate_s3_anomaly();
     validate_s3_person_detect();
     validate_s3_mobilenet();
-    crate::firmware::firmware_log!("=== MODEL VALIDATION S3 DONE ===");
+    crate::firmware::uart0_log!("=== MODEL VALIDATION S3 DONE ===");
 }

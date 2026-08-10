@@ -8,11 +8,11 @@
 //! * elementwise `add`/`mul`/`sub` and pool `avg`/`max` (the kernel groups
 //!   that were NOT previously proven broken under QEMU);
 //! * `relu`, `softmax`, `depthwise`, `conv1x1`, `conv3x3`, `fc`/`gemm`,
-//!   `mean` — added in the simd-zoo-hardening Wave 2 (todo 6). These drive
-//!   the PUBLIC s3 dispatch functions (the same entry points a model calls),
-//!   so on real hardware the SIMD path is exercised; the `qemu` feature is
-//!   gated off inside those dispatch functions (`EE.VSMULAS.S8.QACC.LD.INCP`
-//!   is unemulated by this QEMU fork — see
+//!   `mean` — added in the simd-zoo-hardening Wave 2 (todo 6). ALL 18 checks
+//!   drive the PUBLIC s3 dispatch functions (the same entry points a model
+//!   calls), so on real hardware the SIMD path is exercised; the `qemu`
+//!   feature is gated off inside those dispatch functions
+//!   (`EE.VSMULAS.S8.QACC.LD.INCP` is unemulated by this QEMU fork — see
 //!   `local-notes/notepads/hematite-nn/problems.md`).
 //!
 //! # Call-site note (hardware-only suite)
@@ -62,6 +62,9 @@
 //!
 //! # Eligibility (mirrors the dispatch gates in `hematite-s3/src/{elementwise,pool}.rs`)
 //!
+//! The checks pass params through the PUBLIC dispatch functions, which engage
+//! SIMD only when these gates hold:
+//!
 //! * add/sub: `input1_offset = input2_offset = output_offset = 0`,
 //!   full-range activation bounds, `left_shift <= 0`, and (input1/input2/output)
 //!   `(multiplier, shift) = (1<<30, 1)` — the exact identity pair the scalar
@@ -76,6 +79,14 @@
 //! * pool: exactly 2×2 filter / stride 2 / no padding / channels a multiple
 //!   of 16 / full-range activation bounds (pool's SIMD args struct has no
 //!   clamp field at all, so a non-full range would silently diverge).
+//!
+//! On device the SIMD path engages for every check (gates above + 16-aligned
+//! `Aligned<>` buffers). The raw `*_simd_aligned` / `*_pool_2d_simd` helpers
+//! are NOT called directly: their inline-asm register delivery was the
+//! first-silicon corruption finding (task 8 — see
+//! `hematite-s3/src/elementwise.rs` register-hazard note), and the pool raw
+//! helpers are the Xtensa-LLVM multi-arg-call scramble class. The public
+//! dispatch routes through the device-proven paths (`avg_pool_2d_simd_ctx`).
 
 use hematite_core::op_params::{
     ActivationParams, Conv2DParams, DepthwiseConv2DParams, ElementwiseParams,
@@ -131,10 +142,10 @@ fn compare(name: &'static str, got: &[i8], want: &[i8]) -> CheckResult {
 fn report(r: &CheckResult) {
     match (r.pass, r.mismatch) {
         (true, _) => {
-            crate::firmware::firmware_log!("simd {}: PASS (fnv=0x{:08x})", r.name, r.fnv);
+            crate::firmware::uart0_log!("simd {}: PASS (fnv=0x{:08x})", r.name, r.fnv);
         }
         (false, Some((i, g, w))) => {
-            crate::firmware::firmware_log!(
+            crate::firmware::uart0_log!(
                 "simd {}: FAIL at idx {}: got={} want={} (fnv=0x{:08x})",
                 r.name,
                 i,
@@ -144,7 +155,7 @@ fn report(r: &CheckResult) {
             );
         }
         (false, None) => {
-            crate::firmware::firmware_log!(
+            crate::firmware::uart0_log!(
                 "simd {}: FAIL (length mismatch) (fnv=0x{:08x})",
                 r.name,
                 r.fnv
@@ -233,44 +244,30 @@ fn run_elementwise_check<const N: usize>(op: ElemOp, name: &'static str) {
     let mut got = Aligned([0i8; N]);
     let params = elementwise_params(N as i32);
 
+    // Both sides go through the PUBLIC dispatch: hematite-ref is the oracle,
+    // hematite-s3's `add`/`mul`/`sub` take the SIMD path on device (identity
+    // quant-affine params + 16-aligned Aligned<> buffers satisfy every
+    // eligibility gate). The raw `*_simd_aligned` helpers are NOT called
+    // here — their inline-asm register delivery is the latent hazard found
+    // on first silicon (see hematite-s3/src/elementwise.rs, task-8 note).
     match op {
         ElemOp::Add => {
             hematite_ref::elementwise::add(&input1.0, &input2.0, &params, &mut want.0, &mut [])
                 .expect("harness: ref add shape");
-            unsafe {
-                hematite_s3::elementwise::add_simd_aligned(
-                    got.0.as_mut_ptr(),
-                    input1.0.as_ptr(),
-                    input2.0.as_ptr(),
-                    N as u32,
-                );
-            }
+            hematite_s3::elementwise::add(&input1.0, &input2.0, &params, &mut got.0, &mut [])
+                .expect("harness: s3 add shape");
         }
         ElemOp::Sub => {
             hematite_ref::elementwise::sub(&input1.0, &input2.0, &params, &mut want.0, &mut [])
                 .expect("harness: ref sub shape");
-            unsafe {
-                hematite_s3::elementwise::sub_simd_aligned(
-                    got.0.as_mut_ptr(),
-                    input1.0.as_ptr(),
-                    input2.0.as_ptr(),
-                    N as u32,
-                );
-            }
+            hematite_s3::elementwise::sub(&input1.0, &input2.0, &params, &mut got.0, &mut [])
+                .expect("harness: s3 sub shape");
         }
         ElemOp::Mul => {
             hematite_ref::elementwise::mul(&input1.0, &input2.0, &params, &mut want.0, &mut [])
                 .expect("harness: ref mul shape");
-            let mul_shift = 1 - params.output_shift;
-            unsafe {
-                hematite_s3::elementwise::mul_simd_aligned(
-                    got.0.as_mut_ptr(),
-                    input1.0.as_ptr(),
-                    input2.0.as_ptr(),
-                    N as u32,
-                    mul_shift,
-                );
-            }
+            hematite_s3::elementwise::mul(&input1.0, &input2.0, &params, &mut got.0, &mut [])
+                .expect("harness: s3 mul shape");
         }
     }
 
@@ -302,23 +299,11 @@ fn run_avg_pool_check() {
 
     hematite_ref::pool::average_pool_2d(&input.0, &params, &mut want.0, &mut [])
         .expect("harness: ref average_pool_2d shape");
-
-    let channels = 16i32;
-    let input_w = 4i32;
-    let total_out = 2 * 2 * channels;
-    let area_inv = [64i8; 16]; // round(2^8 / 4) for a 2x2 (area=4) filter
-    unsafe {
-        hematite_s3::pool::avg_pool_2d_simd(
-            got.0.as_mut_ptr(),
-            input.0.as_ptr(),
-            channels,
-            input_w * channels,
-            channels,
-            8,
-            &area_inv,
-            total_out / 16 - 1,
-        );
-    }
+    // PUBLIC dispatch (SIMD on device — the pool dispatch routes through the
+    // device-proven `avg_pool_2d_simd_ctx`). The raw 8-arg `avg_pool_2d_simd`
+    // helper is NOT called here (Xtensa-LLVM multi-arg-call scramble class).
+    hematite_s3::pool::average_pool_2d(&input.0, &params, &mut got.0, &mut [])
+        .expect("harness: s3 average_pool_2d shape");
 
     report(&compare("avg_pool_2x2", &got.0, &want.0));
 }
@@ -331,20 +316,9 @@ fn run_max_pool_check() {
 
     hematite_ref::pool::max_pool_2d(&input.0, &params, &mut want.0, &mut [])
         .expect("harness: ref max_pool_2d shape");
-
-    let channels = 16i32;
-    let input_w = 4i32;
-    let total_out = 2 * 2 * channels;
-    unsafe {
-        hematite_s3::pool::max_pool_2d_simd(
-            got.0.as_mut_ptr(),
-            input.0.as_ptr(),
-            channels,
-            input_w * channels,
-            channels,
-            total_out / 16 - 1,
-        );
-    }
+    // PUBLIC dispatch (see run_avg_pool_check note).
+    hematite_s3::pool::max_pool_2d(&input.0, &params, &mut got.0, &mut [])
+        .expect("harness: s3 max_pool_2d shape");
 
     report(&compare("max_pool_2x2", &got.0, &want.0));
 }
@@ -530,12 +504,37 @@ const CONV3X3_W: usize = 32 * 3 * 3 * 32;
 const CONV3X3_OUT: usize = 16 * 16 * 32;
 
 fn check_conv3x3_simd_matches_ref() {
-    let input = Aligned(make_pattern::<CONV3X3_IN>(0x3EE7_5EED));
-    let weights = Aligned(make_pattern::<CONV3X3_W>(0xACC5_10A));
+    // 53 KB of buffers are carved from the SRAM bench arena (unused during
+    // validation; the kernel benches carve it afterwards — same pattern as
+    // spec.rs `carve_into`). They must NOT be stack locals: with all 18
+    // checks inlined, validate_all's frame was 0xf270 bytes and the conv3x3
+    // check's SP landed below `_stack_end_cpu0`, faulting with an exception
+    // (device finding, task 8). They must NOT be statics either: a +53 KB
+    // `.bss` hoist shrank the 65 KB stack (stack.x gives the stack whatever
+    // remains above bss) to 12 KB and the firmware faulted at boot.
+    // SAFETY: single-threaded firmware; each check runs once, sequentially.
+    let arena = unsafe { &mut *core::ptr::addr_of_mut!(crate::firmware::SRAM_ARENA) };
+    let mut off = 0usize;
+    // Base is 16-aligned and every size is a multiple of 16 → all carves are
+    // 16-aligned (the SIMD dispatch gate + VLD.128 requirement).
+    macro_rules! take_i8 {
+        ($len:expr) => {{
+            let p = unsafe { arena.0.as_mut_ptr().add(off) }.cast::<i8>();
+            off += $len;
+            unsafe { core::slice::from_raw_parts_mut(p, $len) }
+        }};
+    }
+    let input = take_i8!(CONV3X3_IN);
+    let weights = take_i8!(CONV3X3_W);
+    let want = take_i8!(CONV3X3_OUT);
+    let got = take_i8!(CONV3X3_OUT);
+    let scratch = &mut arena.0[off..off + 20480];
+    input.copy_from_slice(&make_pattern::<CONV3X3_IN>(0x3EE7_5EED));
+    weights.copy_from_slice(&make_pattern::<CONV3X3_W>(0xACC5_10A));
     let bias = bias_pattern::<32>();
-    let mut want = Aligned([0i8; CONV3X3_OUT]);
-    let mut got = Aligned([0i8; CONV3X3_OUT]);
-    let mut scratch = AlignedBytes([0u8; 20480]);
+    want.fill(0);
+    got.fill(0);
+    scratch.fill(0);
     let params = Conv2DParams {
         input_shape: [1, 16, 16, 32],
         filter_shape: [32, 3, 3, 32],
@@ -555,25 +554,25 @@ fn check_conv3x3_simd_matches_ref() {
     };
 
     hematite_ref::conv::conv2d(
-        &input.0,
-        &weights.0,
+        input,
+        weights,
         &bias,
         &params,
-        &mut want.0,
-        &mut scratch.0,
+        want,
+        scratch,
     )
     .expect("harness: ref conv3x3 shape");
     hematite_s3::conv3x3::conv2d_3x3(
-        &input.0,
-        &weights.0,
+        input,
+        weights,
         &bias,
         &params,
-        &mut got.0,
-        &mut scratch.0,
+        got,
+        scratch,
     )
     .expect("harness: s3 conv3x3 shape");
 
-    report(&compare("conv3x3_16x16x32_same", &got.0, &want.0));
+    report(&compare("conv3x3_16x16x32_same", got, want));
 }
 
 // ── FC: 256x64 (spec.rs SIMD_FC_256X64_PARAMS) ─────────────────────────────
@@ -663,7 +662,7 @@ fn check_mean_simd_matches_ref() {
 /// this is nonetheless the correct, intended full suite for real hardware
 /// or a fixed QEMU build.
 pub fn validate_all() {
-    crate::firmware::firmware_log!(
+    crate::firmware::uart0_log!(
         "=== SIMD CORRECTNESS (elementwise + pool + relu/softmax/depthwise/conv/fc/mean, vs hematite-ref) ==="
     );
     run_elementwise_check::<16>(ElemOp::Add, "add_n16");
@@ -684,5 +683,5 @@ pub fn validate_all() {
     check_conv3x3_simd_matches_ref();
     check_fc_simd_matches_ref();
     check_mean_simd_matches_ref();
-    crate::firmware::firmware_log!("=== SIMD CORRECTNESS DONE ===");
+    crate::firmware::uart0_log!("=== SIMD CORRECTNESS DONE ===");
 }

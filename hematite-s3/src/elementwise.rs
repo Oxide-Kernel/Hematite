@@ -463,31 +463,39 @@ mod elementwise_simd {
     ///
     /// * `num_elements` must be a multiple of 16 (16-wide SIMD lanes).
     /// * All pointers must be 16-byte aligned for EE.VLD.128.IP / EE.VST.128.IP.
+    ///
+    /// # Register-hazard note (device finding, task 8)
+    ///
+    /// The previous `mov a10,{output}` template style is unsafe: LLVM may
+    /// allocate an `in(reg)` operand to a register the template itself
+    /// overwrites first (observed: `input2`→a10 and `args`→a11, so the
+    /// template's own `mov a10`/`mov a11` clobbered them and the kernel
+    /// received `a12=output` / `a13=input1` — it then read the "length" from
+    /// input1+44 (garbage) and wrote 16-byte chunks across DRAM until it hit
+    /// unmapped memory, corrupting the defmt `RTT_ENCODER.taken` flag on the
+    /// way — the task-5 "defmt logger taken reentrantly" panic is a symptom of
+    /// that walk). Same fix as `avg_pool_2d_simd_ctx`: pinned-register
+    /// operands, no `mov` template, plain struct literal, `#[inline(never)]`.
     #[allow(dead_code)]
+    #[inline(never)]
     pub unsafe fn add_simd_aligned(
         output: *mut i8,
         input1: *const i8,
         input2: *const i8,
         num_elements: u32,
     ) {
-        // Only the length field (@44) is read by the asm.
-        let mut args = core::mem::MaybeUninit::<AddSubAlignedArgs>::uninit();
-        args.as_mut_ptr()
-            .cast::<u8>()
-            .add(44)
-            .cast::<u32>()
-            .write(num_elements);
-        let args = unsafe { args.assume_init_ref() };
+        // Plain struct literal — the MaybeUninit pointer-cast build is
+        // miscompiled by the Xtensa LLVM backend (pool.rs precedent).
+        let args = AddSubAlignedArgs {
+            length: num_elements,
+            ..Default::default()
+        };
         core::arch::asm!(
-            "mov a10, {output}",
-            "mov a11, {input1}",
-            "mov a12, {input2}",
-            "mov a13, {args}",
             "call8 dl_tie728_s8_add_w1_16_w2_16",
-            output = in(reg) output,
-            input1 = in(reg) input1,
-            input2 = in(reg) input2,
-            args = in(reg) args,
+            in("a10") output,
+            in("a11") input1,
+            in("a12") input2,
+            in("a13") &args,
             clobber_abi("C"),
         );
     }
@@ -510,7 +518,11 @@ mod elementwise_simd {
     /// * All pointers 16-byte aligned.
     /// * `mul_shift`: right-shift for requantize rounding
     ///   (`tie728_s8_vector_round_result` macro). Set to 0 for no shift.
+    ///
+    /// Pinned-register operands (no `mov` template) + plain struct literal —
+    /// same register-hazard fix as `add_simd_aligned` (task-8 device finding).
     #[allow(dead_code)]
+    #[inline(never)]
     pub unsafe fn mul_simd_aligned(
         output: *mut i8,
         input1: *const i8,
@@ -518,22 +530,17 @@ mod elementwise_simd {
         num_elements: u32,
         mul_shift: i32,
     ) {
-        // Only c_div_x_1 (@64) and mul_shift (@80) are read by the asm.
-        let mut args = core::mem::MaybeUninit::<MulAlignedArgs>::uninit();
-        let p = args.as_mut_ptr();
-        p.cast::<u8>().add(64).cast::<i32>().write((num_elements / 16) as i32 - 1);
-        p.cast::<u8>().add(80).cast::<i32>().write(mul_shift);
-        let args = unsafe { args.assume_init_ref() };
+        let args = MulAlignedArgs {
+            c_div_x_1: (num_elements / 16) as i32 - 1,
+            mul_shift,
+            ..Default::default()
+        };
         core::arch::asm!(
-            "mov a10, {output}",
-            "mov a11, {input1}",
-            "mov a12, {input2}",
-            "mov a13, {args}",
             "call8 dl_tie728_s8_mul_w1_16_w2_16",
-            output = in(reg) output,
-            input1 = in(reg) input1,
-            input2 = in(reg) input2,
-            args = in(reg) args,
+            in("a10") output,
+            in("a11") input1,
+            in("a12") input2,
+            in("a13") &args,
             clobber_abi("C"),
         );
     }
@@ -554,31 +561,27 @@ mod elementwise_simd {
     ///
     /// * `num_elements` must be a multiple of 16.
     /// * All pointers 16-byte aligned.
+    ///
+    /// Pinned-register operands (no `mov` template) + plain struct literal —
+    /// same register-hazard fix as `add_simd_aligned` (task-8 device finding).
     #[allow(dead_code)]
+    #[inline(never)]
     pub unsafe fn sub_simd_aligned(
         output: *mut i8,
         input1: *const i8,
         input2: *const i8,
         num_elements: u32,
     ) {
-        // Only the length field (@44) is read by the asm.
-        let mut args = core::mem::MaybeUninit::<AddSubAlignedArgs>::uninit();
-        args.as_mut_ptr()
-            .cast::<u8>()
-            .add(44)
-            .cast::<u32>()
-            .write(num_elements);
-        let args = unsafe { args.assume_init_ref() };
+        let args = AddSubAlignedArgs {
+            length: num_elements,
+            ..Default::default()
+        };
         core::arch::asm!(
-            "mov a10, {output}",
-            "mov a11, {input1}",
-            "mov a12, {input2}",
-            "mov a13, {args}",
             "call8 dl_tie728_s8_sub_w1_16_w2_16",
-            output = in(reg) output,
-            input1 = in(reg) input1,
-            input2 = in(reg) input2,
-            args = in(reg) args,
+            in("a10") output,
+            in("a11") input1,
+            in("a12") input2,
+            in("a13") &args,
             clobber_abi("C"),
         );
     }
