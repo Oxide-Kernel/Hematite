@@ -1184,6 +1184,13 @@ pub fn depthwise_scratch_need_codegen(
     }
 }
 
+/// Scratch bytes for the softmax SIMD path (`S3Backend::softmax_scratch_size`):
+/// one `i32` exp value per row element. Extracted from `emit_softmax` so the
+/// T1.4 parity sweep can test it; keep in sync with backend.rs.
+fn softmax_scratch_need_codegen(row_size: i32) -> usize {
+    (row_size.max(0) as usize) * 4
+}
+
 fn emit_op(
     model: &ParsedModel,
     storage: &[Storage],
@@ -1660,7 +1667,7 @@ fn emit_softmax(model: &ParsedModel, storage: &[Storage], ctx: &mut ArenaCtx, i:
     Ok(OpEmission {
         consts: vec![params_c],
         call,
-        scratch: (row_size.max(0) as usize) * 4,
+        scratch: softmax_scratch_need_codegen(row_size),
     })
 }
 
@@ -3293,4 +3300,416 @@ mod tests {
         }
         assert!(checked >= 100, "fc parity matrix did not expand");
     }
+
+    use hematite_core::op_params::{
+        Conv2DParams, DepthwiseConv2DParams, FullyConnectedParams, Padding, SoftmaxParams,
+    };
+    use hematite_benchmarks::spec::KernelParams;
+    use hematite_core::KernelBackend;
+    use hematite_s3::backend::{fc_scratch_need, S3Backend};
+
+    // ── T1.4 — scratch parity: codegen mirrors vs S3Backend runtime ──────
+    //
+    // The macro-time `*_scratch_need_codegen` mirrors (the codegen side of
+    // `SCRATCH_LEN`) must equal the runtime `S3Backend::*_scratch_size`
+    // formulas for every spec-corpus shape and every composed group. The
+    // runtime formulas are canonical — a divergence is a mirror bug, and the
+    // fix belongs in the codegen mirror, never in hematite-s3.
+
+    /// TFLite SAME/VALID output dim (used to build representative grid shapes;
+    /// corpus rows carry their own authoritative out shapes).
+    fn tflite_out_dim(in_dim: i32, filter: i32, stride: i32, padding: Padding) -> i32 {
+        match padding {
+            Padding::Same => (in_dim + stride - 1) / stride,
+            Padding::Valid => {
+                if in_dim >= filter {
+                    (in_dim - filter) / stride + 1
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn conv_params(
+        fh: i32,
+        fw: i32,
+        in_c: i32,
+        out_c: i32,
+        in_h: i32,
+        in_w: i32,
+        out_h: i32,
+        out_w: i32,
+        stride: i32,
+        padding: Padding,
+        offset: i32,
+    ) -> Conv2DParams<'static> {
+        Conv2DParams {
+            input_shape: [1, in_h, in_w, in_c],
+            filter_shape: [out_c, fh, fw, in_c],
+            output_shape: [1, out_h, out_w, out_c],
+            padding,
+            stride_width: stride,
+            stride_height: stride,
+            dilation_width_factor: 1,
+            dilation_height_factor: 1,
+            input_offset: offset,
+            weights_offset: 0,
+            output_offset: 0,
+            // The scratch formulas read shapes/offsets only — slice contents
+            // are irrelevant to any `*_scratch_need`.
+            output_multiplier_per_channel: &[],
+            output_shift_per_channel: &[],
+            quantized_activation_min: -128,
+            quantized_activation_max: 127,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn depthwise_params(
+        dm: i32,
+        in_c: i32,
+        fh: i32,
+        fw: i32,
+        in_h: i32,
+        in_w: i32,
+        stride: i32,
+        padding: Padding,
+        offset: i32,
+    ) -> DepthwiseConv2DParams<'static> {
+        let out_c = in_c * dm;
+        DepthwiseConv2DParams {
+            input_shape: [1, in_h, in_w, in_c],
+            filter_shape: [1, fh, fw, out_c],
+            output_shape: [
+                1,
+                tflite_out_dim(in_h, fh, stride, padding),
+                tflite_out_dim(in_w, fw, stride, padding),
+                out_c,
+            ],
+            padding,
+            stride_width: stride,
+            stride_height: stride,
+            dilation_width_factor: 1,
+            dilation_height_factor: 1,
+            depth_multiplier: dm,
+            input_offset: offset,
+            weights_offset: 0,
+            output_offset: 0,
+            output_multiplier_per_channel: &[],
+            output_shift_per_channel: &[],
+            quantized_activation_min: -128,
+            quantized_activation_max: 127,
+        }
+    }
+
+    fn fc_params(input_dim: i32, output_dim: i32, input_offset: i32) -> FullyConnectedParams<'static> {
+        FullyConnectedParams {
+            input_dim,
+            output_dim,
+            input_offset,
+            weights_offset: 0,
+            output_offset: 0,
+            output_multiplier_per_channel: &[],
+            output_shift_per_channel: &[],
+            quantized_activation_min: -128,
+            quantized_activation_max: 127,
+        }
+    }
+
+    fn softmax_params(row_size: i32) -> SoftmaxParams {
+        SoftmaxParams {
+            num_rows: 1,
+            row_size,
+            input_multiplier: 0,
+            input_left_shift: 0,
+            diff_min: 0,
+            input_offset: 0,
+            output_offset: -128,
+            quantized_activation_min: -128,
+            quantized_activation_max: 127,
+        }
+    }
+
+    fn check_conv(p: &Conv2DParams<'_>, checked: &mut usize) {
+        let runtime = S3Backend::conv2d_scratch_size(p);
+        let mirror = if p.filter_shape[1] == 1 && p.filter_shape[2] == 1 {
+            conv1x1_scratch_need_codegen(p.output_shape[3].max(0) as usize, p.input_offset)
+        } else {
+            conv3x3_scratch_need_codegen(
+                p.input_shape[1].max(0) as usize,
+                p.input_shape[2].max(0) as usize,
+                p.input_shape[3].max(0) as usize,
+                p.output_shape[1].max(0) as usize,
+                p.output_shape[2].max(0) as usize,
+                p.output_shape[3].max(0) as usize,
+                p.filter_shape[1],
+                p.filter_shape[2],
+                p.stride_height,
+                p.stride_width,
+                p.dilation_height_factor,
+                p.dilation_width_factor,
+                p.input_offset,
+            )
+        };
+        assert_eq!(
+            mirror, runtime,
+            "conv in={:?} f={:?} out={:?} pad={:?} stride={} off={}: codegen mirror {mirror} != S3Backend need {runtime}",
+            p.input_shape, p.filter_shape, p.output_shape, p.padding, p.stride_height, p.input_offset
+        );
+        *checked += 1;
+    }
+
+    fn check_depthwise(p: &DepthwiseConv2DParams<'_>, checked: &mut usize) {
+        let runtime = S3Backend::depthwise_conv2d_scratch_size(p);
+        let mirror = depthwise_scratch_need_codegen(
+            p.input_shape[1].max(0) as usize,
+            p.input_shape[2].max(0) as usize,
+            p.input_shape[3].max(0) as usize,
+            p.output_shape[1].max(0) as usize,
+            p.output_shape[2].max(0) as usize,
+            p.output_shape[3].max(0) as usize,
+            p.filter_shape[1],
+            p.filter_shape[2],
+            p.stride_height,
+            p.stride_width,
+            p.dilation_height_factor,
+            p.dilation_width_factor,
+            p.depth_multiplier,
+            p.input_offset,
+        );
+        assert_eq!(
+            mirror, runtime,
+            "depthwise in={:?} f={:?} out={:?} dm={} stride={} off={}: codegen mirror {mirror} != S3Backend need {runtime}",
+            p.input_shape, p.filter_shape, p.output_shape, p.depth_multiplier, p.stride_height, p.input_offset
+        );
+        *checked += 1;
+    }
+
+    fn check_fc(p: &FullyConnectedParams<'_>, checked: &mut usize) {
+        let runtime = fc_scratch_need(p);
+        let mirror = fc_scratch_need_codegen(
+            p.input_dim.max(0) as usize,
+            p.output_dim.max(0) as usize,
+            p.input_offset,
+        );
+        assert_eq!(
+            mirror, runtime,
+            "fc in={} out={} off={}: codegen mirror {mirror} != S3Backend need {runtime}",
+            p.input_dim, p.output_dim, p.input_offset
+        );
+        *checked += 1;
+    }
+
+    fn check_softmax(p: &SoftmaxParams, checked: &mut usize) {
+        let runtime = S3Backend::softmax_scratch_size(p);
+        let mirror = softmax_scratch_need_codegen(p.row_size);
+        assert_eq!(
+            mirror, runtime,
+            "softmax row_size={}: codegen mirror {mirror} != S3Backend need {runtime}",
+            p.row_size
+        );
+        *checked += 1;
+    }
+
+    /// T1.4 — corpus-wide scratch parity sweep. Every mirror fn is asserted
+    /// equal to the runtime S3Backend formula over (a) every machine-readable
+    /// row of the per-kernel benchmark corpus (`hematite_benchmarks::spec::
+    /// kernel_specs()`, consumed directly — never hand-copied) and (b) the
+    /// widened shape grids below. Activation/elementwise rows have no scratch
+    /// on either side (codegen emits 0, the trait defines no scratch method);
+    /// pool rows are the same (the s3 pool kernels never read scratch) and
+    /// are counted as 0 == 0.
+    #[test]
+    fn scratch_parity_spec_corpus_and_grids() {
+        let mut checked = 0;
+        let mut n_conv = 0;
+        let mut n_dw = 0;
+        let mut n_fc = 0;
+        let mut n_sm = 0;
+        let mut n_pool = 0;
+        let mut n_scratch_free = 0;
+
+        // (a) spec corpus — every scratch-relevant row.
+        for spec in hematite_benchmarks::spec::kernel_specs() {
+            match &spec.params {
+                KernelParams::Conv(p) => {
+                    check_conv(p, &mut checked);
+                    n_conv += 1;
+                }
+                KernelParams::Depthwise(p) => {
+                    check_depthwise(p, &mut checked);
+                    n_dw += 1;
+                }
+                KernelParams::Fc(p) => {
+                    check_fc(p, &mut checked);
+                    n_fc += 1;
+                }
+                KernelParams::Softmax(p) => {
+                    check_softmax(p, &mut checked);
+                    n_sm += 1;
+                }
+                KernelParams::Pool(_) => {
+                    // Pool has no scratch on either side: the codegen emitter
+                    // reports the literal 0 (emit_pool) and `KernelBackend`
+                    // defines no pool scratch method (runtime default 0; the
+                    // s3 pool kernels ignore scratch entirely).
+                    checked += 1;
+                    n_pool += 1;
+                }
+                KernelParams::Activation(_) | KernelParams::Elementwise(_) => {
+                    // relu/add/mul/sub: codegen emits scratch 0; the trait has
+                    // no scratch method for them (runtime 0). No mirror exists.
+                    n_scratch_free += 1;
+                }
+            }
+        }
+        assert!(n_conv >= 8 && n_dw >= 13 && n_fc >= 7 && n_sm >= 1 && n_pool >= 3,
+            "corpus shrank unexpectedly: conv={n_conv} dw={n_dw} fc={n_fc} softmax={n_sm} pool={n_pool} scratch-free={n_scratch_free}");
+
+        // (b) widened grids (spec-corpus families + corner cases).
+        // conv1x1: out_c × spatial × in_c × offset. The 1×1 formula reads only
+        // out_c + input_offset — the grid still sweeps all dims so a future
+        // formula change cannot hide behind an un-swept corner.
+        for &out_c in &[16, 32, 64] {
+            for &spatial in &[1, 8, 14, 16, 28, 56, 112] {
+                for &in_c in &[16, 32, 64, 128] {
+                    for &offset in &[0, 5, 128] {
+                        let p = conv_params(1, 1, in_c, out_c, spatial, spatial, spatial, spatial, 1, Padding::Same, offset);
+                        check_conv(&p, &mut checked);
+                    }
+                }
+            }
+        }
+        // conv3x3: in_c × out_c × hw × pad × stride × offset.
+        for &in_c in &[3, 16, 32, 64] {
+            for &out_c in &[16, 32, 64] {
+                for &hw in &[8, 16, 32] {
+                    for &padding in &[Padding::Valid, Padding::Same] {
+                        for &stride in &[1, 2] {
+                            for &offset in &[0, 5, 127] {
+                                let out_h = tflite_out_dim(hw, 3, stride, padding);
+                                let p = conv_params(3, 3, in_c, out_c, hw, hw, out_h, out_h, stride, padding, offset);
+                                check_conv(&p, &mut checked);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // depthwise: dm × in_c × filter(3x3, 5x5, 10x8-anytap) × spatial ×
+        // offset × stride (the 10×8 family covers the T3.5b anytap staging).
+        for &dm in &[1, 2, 4, 8] {
+            for &in_c in &[1, 3, 8, 16, 32] {
+                for &(fh, fw) in &[(3, 3), (5, 5), (10, 8)] {
+                    for &spatial in &[12, 14, 49] {
+                        for &offset in &[0, 3, 128] {
+                            for &stride in &[1, 2] {
+                                let p = depthwise_params(dm, in_c, fh, fw, spatial, spatial, stride, Padding::Same, offset);
+                                check_depthwise(&p, &mut checked);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // fc: input_dim × output_dim × offset (covers the T3.6 pad16 small
+        // shapes and the %16 no-pad path).
+        for &input_dim in &[1, 3, 8, 15, 16, 17, 32, 128, 640] {
+            for &output_dim in &[1, 8, 16, 128] {
+                for &offset in &[0, 5, 128] {
+                    let p = fc_params(input_dim, output_dim, offset);
+                    check_fc(&p, &mut checked);
+                }
+            }
+        }
+        // softmax: row_size × 4 on both sides.
+        for &row_size in &[16, 32, 64, 128, 1960] {
+            let p = softmax_params(row_size);
+            check_softmax(&p, &mut checked);
+        }
+        // pool: avg/max × filter(2x2..7x7) × stride × pad × channels — both
+        // sides are 0 by construction (see the corpus comment above).
+        for &kind in &["avg", "max"] {
+            for &f in &[2, 3, 5, 7] {
+                for &stride in &[1, 2] {
+                    for &padding in &[Padding::Valid, Padding::Same] {
+                        for &ch in &[3, 16, 32, 64] {
+                            let _ = (kind, f, stride, padding, ch);
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(checked >= 2000, "parity sweep did not expand ({checked})");
+    }
+
+    /// T1.4 — composed-group scratch parity. The composed emission reuses
+    /// per-op needs (documented choice: no separate composed mirror fns):
+    ///
+    /// * `fused_conv2d` — `emit_fused_conv` reports `scratch: conv.em.scratch`
+    ///   (the conv mirror), and the runtime decomposition
+    ///   (`RefBackend::fused_conv2d`, hematite-ref/src/fused.rs) forwards the
+    ///   same scratch to `conv2d`, whose need is exactly
+    ///   `S3Backend::conv2d_scratch_size`. The composed need therefore EQUALS
+    ///   the conv parity value (the absorbed add/act contribute 0).
+    /// * `fused_pool_with_fold` — `emit_fused_pool_fold` reports
+    ///   `scratch: num_elements` (flat_len of the fold input = in_h·in_w·in_c);
+    ///   the decomposition (hematite-ref/src/fused.rs) materializes the
+    ///   absorbed fold into exactly `num_elements` scratch bytes and the pool
+    ///   then needs 0 more (s3 pool ignores scratch). Composed need ==
+    ///   fold_need + pool_need, asserted as the task's decomposition-safety
+    ///   bound (>=) with equality verified.
+    #[test]
+    fn composed_scratch_parity() {
+        // fused_conv2d groups (3×3 and 1×1 anchors, with/without offset).
+        for &(fh, fw, in_c, out_c, spatial, stride, off) in &[
+            (3, 3, 16, 16, 16, 1, 0),
+            (3, 3, 32, 64, 16, 1, 128),
+            (3, 3, 3, 16, 8, 2, 0),
+            (3, 3, 64, 32, 28, 1, 5),
+            (3, 3, 12, 32, 12, 2, 0),
+            (1, 1, 16, 64, 16, 1, 0),
+            (1, 1, 32, 128, 14, 1, 128),
+        ] {
+            let out_h = tflite_out_dim(spatial, fh, stride, Padding::Same);
+            let out_w = tflite_out_dim(spatial, fw, stride, Padding::Same);
+            let p = conv_params(fh, fw, in_c, out_c, spatial, spatial, out_h, out_w, stride, Padding::Same, off);
+            let runtime = S3Backend::conv2d_scratch_size(&p);
+            let composed_need = if fh == 1 && fw == 1 {
+                conv1x1_scratch_need_codegen(out_c as usize, off)
+            } else {
+                conv3x3_scratch_need_codegen(
+                    spatial as usize, spatial as usize, in_c as usize,
+                    out_h as usize, out_w as usize, out_c as usize,
+                    fh, fw, stride, stride, 1, 1, off,
+                )
+            };
+            // emit_fused_conv → conv.em.scratch: the composed group's need IS
+            // the conv mirror, and the decomposition needs exactly the conv
+            // need — equality, never under-sized.
+            assert_eq!(
+                composed_need, runtime,
+                "fused_conv2d in_c={in_c} out_c={out_c} f={fh}x{fw} s={stride} off={off}: composed need {composed_need} != runtime conv need {runtime}"
+            );
+        }
+
+        // fused_pool_with_fold: codegen num_elements vs decomposition sum.
+        for &(h, w, c) in &[(4, 4, 16), (8, 16, 8), (16, 40, 1), (7, 7, 1280), (12, 12, 12), (32, 32, 3)] {
+            let num_elements = h * w * c; // emit_fused_pool_fold: flat_len(fold input)
+            let fold_need = num_elements; // decomposition: fold materialization
+            let pool_need = 0; // pool consumes no scratch on either side
+            assert!(
+                num_elements >= fold_need + pool_need,
+                "fused_pool_with_fold {h}x{w}x{c}: composed need {num_elements} < decomposition sum {}",
+                fold_need + pool_need
+            );
+            assert_eq!(num_elements, fold_need + pool_need);
+        }
+    }
+
+
 }

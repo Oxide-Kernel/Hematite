@@ -834,6 +834,7 @@ dependencies = [
 name = "hematite-codegen"
 version = "0.1.0"
 dependencies = [
+ "hematite-benchmarks",
  "hematite-core",
  "hematite-memory",
  "hematite-ref",

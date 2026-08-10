@@ -22,6 +22,11 @@ syn = { workspace = true }
 # the runtime `S3Backend::*_scratch_size` computations. The dev-dep keeps the
 # proc-macro lib itself free of any runtime backend dependency.
 hematite-s3 = { path = "../hematite-s3" }
+# T1.4: the parity sweep consumes the machine-readable per-kernel corpus
+# (`spec::kernel_specs()`) directly — the test never hand-copies spec shapes.
+# hematite-benchmarks' own dependency on hematite-codegen is optional
+# (model-validation feature, off here), so this dev-dep edge does not cycle.
+hematite-benchmarks = { path = "../hematite-benchmarks" }
 # T1.2 fused-vs-unfused equivalence gate: runs every zoo model twice
 # (`#[model]` fused vs `#[model_unfused]` per-op) through `RefBackend` and
 # asserts element-equal outputs + identical FNV-1a.
