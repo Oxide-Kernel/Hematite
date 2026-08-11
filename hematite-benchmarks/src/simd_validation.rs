@@ -871,6 +871,68 @@ fn check_conv1x1_simd_matches_ref() {
     report(&compare("conv1x1_64x1x1x64", got, want));
 }
 
+// ── Conv 1x1 channel-padded (T3.3): 3ch → 16ch, pad-in-scratch ──────────────
+//
+// input_c 3 (< 16, non-%16) gates out of the strict `% 16` gate and now
+// dispatches SIMD via zero-pad-in-scratch on device. The engagement flag
+// (`conv1x1_padded_took_simd`) asserts the padded SIMD path ACTUALLY ran —
+// the eligibility mirror alone cannot see runtime pointer alignment.
+
+const CONV1X1_PAD3_IN: usize = 1 * 1 * 3;
+const CONV1X1_PAD3_W: usize = 16 * 1 * 1 * 3;
+const CONV1X1_PAD3_OUT: usize = 1 * 1 * 16;
+
+fn check_conv1x1_padded_3ch_matches_ref() {
+    let mut off = 0;
+    let input = arena_carve_i8(&mut off, (CONV1X1_PAD3_IN + 15) & !15);
+    let weights = arena_carve_i8(&mut off, (CONV1X1_PAD3_W + 15) & !15);
+    let want = arena_carve_i8(&mut off, (CONV1X1_PAD3_OUT + 15) & !15);
+    let got = arena_carve_i8(&mut off, (CONV1X1_PAD3_OUT + 15) & !15);
+    // Staged padded input (1 px × 16) + padded weights (16×16) + accs (16×4)
+    // + wsum (16×4) = 592 bytes; carve 1024 for head room.
+    let scratch = arena_carve(&mut off, 1024);
+    let input = &mut input[..CONV1X1_PAD3_IN];
+    let weights = &mut weights[..CONV1X1_PAD3_W];
+    let want = &mut want[..CONV1X1_PAD3_OUT];
+    let got = &mut got[..CONV1X1_PAD3_OUT];
+    fill_pattern_slice(0x3C1_A0, input);
+    fill_pattern_slice(0x5EED_0FF, weights);
+    let bias = bias_pattern::<16>();
+    want.fill(0);
+    got.fill(0);
+    scratch.fill(0);
+    let params = Conv2DParams {
+        input_shape: [1, 1, 1, 3],
+        filter_shape: [16, 1, 1, 3],
+        output_shape: [1, 1, 1, 16],
+        padding: Padding::Same,
+        stride_width: 1,
+        stride_height: 1,
+        dilation_width_factor: 1,
+        dilation_height_factor: 1,
+        input_offset: 128,
+        weights_offset: 0,
+        output_offset: -10,
+        output_multiplier_per_channel: &MULT_16,
+        output_shift_per_channel: &SHIFT_16,
+        quantized_activation_min: -128,
+        quantized_activation_max: 127,
+    };
+
+    hematite_ref::conv::conv2d(input, weights, &bias, &params, want, scratch)
+        .expect("harness: ref conv1x1 padded shape");
+    hematite_s3::conv1x1::conv2d_1x1(input, weights, &bias, &params, got, scratch)
+        .expect("harness: s3 conv1x1 padded shape");
+
+    let simd = if hematite_s3::conv1x1::conv1x1_padded_took_simd() {
+        "SIMD"
+    } else {
+        "scalar"
+    };
+    crate::firmware::uart0_log!("simd conv1x1_padded_3ch path: {}", simd);
+    report(&compare("conv1x1_padded_3ch", got, want));
+}
+
 // ── Conv 3x3: 16x16x32 SAME (spec.rs SIMD_CONV3X3_SAME_PARAMS) ─────────────
 
 const CONV3X3_IN: usize = 16 * 16 * 32;
@@ -1383,6 +1445,7 @@ pub fn validate_all() {
     check_depthwise_dm8_simd_matches_ref();
     check_depthwise_kws10x8_simd_matches_ref();
     check_conv1x1_simd_matches_ref();
+    check_conv1x1_padded_3ch_matches_ref();
     check_conv3x3_simd_matches_ref();
     check_fc_simd_matches_ref();
     check_fc_small_simd_matches_ref();

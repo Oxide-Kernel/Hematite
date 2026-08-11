@@ -739,6 +739,146 @@ const SIMD_FC_8X128_PARAMS: FullyConnectedParams<'static> = FullyConnectedParams
     quantized_activation_max: 127,
 };
 
+// ── Conv1x1 channel-padded shapes (T3.3 pad-in-scratch widening) ─────────────
+
+/// 1×1 conv, input_c 3 (non-%16) — the first-conv family (e.g. a 3-channel
+/// pointwise). input_c 3 is zero-padded to 16 in scratch, then the TIE728
+/// 11cn path runs.
+const SIMD_CONV1X1_PAD_3CH_PARAMS: Conv2DParams<'static> = Conv2DParams {
+    input_shape: [1, 1, 1, 3],
+    filter_shape: [16, 1, 1, 3],
+    output_shape: [1, 1, 1, 16],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 1×1 conv, input_c 3, non-zero input_offset 128 (Phase-C fold over padded
+/// weight rows).
+const SIMD_CONV1X1_PAD_3CH_OFF_PARAMS: Conv2DParams<'static> = Conv2DParams {
+    input_shape: [1, 1, 1, 3],
+    filter_shape: [16, 1, 1, 3],
+    output_shape: [1, 1, 1, 16],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    input_offset: 128,
+    weights_offset: 0,
+    output_offset: -10,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 1×1 conv, input_c 8 over 4×4 spatial, input_offset 128 — the
+/// anomaly_detect-style small-channel fold with spatial pixels.
+const SIMD_CONV1X1_PAD_8CH_PARAMS: Conv2DParams<'static> = Conv2DParams {
+    input_shape: [1, 4, 4, 8],
+    filter_shape: [16, 1, 1, 8],
+    output_shape: [1, 4, 4, 16],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    input_offset: 128,
+    weights_offset: 0,
+    output_offset: 5,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 1×1 conv, input_c 15 (pad to 16), input_offset 5.
+const SIMD_CONV1X1_PAD_15CH_PARAMS: Conv2DParams<'static> = Conv2DParams {
+    input_shape: [1, 1, 1, 15],
+    filter_shape: [16, 1, 1, 15],
+    output_shape: [1, 1, 1, 16],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    input_offset: 5,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 1×1 conv, input_c 1 (pad to 16) — the degenerate single-channel
+/// pointwise family.
+const SIMD_CONV1X1_PAD_1CH_PARAMS: Conv2DParams<'static> = Conv2DParams {
+    input_shape: [1, 1, 1, 1],
+    filter_shape: [16, 1, 1, 1],
+    output_shape: [1, 1, 1, 16],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 1×1 conv, input_c 17 (pads to 32), 2×2 spatial.
+const SIMD_CONV1X1_PAD_17CH_PARAMS: Conv2DParams<'static> = Conv2DParams {
+    input_shape: [1, 2, 2, 17],
+    filter_shape: [16, 1, 1, 17],
+    output_shape: [1, 2, 2, 16],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 1×1 conv, input_c 32 (%16, no pad) — the T3.3 no-pad control row.
+const SIMD_CONV1X1_PAD_32CH_PARAMS: Conv2DParams<'static> = Conv2DParams {
+    input_shape: [1, 1, 1, 32],
+    filter_shape: [16, 1, 1, 32],
+    output_shape: [1, 1, 1, 16],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
 /// 2×2 max-pool, stride 2, VALID, channels 16 (%16) — fires
 /// `dl_tie728_s8_max_pool2d_22c1` (hardcoded 2x2/stride-2 pattern).
 const SIMD_MAXPOOL_32X32_PARAMS: PoolParams = PoolParams {
@@ -1551,6 +1691,62 @@ pub const fn kernel_specs() -> &'static [KernelSpec] {
                 source: "plan composed-kernels Scope table (user-verified 2026-08-10): anomaly 28,550,253 → 7,758,145 cyc (3.7x). Measured Hematite row lands in T6.x (on-device).",
             }),
             note: "T3.6 anomaly_detect 6th dense (the only gated-out FC): input_dim 8 zero-padded to 16; non-zero input_offset fold over padded rows.",
+        },
+        KernelSpec {
+            name: "conv1x1_s8 1x1,3->16 (padded, T3.3)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Conv2d1x1,
+            params: KernelParams::Conv(&SIMD_CONV1X1_PAD_3CH_PARAMS),
+            reference: None,
+            note: "T3.3 first-conv family row: input_c 3 (<16, previously gated out) zero-padded to 16 in scratch; TIE728 11cn SIMD.",
+        },
+        KernelSpec {
+            name: "conv1x1_s8 1x1,3->16 off128 (padded, T3.3)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Conv2d1x1,
+            params: KernelParams::Conv(&SIMD_CONV1X1_PAD_3CH_OFF_PARAMS),
+            reference: None,
+            note: "T3.3 input_c 3 padded; non-zero input_offset fold over padded weight rows (Phase C).",
+        },
+        KernelSpec {
+            name: "conv1x1_s8 4x4,8->16 off128 (padded, T3.3)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Conv2d1x1,
+            params: KernelParams::Conv(&SIMD_CONV1X1_PAD_8CH_PARAMS),
+            reference: None,
+            note: "T3.3 input_c 8 padded; spatial 4×4 pixel loop over the staged padded input; input_offset fold.",
+        },
+        KernelSpec {
+            name: "conv1x1_s8 1x1,15->16 off5 (padded, T3.3)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Conv2d1x1,
+            params: KernelParams::Conv(&SIMD_CONV1X1_PAD_15CH_PARAMS),
+            reference: None,
+            note: "T3.3 input_c 15 (pad to 16), input_offset 5 fold.",
+        },
+        KernelSpec {
+            name: "conv1x1_s8 1x1,1->16 (padded, T3.3)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Conv2d1x1,
+            params: KernelParams::Conv(&SIMD_CONV1X1_PAD_1CH_PARAMS),
+            reference: None,
+            note: "T3.3 degenerate single-channel pointwise: input_c 1 padded to 16.",
+        },
+        KernelSpec {
+            name: "conv1x1_s8 2x2,17->16 (padded, T3.3)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Conv2d1x1,
+            params: KernelParams::Conv(&SIMD_CONV1X1_PAD_17CH_PARAMS),
+            reference: None,
+            note: "T3.3 input_c 17 (pad to 32), 2×2 spatial.",
+        },
+        KernelSpec {
+            name: "conv1x1_s8 1x1,32->16 (no-pad, T3.3)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Conv2d1x1,
+            params: KernelParams::Conv(&SIMD_CONV1X1_PAD_32CH_PARAMS),
+            reference: None,
+            note: "T3.3 no-pad control row: input_c 32 (%16) takes the strict direct path.",
         },
         KernelSpec {
             name: "depthwise_s8 12x12,16x3x3x16 S2 SAME (SIMD)",
@@ -3217,6 +3413,15 @@ mod tests {
                         // T3.6 — FC accepts any input_dim >= 1: small /
                         // non-16 input dims are zero-padded in scratch.
                         KernelParams::Fc(_) => in_c >= 1 && out_c >= 1,
+                        // T3.3 — 1×1 convs accept any in_c >= 1: non-%16
+                        // input channels are zero-padded in scratch (the
+                        // strict `% 16` gate stays the direct path; this
+                        // widened gate feeds the padded emulation below).
+                        KernelParams::Conv(p)
+                            if p.filter_shape[1] == 1 && p.filter_shape[2] == 1 =>
+                        {
+                            in_c >= 1 && out_c >= 1
+                        }
                         _ => in_c >= 16 && in_c % 16 == 0 && out_c >= 1,
                     }
                 };
@@ -3234,58 +3439,122 @@ mod tests {
                         let stride_w = p.stride_width as usize;
                         let dil_h = p.dilation_height_factor as usize;
                         let dil_w = p.dilation_width_factor as usize;
-                        // Mirror the dispatch's SAME-pad derivation (same formula
-                        // as conv3x3.rs conv3x3_accx_dispatch). The ACCX kernel
-                        // runs on a zero-padded copy, so out-of-padded-bounds taps
-                        // contribute 0 — equivalent to skipping them here.
-                        let dilated_h = (p.filter_shape[1] - 1) * p.dilation_height_factor + 1;
-                        let dilated_w = (p.filter_shape[2] - 1) * p.dilation_width_factor + 1;
-                        let pad_h = (((out_h as i32 - 1) * p.stride_height + dilated_h - p.input_shape[1])
-                            / 2)
-                            .max(0) as usize;
-                        let pad_w = (((out_w as i32 - 1) * p.stride_width + dilated_w - p.input_shape[2])
-                            / 2)
-                            .max(0) as usize;
-                        for oh in 0..out_h {
-                            for ow in 0..out_w {
-                                for oc in 0..out_c {
-                                    let mut acc: i64 = 0;
-                                    for tap in 0..taps {
-                                        let (kh, kw) = if taps == 9 {
-                                            (tap / 3, tap % 3)
-                                        } else {
-                                            (0, 0)
-                                        };
-                                        let ih = (oh * stride_h + kh * dil_h) as i32 - pad_h as i32;
-                                        let iw = (ow * stride_w + kw * dil_w) as i32 - pad_w as i32;
-                                        if ih < 0 || iw < 0 || ih as usize >= in_h || iw as usize >= in_w
-                                        {
-                                            continue;
+                        // T3.3 — 1×1 convs with non-%16 input channels: the
+                        // SIMD dispatch stages a zero-padded input copy (each
+                        // NHWC pixel padded to `padded_c`) AND zero-padded
+                        // weight rows, runs the kernel on the padded buffers,
+                        // then folds `input_offset` via weight sums over the
+                        // padded rows. Padded lanes contribute 0×0 = 0 — this
+                        // equals the scalar `Σ (in + off)·w` exactly. Mirror
+                        // the pad-in-scratch here.
+                        let is_1x1_padded =
+                            p.filter_shape[1] == 1 && p.filter_shape[2] == 1 && in_c % 16 != 0;
+                        if is_1x1_padded {
+                            let padded_c = in_c.div_ceil(16) * 16;
+                            for oh in 0..out_h {
+                                for ow in 0..out_w {
+                                    let pixel = oh * in_w + ow;
+                                    for oc in 0..out_c {
+                                        let mut raw: i64 = 0;
+                                        let mut wsum: i64 = 0;
+                                        for ic in 0..padded_c {
+                                            let w = if ic < in_c {
+                                                bufs.weights[oc * in_c + ic] as i64
+                                            } else {
+                                                0
+                                            };
+                                            let x = if ic < in_c {
+                                                bufs.input[pixel * in_c + ic] as i64
+                                            } else {
+                                                0
+                                            };
+                                            raw += x * w;
+                                            wsum += w;
                                         }
-                                        let ih = ih as usize;
-                                        let iw = iw as usize;
-                                        for ic in 0..in_c {
-                                            let in_idx = (ih * in_w + iw) * in_c + ic;
-                                            // RAW [oc][tap][ic] — asm filter[(oc*taps+tap)*in_c+ic]
-                                            let w_idx = (oc * taps + tap) * in_c + ic;
-                                            acc += bufs.weights[w_idx] as i64
-                                                * (bufs.input[in_idx] as i64 + p.input_offset as i64);
-                                        }
+                                        let acc = raw + p.input_offset as i64 * wsum;
+                                        let acc32 = (bufs.bias[oc] as i64 + acc).clamp(
+                                            i32::MIN as i64,
+                                            i32::MAX as i64,
+                                        ) as i32;
+                                        let scaled = multiply_by_quantized_multiplier(
+                                            acc32,
+                                            p.output_multiplier_per_channel[oc],
+                                            p.output_shift_per_channel[oc],
+                                        );
+                                        let clamped = (scaled + p.output_offset).clamp(
+                                            p.quantized_activation_min,
+                                            p.quantized_activation_max,
+                                        );
+                                        emu[(oh * out_w + ow) * out_c + oc] =
+                                            saturating_cast(clamped);
                                     }
-                                    let acc32 = (bufs.bias[oc] as i64 + acc).clamp(
-                                        i32::MIN as i64,
-                                        i32::MAX as i64,
-                                    ) as i32;
-                                    let scaled = multiply_by_quantized_multiplier(
-                                        acc32,
-                                        p.output_multiplier_per_channel[oc],
-                                        p.output_shift_per_channel[oc],
-                                    );
-                                    let clamped = (scaled + p.output_offset).clamp(
-                                        p.quantized_activation_min,
-                                        p.quantized_activation_max,
-                                    );
-                                    emu[(oh * out_w + ow) * out_c + oc] = saturating_cast(clamped);
+                                }
+                            }
+                        } else {
+                            // Mirror the dispatch's SAME-pad derivation (same formula
+                            // as conv3x3.rs conv3x3_accx_dispatch). The ACCX kernel
+                            // runs on a zero-padded copy, so out-of-padded-bounds taps
+                            // contribute 0 — equivalent to skipping them here.
+                            let dilated_h =
+                                (p.filter_shape[1] - 1) * p.dilation_height_factor + 1;
+                            let dilated_w =
+                                (p.filter_shape[2] - 1) * p.dilation_width_factor + 1;
+                            let pad_h = (((out_h as i32 - 1) * p.stride_height + dilated_h
+                                - p.input_shape[1])
+                                / 2)
+                                .max(0) as usize;
+                            let pad_w = (((out_w as i32 - 1) * p.stride_width + dilated_w
+                                - p.input_shape[2])
+                                / 2)
+                                .max(0) as usize;
+                            for oh in 0..out_h {
+                                for ow in 0..out_w {
+                                    for oc in 0..out_c {
+                                        let mut acc: i64 = 0;
+                                        for tap in 0..taps {
+                                            let (kh, kw) = if taps == 9 {
+                                                (tap / 3, tap % 3)
+                                            } else {
+                                                (0, 0)
+                                            };
+                                            let ih =
+                                                (oh * stride_h + kh * dil_h) as i32 - pad_h as i32;
+                                            let iw =
+                                                (ow * stride_w + kw * dil_w) as i32 - pad_w as i32;
+                                            if ih < 0
+                                                || iw < 0
+                                                || ih as usize >= in_h
+                                                || iw as usize >= in_w
+                                            {
+                                                continue;
+                                            }
+                                            let ih = ih as usize;
+                                            let iw = iw as usize;
+                                            for ic in 0..in_c {
+                                                let in_idx = (ih * in_w + iw) * in_c + ic;
+                                                // RAW [oc][tap][ic] — asm filter[(oc*taps+tap)*in_c+ic]
+                                                let w_idx = (oc * taps + tap) * in_c + ic;
+                                                acc += bufs.weights[w_idx] as i64
+                                                    * (bufs.input[in_idx] as i64
+                                                        + p.input_offset as i64);
+                                            }
+                                        }
+                                        let acc32 = (bufs.bias[oc] as i64 + acc).clamp(
+                                            i32::MIN as i64,
+                                            i32::MAX as i64,
+                                        ) as i32;
+                                        let scaled = multiply_by_quantized_multiplier(
+                                            acc32,
+                                            p.output_multiplier_per_channel[oc],
+                                            p.output_shift_per_channel[oc],
+                                        );
+                                        let clamped = (scaled + p.output_offset).clamp(
+                                            p.quantized_activation_min,
+                                            p.quantized_activation_max,
+                                        );
+                                        emu[(oh * out_w + ow) * out_c + oc] =
+                                            saturating_cast(clamped);
+                                    }
                                 }
                             }
                         }

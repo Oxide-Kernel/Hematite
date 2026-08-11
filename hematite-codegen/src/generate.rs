@@ -1076,9 +1076,26 @@ const fn pad16(c: usize) -> usize {
 }
 
 /// Scratch bytes for a 1×1 conv (`conv1x1_scratch_need`).
-fn conv1x1_scratch_need_codegen(out_c: usize, input_offset: i32) -> usize {
+///
+/// T3.3 — when `in_c` is not a multiple of 16 the conv1x1 dispatch stages a
+/// zero-padded input copy (`pixels * pad16(in_c)` bytes — every NHWC pixel
+/// padded to the next multiple of 16) AND a zero-padded weight copy
+/// (`out_c * pad16(in_c)` bytes) in scratch, plus the i32 accumulator buffer
+/// and the optional weight-sum buffer. Keep in sync with
+/// `hematite-s3/src/backend.rs`.
+fn conv1x1_scratch_need_codegen(
+    in_c: usize,
+    out_c: usize,
+    pixels: usize,
+    input_offset: i32,
+) -> usize {
+    let padded_c = pad16(in_c);
     let wsum = if input_offset != 0 { out_c * 4 } else { 0 };
-    out_c * 4 + wsum
+    if padded_c != in_c {
+        pixels * padded_c + out_c * padded_c + out_c * 4 + wsum
+    } else {
+        out_c * 4 + wsum
+    }
 }
 
 /// Scratch bytes for the FC/GEMM path (`fc_scratch_need` in backend.rs).
@@ -1214,7 +1231,7 @@ fn fused_conv2d_scratch_need_codegen(
     input_offset: i32,
 ) -> usize {
     if filter_h == 1 && filter_w == 1 {
-        conv1x1_scratch_need_codegen(out_c, input_offset)
+        conv1x1_scratch_need_codegen(in_c, out_c, in_h * in_w, input_offset)
     } else {
         conv3x3_scratch_need_codegen(
             in_h, in_w, in_c, out_h, out_w, out_c, filter_h, filter_w,
@@ -1343,7 +1360,12 @@ fn emit_conv2d(model: &ParsedModel, storage: &[Storage], ctx: &mut ArenaCtx, i: 
         backend.conv2d(#src, &#w_name.0, &#b_name, &#p_name, #dst, scratch)?;
     };
     let scratch = if filter_raw[1] == 1 && filter_raw[2] == 1 {
-        conv1x1_scratch_need_codegen(out_channels, input_offset)
+        conv1x1_scratch_need_codegen(
+            input_raw[3].max(0) as usize,
+            out_channels,
+            (input_raw[1].max(0) as usize) * (input_raw[2].max(0) as usize),
+            input_offset,
+        )
     } else {
         conv3x3_scratch_need_codegen(
             input_raw[1].max(0) as usize,
@@ -3524,7 +3546,12 @@ mod tests {
     fn check_conv(p: &Conv2DParams<'_>, checked: &mut usize) {
         let runtime = S3Backend::conv2d_scratch_size(p);
         let mirror = if p.filter_shape[1] == 1 && p.filter_shape[2] == 1 {
-            conv1x1_scratch_need_codegen(p.output_shape[3].max(0) as usize, p.input_offset)
+            conv1x1_scratch_need_codegen(
+                p.input_shape[3].max(0) as usize,
+                p.output_shape[3].max(0) as usize,
+                (p.input_shape[1].max(0) as usize) * (p.input_shape[2].max(0) as usize),
+                p.input_offset,
+            )
         } else {
             conv3x3_scratch_need_codegen(
                 p.input_shape[1].max(0) as usize,
@@ -3731,12 +3758,14 @@ mod tests {
             "corpus shrank unexpectedly: conv={n_conv} dw={n_dw} fc={n_fc} softmax={n_sm} pool={n_pool} fused={n_fused} scratch-free={n_scratch_free}");
 
         // (b) widened grids (spec-corpus families + corner cases).
-        // conv1x1: out_c × spatial × in_c × offset. The 1×1 formula reads only
-        // out_c + input_offset — the grid still sweeps all dims so a future
-        // formula change cannot hide behind an un-swept corner.
+        // conv1x1: out_c × spatial × in_c × offset. The 1×1 formula reads
+        // in_c (T3.3 pad path), out_c, spatial, and input_offset — the grid
+        // sweeps in_c across the pad (1/3/8/15/17) and no-pad (16/32/64/128)
+        // families so a future formula change cannot hide behind an un-swept
+        // corner.
         for &out_c in &[16, 32, 64] {
             for &spatial in &[1, 8, 14, 16, 28, 56, 112] {
-                for &in_c in &[16, 32, 64, 128] {
+                for &in_c in &[1, 3, 8, 15, 16, 17, 32, 64, 128] {
                     for &offset in &[0, 5, 128] {
                         let p = conv_params(1, 1, in_c, out_c, spatial, spatial, spatial, spatial, 1, Padding::Same, offset);
                         check_conv(&p, &mut checked);

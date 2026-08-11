@@ -76,13 +76,29 @@ fn pad16(n: usize) -> usize {
     n.div_ceil(16) * 16
 }
 
-/// Scratch bytes needed by the 1×1 ACCX path (`conv1x1_accx_dispatch`):/// `out_c * 4` i32 accumulators, plus an `out_c * 4` weight-sum buffer when
-/// `input_offset != 0`.
+/// Scratch bytes needed by the 1×1 ACCX path (`conv1x1_accx_dispatch`).
+///
+/// T3.3 — when `input_c` is not a multiple of 16 the dispatch stages a
+/// zero-padded input copy (`pixels * pad16(input_c)` bytes — every NHWC
+/// pixel padded to the next multiple of 16) AND a zero-padded weight copy
+/// (`out_c * pad16(input_c)` bytes — the kernel strides weight rows by the
+/// padded channel count) in scratch at 16-byte-aligned offsets, plus the i32
+/// accumulator buffer and the optional weight-sum buffer. The canonical
+/// runtime formula — kept in sync with `conv1x1_scratch_need_codegen`
+/// (hematite-codegen/src/generate.rs) and the dispatch's own `need`
+/// computation in `conv1x1.rs`.
 #[inline(always)]
 fn conv1x1_scratch_need(params: &Conv2DParams) -> usize {
+    let in_c = params.input_shape[3].max(0) as usize;
     let out_c = params.output_shape[3].max(0) as usize;
+    let pixels = (params.input_shape[1].max(0) as usize) * (params.input_shape[2].max(0) as usize);
+    let padded_c = pad16(in_c);
     let wsum = if params.input_offset != 0 { out_c * 4 } else { 0 };
-    out_c * 4 + wsum
+    if padded_c != in_c {
+        pixels * padded_c + out_c * padded_c + out_c * 4 + wsum
+    } else {
+        out_c * 4 + wsum
+    }
 }
 
 /// Scratch bytes needed by the FC/GEMM ACCX path
@@ -803,6 +819,49 @@ mod tests {
         let expect4 = (58 * 46 * 16) + (80 * 16) + (16 * 4) + (16 * 4);
         assert_eq!(depthwise_scratch_need(&p4), expect4);
         assert_eq!(S3Backend::depthwise_conv2d_scratch_size(&p4), expect4);
+    }
+
+    /// T3.3 — the conv1x1 padded-path scratch need formula must match the
+    /// dispatch layout in `conv1x1.rs::conv1x1_accx_dispatch` for pad and
+    /// no-pad shapes.
+    #[test]
+    fn conv1x1_scratch_need_matches_padded_dispatch_layout() {
+        fn p(in_c: i32, out_c: i32, spatial: i32, input_offset: i32) -> Conv2DParams<'static> {
+            Conv2DParams {
+                input_shape: [1, spatial, spatial, in_c],
+                filter_shape: [out_c, 1, 1, in_c],
+                output_shape: [1, spatial, spatial, out_c],
+                padding: hematite_core::op_params::Padding::Same,
+                stride_width: 1,
+                stride_height: 1,
+                dilation_width_factor: 1,
+                dilation_height_factor: 1,
+                input_offset,
+                weights_offset: 0,
+                output_offset: 0,
+                output_multiplier_per_channel: &[0],
+                output_shift_per_channel: &[0],
+                quantized_activation_min: -128,
+                quantized_activation_max: 127,
+            }
+        }
+        // No pad (input_c % 16 == 0): accs + wsum only.
+        assert_eq!(conv1x1_scratch_need(&p(16, 64, 1, 0)), 64 * 4);
+        assert_eq!(conv1x1_scratch_need(&p(32, 8, 1, 0)), 8 * 4);
+        assert_eq!(conv1x1_scratch_need(&p(16, 64, 1, 5)), 64 * 4 + 64 * 4);
+
+        // Pad (input_c % 16 != 0): padded input (pixels × pad16(in_c)) +
+        // padded weights + accs (+ wsum when input_offset != 0). in_c 3 →
+        // pad16 = 16, 1 pixel.
+        assert_eq!(conv1x1_scratch_need(&p(3, 16, 1, 0)), 16 + 16 * 16 + 16 * 4);
+        assert_eq!(
+            conv1x1_scratch_need(&p(3, 16, 1, 128)),
+            16 + 16 * 16 + 16 * 4 + 16 * 4
+        );
+        // in_c 3, 4×4 spatial → 16 pixels × 16 padded channels.
+        assert_eq!(conv1x1_scratch_need(&p(3, 16, 4, 0)), 16 * 16 + 16 * 16 + 16 * 4);
+        // in_c 17 → pad16 = 32.
+        assert_eq!(conv1x1_scratch_need(&p(17, 4, 1, 0)), 32 + 4 * 32 + 4 * 4);
     }
 
     /// T3.6 — the FC padded-path scratch need formula must match the dispatch

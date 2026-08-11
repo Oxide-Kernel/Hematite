@@ -37,6 +37,21 @@
 //! requantize, no arg-struct ABI. See [`conv1x1_accx_dispatch`] for the
 //! eligibility gate (zero offsets, 16-aligned channel counts, runtime 16-byte
 //! pointer alignment, sufficient scratch).
+//!
+//! # Small / non-16 input channels (T3.3)
+//!
+//! The strict `accx_eligible_1x1` gate (`input_c >= 16 && input_c % 16 == 0`)
+//! is KEPT as the unpadded fast path. In addition, the dispatch now widens to
+//! ANY `input_c >= 1` (via `accx_eligible_1x1_padded`): when
+//! `input_c % 16 != 0` the dispatch stages a zero-padded input copy (each
+//! NHWC pixel padded to the next multiple of 16) AND a zero-padded weight copy
+//! (rows padded to the padded channel count) in scratch at 16-byte-aligned
+//! offsets, runs the same `s8_accx_conv1x1` kernel on the padded buffers, and
+//! folds the non-zero `input_offset` via weight sums over the padded rows (pad
+//! lanes are zero). Padded lanes contribute `0 × 0 = 0` — the output is
+//! bit-exact vs the scalar reference. The staged carve mirrors the
+//! conv3x3/depthwise channel-pad path and T3.6's fc pad (16-byte alignment; an
+//! unaligned staged copy would silently fall back to scalar).
 
 use hematite_core::op_params::Conv2DParams;
 use hematite_core::KernelError;
@@ -87,6 +102,66 @@ pub fn transform_weights_11cn(
     Ok(())
 }
 
+/// Round a channel count up to the TIE728 SIMD group width (16 lanes).
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+#[inline(always)]
+const fn pad16(n: usize) -> usize {
+    (n + 15) & !15
+}
+
+/// Stage a zero-padded NHWC input copy (each of `pixels` pixels: real
+/// `input[p*input_c .. p*input_c+input_c]`, then zeros to `padded_c`) and a
+/// zero-padded weight copy (`weights` is `out_c × input_c` raw `[oc][ic]`; the
+/// staged copy is `out_c × padded_c` with each row zero-filled past
+/// `input_c`).
+///
+/// The staged buffers are what the device dispatch hands to
+/// `s8_accx_conv1x1` when `input_c % 16 != 0`: the kernel VLDs 16-lane
+/// vectors and strides weight rows by the padded channel count, so both staged
+/// buffers must be padded to a multiple of 16. Padded lanes multiply
+/// `0 × 0 = 0`, and the Phase-C `input_offset` fold reads weight sums over the
+/// padded rows — pad lanes are zero, so the sums equal the real per-row
+/// sums — bit-exact vs the scalar `Σ (in + offset)·w` loop. Host-compilable so
+/// the unit tests exercise the real device-pipeline staging.
+///
+/// # Panics
+/// `dst_in` / `dst_w` must be exactly `pixels * padded_c` /
+/// `out_c * padded_c` bytes (caller-computed via [`pad16`]); this is asserted.
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+pub(crate) fn stage_conv1x1_padded(
+    dst_in: &mut [u8],
+    dst_w: &mut [i8],
+    input: &[i8],
+    weights: &[i8],
+    input_c: usize,
+    out_c: usize,
+    pixels: usize,
+) {
+    let padded_c = pad16(input_c);
+    assert_eq!(
+        dst_in.len(),
+        pixels * padded_c,
+        "stage_conv1x1_padded: dst_in len"
+    );
+    assert_eq!(
+        dst_w.len(),
+        out_c * padded_c,
+        "stage_conv1x1_padded: dst_w len"
+    );
+    dst_in.fill(0);
+    for p in 0..pixels {
+        let dst = &mut dst_in[p * padded_c..p * padded_c + input_c];
+        for (d, &x) in dst.iter_mut().zip(input[p * input_c..(p + 1) * input_c].iter()) {
+            *d = x as u8; // bit-preserving i8→u8 re-interpret (VLD reads i8 lanes)
+        }
+    }
+    for oc in 0..out_c {
+        let row = &mut dst_w[oc * padded_c..(oc + 1) * padded_c];
+        row[..input_c].copy_from_slice(&weights[oc * input_c..(oc + 1) * input_c]);
+        row[input_c..].fill(0);
+    }
+}
+
 /// Context for the ACCX 1×1 conv dispatch — bundled into one `&mut` arg so the
 /// Xtensa LLVM backend generates a 1-arg call (multi-arg calls are miscompiled
 /// on device; see the Xtensa multi-arg call miscompile class).
@@ -113,9 +188,9 @@ pub(crate) struct Conv1x1AccxCtx<'a> {
 /// accumulators instead of the standalone requantize — the T2.2 fused-conv
 /// SIMD path. The `input_offset` fold still runs first in both branches.
 ///
-/// Eligibility: `input_offset == 0`, stride/dilation 1, `out_h == in_h`,
-/// `out_w == in_w` (pad 0), `in_c % 16 == 0`, `in_c >= 16`, `out_c >= 1`,
-/// all pointers 16-byte aligned, `scratch >= out_c * 4`.
+/// Eligibility: stride/dilation 1, `out_h == in_h`, `out_w == in_w` (pad 0),
+/// `in_c >= 1`, `out_c >= 1`, all pointers 16-byte aligned (direct path) or
+/// sufficient scratch for the padded staging (T3.3), `scratch >= out_c * 4`.
 ///
 /// `uniform` is the precomputed uniform-scale hint `(mult, shift)` —
 /// `i32::MIN` shift means "per-channel" (the requantize epilogue selects the
@@ -142,13 +217,32 @@ pub(crate) fn conv1x1_accx_dispatch(
         || params.dilation_width_factor != 1
         || in_h != out_h
         || in_w != out_w
-        || !crate::accx::accx_eligible_1x1(input_c, out_c)
+        // T3.3 — the strict `accx_eligible_1x1` gate stays the unpadded fast
+        // path; the padded gate accepts ANY `input_c >= 1` and stages a
+        // zero-padded copy below when `input_c % 16 != 0`.
+        || !crate::accx::accx_eligible_1x1_padded(input_c, out_c)
     {
         return Ok(false);
     }
 
     let input_offset = params.input_offset;
-    let need = out_c * 4 + if input_offset != 0 { out_c * 4 } else { 0 };
+    // T3.3 — small / non-16 input channels: stage a zero-padded input copy AND
+    // a zero-padded weight copy (the kernel VLDs 16-lane vectors and strides
+    // weight rows by the padded channel count), then run the same kernel.
+    // Mirrors the conv3x3/depthwise channel-pad carve and T3.6's fc pad.
+    let padded_c = pad16(input_c);
+    let needs_pad = padded_c != input_c;
+    let pixels = in_h * in_w;
+    // Padded layout (mirrors gemm.rs fc + conv3x3.rs):
+    //   [padded input: pixels*padded_c][padded weights: out_c*padded_c][accs: out_c*4][wsum: out_c*4 if input_offset != 0]
+    let pad_input_len = pixels * padded_c;
+    let pad_weights_len = out_c * padded_c;
+    let wsum_extra = if input_offset != 0 { out_c * 4 } else { 0 };
+    let need = if needs_pad {
+        pad_input_len + pad_weights_len + out_c * 4 + wsum_extra
+    } else {
+        out_c * 4 + wsum_extra
+    };
     if ctx.scratch.len() < need {
         return Ok(false);
     }
@@ -156,23 +250,60 @@ pub(crate) fn conv1x1_accx_dispatch(
     let in_ptr = ctx.input.as_ptr();
     let w_ptr = ctx.weights.as_ptr();
     let out_ptr = ctx.output.as_mut_ptr();
-    let accs = ctx.scratch.as_mut_ptr() as *mut i32;
-    if (in_ptr as usize) % 16 != 0
-        || (w_ptr as usize) % 16 != 0
-        || (out_ptr as usize) % 16 != 0
-        || (accs as usize) % 4 != 0
-    {
-        return Ok(false);
-    }
-    let wsum = if input_offset != 0 {
-        unsafe { accs.add(out_c) }
+    let scratch_ptr = ctx.scratch.as_mut_ptr();
+    let scratch_u = scratch_ptr as usize;
+
+    let (k_in_ptr, k_w_ptr, accs, wsum, k_in_c);
+    if needs_pad {
+        // Padded buffers — carve from scratch at 16-byte boundaries so the
+        // kernel's VLD.128 stays aligned (mirrors conv3x3.rs:190-195 and
+        // gemm.rs's fc carve).
+        let in_off = (scratch_u + 15) & !15;
+        let w_off = in_off + pad_input_len;
+        let accs_off = (w_off + pad_weights_len + 15) & !15;
+        let p_in: *const i8 = unsafe { scratch_ptr.add(in_off - scratch_u) }.cast::<i8>();
+        let p_w: *const i8 = unsafe { scratch_ptr.add(w_off - scratch_u) }.cast::<i8>();
+        let p_accs = unsafe { scratch_ptr.add(accs_off - scratch_u) } as *mut i32;
+        if (accs_off - scratch_u) % 4 != 0 {
+            return Ok(false);
+        }
+        wsum = if input_offset != 0 {
+            (unsafe { scratch_ptr.add(accs_off - scratch_u + out_c * 4) }) as *mut i32
+        } else {
+            core::ptr::null_mut()
+        };
+        let dst_in =
+            unsafe { core::slice::from_raw_parts_mut(p_in as *mut u8, pad_input_len) };
+        let dst_w = unsafe { core::slice::from_raw_parts_mut(p_w as *mut i8, pad_weights_len) };
+        stage_conv1x1_padded(dst_in, dst_w, ctx.input, ctx.weights, input_c, out_c, pixels);
+        k_in_ptr = p_in;
+        k_w_ptr = p_w;
+        accs = p_accs;
+        k_in_c = padded_c;
     } else {
-        core::ptr::null_mut()
-    };
+        if (in_ptr as usize) % 16 != 0
+            || (w_ptr as usize) % 16 != 0
+            || (out_ptr as usize) % 16 != 0
+        {
+            return Ok(false);
+        }
+        accs = scratch_ptr as *mut i32;
+        if (accs as usize) % 4 != 0 {
+            return Ok(false);
+        }
+        wsum = if input_offset != 0 {
+            unsafe { accs.add(out_c) }
+        } else {
+            core::ptr::null_mut()
+        };
+        k_in_ptr = in_ptr;
+        k_w_ptr = w_ptr;
+        k_in_c = input_c;
+    }
     if input_offset != 0 {
         let ws = unsafe { core::slice::from_raw_parts_mut(wsum, out_c) };
-        let wv = unsafe { core::slice::from_raw_parts(w_ptr, out_c * input_c) };
-        crate::accx::weight_sums_conv(ws, wv, 1, input_c);
+        let wv = unsafe { core::slice::from_raw_parts(k_w_ptr, out_c * k_in_c) };
+        crate::accx::weight_sums_conv(ws, wv, 1, k_in_c);
     }
 
     let multipliers = params.output_multiplier_per_channel;
@@ -184,14 +315,14 @@ pub(crate) fn conv1x1_accx_dispatch(
 
     for oh in 0..out_h {
         for ow in 0..out_w {
-            let px_in = (oh * in_w + ow) * input_c;
+            let px_in = (oh * in_w + ow) * k_in_c;
             let px_out = (oh * out_w + ow) * out_c;
             unsafe {
                 crate::accx::accx_conv1x1(
-                    in_ptr.add(px_in),
-                    w_ptr,
+                    k_in_ptr.add(px_in),
+                    k_w_ptr,
                     accs,
-                    input_c,
+                    k_in_c,
                     out_c,
                 );
             }
@@ -228,7 +359,37 @@ pub(crate) fn conv1x1_accx_dispatch(
             }
         }
     }
+    if needs_pad {
+        CONV1X1_PADDED_RAN.store(1, core::sync::atomic::Ordering::Relaxed);
+    }
     Ok(true)
+}
+
+/// Last-padded-1×1-conv SIMD engagement flag (device diagnostic for
+/// simd_validation). Mirrors `reductions::mean`'s `SIMD_MEAN_RAN` pattern.
+///
+/// `allow(dead_code)`: written only from the device-gated dispatch and read
+/// only from the device-gated getter below, so host builds see it as unused.
+#[allow(dead_code)]
+static CONV1X1_PADDED_RAN: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+
+/// Whether the most recent 1×1 conv with a padded channel count (input_c not
+/// a multiple of 16) took the SIMD path.
+///
+/// Host/QEMU builds never run the SIMD kernel, so this is always `false`
+/// there; on real hardware it flips to `true` after an eligible padded conv
+/// (the eligibility mirror alone cannot see runtime pointer alignment — the
+/// atomic is set only when the staged SIMD dispatch actually ran).
+pub fn conv1x1_padded_took_simd() -> bool {
+    #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+    {
+        CONV1X1_PADDED_RAN.load(core::sync::atomic::Ordering::Relaxed) != 0
+    }
+    #[cfg(not(all(target_arch = "xtensa", not(feature = "qemu"))))]
+    {
+        false
+    }
 }
 
 /// Prepared 1×1 conv handle — runs the SIMD eligibility gate ONCE at
@@ -262,8 +423,14 @@ impl PreparedConv1x1 {
     pub fn new(params: &'static Conv2DParams<'static>) -> Result<Self, KernelError> {
         let input_c = params.input_shape[3] as usize;
         let out_channels = params.output_shape[3] as usize;
+        // T3.3 — SIMD engages for the strict direct gate (`accx_eligible_1x1`,
+        // input_c >= 16 && %16) OR the widened pad-in-scratch gate
+        // (`accx_eligible_1x1_padded`, any input_c >= 1 — the dispatch stages
+        // a zero-padded copy when input_c % 16 != 0). Both gates stay
+        // unchanged; this is the union of the two dispatch branches.
         let accx = cfg!(all(target_arch = "xtensa", not(feature = "qemu")))
-            && crate::accx::accx_eligible_1x1(input_c, out_channels);
+            && (crate::accx::accx_eligible_1x1(input_c, out_channels)
+                || crate::accx::accx_eligible_1x1_padded(input_c, out_channels));
         let uniform =
             crate::accx::uniform_scale(params.output_multiplier_per_channel, params.output_shift_per_channel)
                 .unwrap_or((0, i32::MIN));
@@ -488,4 +655,232 @@ fn conv2d_1x1_scalar(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate alloc;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use super::*;
+    use hematite_core::op_params::{Conv2DParams, Padding};
+
+    /// Host model of the `s8_accx_conv1x1` accumulation contract on the
+    /// staged (padded) buffers: `acc[oc] = Σ_ic staged_w[oc*padded_c + ic] *
+    /// staged_in[pixel*padded_c + ic]` in wrapping i32 — the exact
+    /// GPR-accumulator arithmetic the asm uses (raw dot product, no
+    /// input_offset).
+    fn kernel_model_accs(
+        staged_in: &[u8],
+        staged_w: &[i8],
+        padded_c: usize,
+        out_c: usize,
+        pixel: usize,
+    ) -> Vec<i32> {
+        let mut accs = vec![0i32; out_c];
+        for oc in 0..out_c {
+            let mut acc: i32 = 0;
+            for ic in 0..padded_c {
+                let iv = i32::from(staged_in[pixel * padded_c + ic] as i8);
+                let wv = i32::from(staged_w[oc * padded_c + ic]);
+                acc = acc.wrapping_add(iv.wrapping_mul(wv));
+            }
+            accs[oc] = acc;
+        }
+        accs
+    }
+
+    /// Run the full device SIMD pipeline in software — real
+    /// [`stage_conv1x1_padded`] staging, the kernel-model accumulators, the
+    /// real Phase-C `input_offset` fold, and the real `requantize_1x1`
+    /// epilogue — producing one 1×1 conv output layer. This exercises the
+    /// exact device pipeline code (pad + kernel contract + fold + requantize).
+    fn simd_model_layer(
+        input: &[i8],
+        weights: &[i8],
+        bias: &[i32],
+        p: &Conv2DParams<'_>,
+    ) -> Vec<i8> {
+        let in_c = p.input_shape[3] as usize;
+        let out_c = p.output_shape[3] as usize;
+        let pixels = (p.input_shape[1] * p.input_shape[2]) as usize;
+        let padded_c = pad16(in_c);
+        let needs_pad = padded_c != in_c;
+
+        let mut staged_in = vec![0u8; pixels * padded_c];
+        let mut staged_w = vec![0i8; out_c * padded_c];
+        if needs_pad {
+            stage_conv1x1_padded(
+                &mut staged_in,
+                &mut staged_w,
+                input,
+                weights,
+                in_c,
+                out_c,
+                pixels,
+            );
+        } else {
+            for p in 0..pixels {
+                for (d, &x) in staged_in[p * in_c..(p + 1) * in_c]
+                    .iter_mut()
+                    .zip(input[p * in_c..(p + 1) * in_c].iter())
+                {
+                    *d = x as u8; // bit-preserving i8→u8 re-interpret
+                }
+            }
+            staged_w.copy_from_slice(weights);
+        }
+
+        let multipliers = p.output_multiplier_per_channel;
+        let shifts = p.output_shift_per_channel;
+        let (uniform_mult, uniform_shift) = match crate::accx::uniform_scale(multipliers, shifts) {
+            Some((m, s)) => (m, s),
+            None => (0, i32::MIN),
+        };
+        let mut output = vec![0i8; pixels * out_c];
+        for px in 0..pixels {
+            let mut accs = kernel_model_accs(&staged_in, &staged_w, padded_c, out_c, px);
+            if p.input_offset != 0 {
+                // Weight sums over the PADDED rows — pad lanes are zero, so
+                // these equal the real per-row sums (the dispatch computes
+                // them this way; mirror exactly).
+                let mut wsum = vec![0i32; out_c];
+                crate::accx::weight_sums_conv(&mut wsum, &staged_w, 1, padded_c);
+                crate::depthwise::fold_input_offset(&mut accs, &wsum, p.input_offset);
+            }
+            crate::accx::requantize_1x1(&mut crate::accx::ReqCtx {
+                accs: &accs,
+                bias,
+                multipliers,
+                shifts,
+                output_offset: p.output_offset,
+                act_min: p.quantized_activation_min,
+                act_max: p.quantized_activation_max,
+                out_base: px * out_c,
+                output: &mut output,
+                uniform_mult,
+                uniform_shift,
+            });
+        }
+        output
+    }
+
+    fn per_channel_mult(n: usize) -> Vec<i32> {
+        (0..n).map(|i| (1 << 30) - (i as i32) * 7919).collect()
+    }
+
+    fn per_channel_shift(n: usize) -> Vec<i32> {
+        (0..n).map(|i| (i % 3) as i32).collect()
+    }
+
+    /// Deterministic pseudo-random `i8` pattern (full int8 range).
+    fn pattern(seed: u32, n: usize) -> Vec<i8> {
+        let mut out = vec![0i8; n];
+        let mut x = seed;
+        for v in out.iter_mut() {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *v = (x >> 16) as i8;
+        }
+        out
+    }
+
+    fn pattern_i32(seed: u32, n: usize) -> Vec<i32> {
+        let mut out = vec![0i32; n];
+        let mut x = seed;
+        for v in out.iter_mut() {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *v = ((x >> 16) as i32) * 37 - 500;
+        }
+        out
+    }
+
+    /// Host bit-exact gate (T3.3): the device SIMD pipeline model (real
+    /// staging + kernel-contract accumulation + real fold + real requantize)
+    /// must equal the independent `hematite-ref` scalar conv2d for every
+    /// small / non-16 input_c in {1, 3, 8, 15, 17, 32} — pad and no-pad
+    /// paths — across spatial shapes, offsets, and identity / non-identity
+    /// per-channel multipliers. Zero mismatches.
+    #[test]
+    fn conv1x1_small_simd_model_matches_ref_bit_exact() {
+        let mut checked = 0;
+        for &input_c in &[1, 3, 8, 15, 17, 32] {
+            for &(h, w) in &[(1, 1), (4, 4), (2, 5)] {
+                for &in_off in &[0, 5, 128] {
+                    for mode in 0..3 {
+                        let out_c = 16i32;
+                        let n = out_c as usize;
+                        let (mults, shifts): (Vec<i32>, Vec<i32>) = match mode {
+                            0 => (vec![1 << 30; n], vec![1; n]),
+                            1 => (per_channel_mult(n), per_channel_shift(n)),
+                            _ => (vec![1 << 29; n], vec![0; n]),
+                        };
+                        let pixels = h * w;
+                        let p = Conv2DParams {
+                            input_shape: [1, h, w, input_c],
+                            filter_shape: [out_c, 1, 1, input_c],
+                            output_shape: [1, h, w, out_c],
+                            padding: Padding::Same,
+                            stride_width: 1,
+                            stride_height: 1,
+                            dilation_width_factor: 1,
+                            dilation_height_factor: 1,
+                            input_offset: in_off,
+                            weights_offset: 0,
+                            output_offset: if in_off == 0 { 0 } else { -10 },
+                            output_multiplier_per_channel: &mults,
+                            output_shift_per_channel: &shifts,
+                            quantized_activation_min: if mode == 1 { 0 } else { -128 },
+                            quantized_activation_max: 127,
+                        };
+                        let seed = 0x1C00_0000u32
+                            | (input_c as u32 * 131 + h as u32 * 17 + w as u32);
+                        let input = pattern(seed, pixels as usize * input_c as usize);
+                        let weights =
+                            pattern(0xE3A + input_c as u32 * 17, input_c as usize * n);
+                        let bias = pattern_i32(0xFAC + out_c as u32, n);
+
+                        let got = simd_model_layer(&input, &weights, &bias, &p);
+                        let mut want = vec![0i8; got.len()];
+                        hematite_ref::conv::conv2d(
+                            &input,
+                            &weights,
+                            &bias,
+                            &p,
+                            &mut want,
+                            &mut [],
+                        )
+                        .expect("ref conv2d accepts the shape");
+                        assert_eq!(
+                            got, want,
+                            "input_c={input_c} h={h} w={w} in_off={in_off} mode={mode}: \
+                             SIMD-model output must equal hematite-ref scalar"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked >= 150, "small-conv matrix did not expand ({checked})");
+    }
+
+    /// The staging must produce the exact padded layout the kernel consumes:
+    /// input pixels `[real | zeros]`, weight rows `[real row | zeros]`.
+    #[test]
+    fn stage_conv1x1_padded_zero_fills_pad_lanes() {
+        let input: Vec<i8> = (0..16).map(|i| i as i8 - 3).collect(); // 2 pixels x 8 ch
+        let weights: Vec<i8> = (0..32).map(|i| (i % 7) as i8 - 2).collect(); // 4 rows x 8
+        let mut dst_in = vec![0xEEu8; 2 * 16];
+        let mut dst_w = vec![0x7Fi8; 64]; // 4 rows x 16
+        stage_conv1x1_padded(&mut dst_in, &mut dst_w, &input, &weights, 8, 4, 2);
+        for p in 0..2 {
+            let expect: Vec<u8> = input[p * 8..(p + 1) * 8].iter().map(|&x| x as u8).collect();
+            assert_eq!(&dst_in[p * 16..p * 16 + 8], &expect[..]);
+            assert_eq!(&dst_in[p * 16 + 8..(p + 1) * 16], &[0; 8], "pixel {p} pad lanes");
+        }
+        for oc in 0..4 {
+            let row = &dst_w[oc * 16..(oc + 1) * 16];
+            assert_eq!(&row[..8], &weights[oc * 8..(oc + 1) * 8]);
+            assert_eq!(&row[8..], &[0; 8], "row {oc} pad lanes must be zero");
+        }
+    }
 }
