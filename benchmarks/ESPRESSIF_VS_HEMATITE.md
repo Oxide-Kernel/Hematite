@@ -320,6 +320,81 @@ T3.5 depthwise `dm>1` for kws; T3.6 small-shape FC for sine/hello/anomaly.
 The Hematite "now" column is the pre-optimization baseline; re-run
 measurements wherever the ESP-IDF toolchain is present, never guess numbers.
 
+## Zoo-model + A/B/C head-to-head — ledger rows (composed-kernels T6.2)
+
+Consolidated ledger in the user-mandated format (ISO timestamp + commit id of
+the measured code + FULL Hematite cycles + FULL C-stack cycles + speedup +
+config — never deltas-only). Full analysis (per-model and per-kernel
+speedup-loss identification with root-cause classes and next levers) lives in
+`local-notes/evidence/composed-kernels/head-to-head.md`.
+
+**Provenance:** A/B/C rows = real-device 2026-08-10 (Hematite measured-code
+HEAD `33d498a` per this doc's normalized-per-op note; C = espnn-baseline T0.3
+era). Zoo rows = user-verified real-device 2026-08-10 (Hematite pre-opt
+`model_bench`; C = `3d74726` T0.3 harness). All 4 zoo on-device fused-vs-
+unfused deltas are **BLOCKED-BY-HARDWARE** (board permanently flash-encrypted,
+`SPI_BOOT_CRYPT_CNT=0x7`, espflash no-encrypt — `model-cycles.md §1`); the W0
+fused profile shows **zero composed groups** in these models, so fused ==
+unfused emission (`fused-equivalence.md`, `fused-profile.md`). QEMU-emulated
+rows are labeled HOST-EMULATED — never device cycles.
+
+### A/B/C benchmark graphs (device, 2026-08-10)
+
+| Graph | arm | ISO timestamp | commit (measured code) | Hematite cycles (min/med) | ms @240 MHz | C-stack cycles (min/med) | ms @240 MHz | speedup (Hematite/C — Hematite wins when >1) | config |
+|---|---|---|---|---|---|---|---|---|---|
+| A — 4-layer CNN | fused path | 2026-08-10 | Hematite `33d498a`; C espnn-baseline T0.3 era | 1,686,922 / 1,686,922 | 7.03 | 2,630,401 / 2,630,423 | 10.96 | **1.56×** | SRAM; conv3x3 32×32×16 + maxpool + conv1x1 + FC 7200→16; S3 SIMD; out_fnv `0x75eb32f5` |
+| B — mv2mini 7-layer | fused path | 2026-08-10 | Hematite `33d498a`; C espnn-baseline T0.3 era | 763,105 / 763,105 | 3.18 | 994,782 / 994,782 | 4.14 | **1.30×** | SRAM; conv3x3 16×16×3 + maxpool + dw + conv1x1 + dw + conv1x1 + FC; S3 SIMD; out_fnv `0x7f23eb05` |
+| C — mv2real 6-layer | fused path | 2026-08-10 | Hematite `33d498a`; C espnn-baseline T0.3 era | 650,773 / 650,773 | 2.71 | 655,194 / 655,303 | 2.73 | **1.007×** (floor-limited; all 6 layers SIMD) | SRAM; SAME + stride-2 conv/dw blocks + FC; S3 SIMD; out_fnv `0x75eb32f5` |
+
+Model C margin is **1.007×** (650,773 vs 655,303) — maintained ≥ 1.007×. The
+**1.10× figure is the conv3x3 32×32 VALID *kernel* row** (Rust prepared
+3075/3102 vs C raw 2824, `espdl-baseline/README.md:108`), NOT Model C.
+
+### Zoo models (device, user-verified T0.3, 2026-08-10)
+
+| Model | arm | ISO timestamp | commit (measured code) | Hematite cycles (min/med, pre-opt) | ms @240 MHz | C-stack cycles (min/med) | ms @240 MHz | speedup (C/Hematite — C wins when >1) | config |
+|---|---|---|---|---|---|---|---|---|---|
+| sine | fused == unfused (W0; delta BLOCKED) | 2026-08-10 | Hematite pre-opt `model_bench`; C `3d74726` | 618 | 0 | 190 / 190 | 0 | **C 3.3×** | FC 1→1, SRAM; out_fnv `0x040c5b8c` |
+| hello_world | fused == unfused (W0) | 2026-08-10 | Hematite pre-opt; C `3d74726` | 10,314 | 0 | 4,675 / 4,675 | 0 | **C 2.2×** | 3×FC, SRAM; out_fnv `0xfaf3a2e1` |
+| kws | fused == unfused (W0) | 2026-08-10 | Hematite pre-opt; C `3d74726` | 12,983,503 | 54 | 1,059,889 / 1,060,258 | 4 | **C 12.3×** (largest) | dw(dm=8)+FC+softmax, SRAM; out_fnv `0x2131fda5` |
+| anomaly_detect | fused == unfused (W0) | 2026-08-10 | Hematite pre-opt; C `3d74726` | 28,550,253 | 118 | 7,758,145 / 7,758,250 | 32 | **C 3.7×** | 10×FC, SRAM; out_fnv `0xe8f86342` |
+| person_detect | — | 2026-08-10 | — | **SKIP reason=stack** | — | **SKIP** | — | — | arena 55,296 B vs ~65 KB stack; **PENDING device probe** |
+| mobilenet_v2 | — | 2026-08-10 | — | **SKIP reason=no-psram** | — | **SKIP** | — | — | `PSRAM: 0 bytes`; bar 1294.5 ms hold-as-documented |
+
+### HOST-EMULATED rows (QEMU esp32s3, `-icount 3`, commit `28482eb`, 2026-08-11T15:43:38+05:30) — NOT device cycles
+
+| Model | arm | Hematite cycles (min/med, QEMU) | out_fnv | C-stack ref (T0.3 device) | config |
+|---|---|---|---|---|---|
+| sine | fused / unfused | 72/73 / 74/74 | 0x040c5b8c | 190 | HOST-EMULATED; qemu feature |
+| hello_world | fused / unfused | 2518/2518 / 2523/2523 | 0xfaf3a2e1 | 4,675 | HOST-EMULATED; qemu feature |
+| kws | fused / unfused | 4458758/4458759 / 4458755/4458755 | 0x2131fda5 | 1,059,889 | HOST-EMULATED; qemu feature |
+| anomaly_detect | fused / unfused | 1161551/1661551 / 1161551/1661551 | 0xe8f86342 | 7,758,145 | HOST-EMULATED; qemu feature |
+| person_detect | fused / unfused | SKIP reason=stack | — | SKIP | guard verified both arms |
+| mobilenet_v2 | fused / unfused | SKIP reason=no-psram | — | SKIP | guard verified both arms |
+
+### Speedup-loss summary (full per-model + per-kernel analysis in `local-notes/evidence/composed-kernels/head-to-head.md §5`)
+
+- **A/B/C: Hematite beats/ties everywhere** (1.56× / 1.30× / 1.007×). No losing
+  sections at model level.
+- **Zoo losses, by root-cause class:**
+  - **(d) algorithmic** — kws dm=8 depthwise (the 12.3× gap). **Closed by
+    T3.5b**: the real 10×8 filter now engages the chunked anytap SIMD
+    (on-device bit-exact PASS `t61-device.log:77`); the on-device cycle row is
+    the remaining measurement (target < 1,059,889 cyc / 4 ms).
+  - **(b) dispatch/model-wrapper overhead** — sine, hello_world, anomaly_detect
+    (small-FC model dispatch; 10 dense FCs for anomaly). Pre-T3.6 each also had
+    one **(a) kernel-gated** small FC; T3.6 pad gates close those (1→1, 1→16,
+    8→128). Prepared-path handles are the recorded lever for the wrapper class.
+  - **(e) hardware-gated** — person_detect (stack) and mobilenet_v2 (PSRAM);
+    both SKIP on both stacks, PENDING-FLASH-DECISION / PSRAM board.
+- **Per-kernel:** Hematite's public-API rows trail the C raw-asm entries on
+  every matched shape (6.8× conv1x1 down to 1.6× mul) — classified **(b)**
+  wrapper overhead; the prepared path closes most of it (conv1x1 1.42×,
+  avg_pool 1.02×, fc 1.22×). The residual is the raw kernel issue-rate plus the
+  bit-exact ACCX contract (~2.5× the 8-bit-saturating QACC asm — a
+  correctness-vs-speed trade, not a fixable loss). C rows for conv3x3
+  full-image / SAME, depthwise S2, and softmax are still missing on the C side.
+
 ## Where to look
 
 - ESP-NN model harness: `benchmarks/espnn-baseline/` (`main.c`, vendored
