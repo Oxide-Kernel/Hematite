@@ -254,6 +254,7 @@ const SHIFT_128: [i32; 128] = [0; 128];
 
 // ── Elementwise: add / mul / sub at N = 16 / 32 / 48 ────────────────────────
 
+#[derive(Clone, Copy)]
 enum ElemOp {
     Add,
     Mul,

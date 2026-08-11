@@ -1404,6 +1404,14 @@ pub fn run_benchmarks() -> ! {
     #[cfg(all(feature = "model-validation", not(feature = "qemu")))]
     crate::simd_validation::validate_all();
 
+    // 4.7 person_detect stack-probe (composed-kernels T5.2) — AFTER the SIMD
+    // sweep so a stack overflow here (the honest shortfall signal) can never
+    // mask the sweep results. Runs predict_with_scratch on the real device
+    // stack budget (T1.3 arena peak 55,296 B vs ~65 KB stack); NO static-mut
+    // decision is made — a shortfall is recorded for the owner.
+    #[cfg(all(feature = "model-validation", not(feature = "qemu")))]
+    crate::model_validation::probe_person_detect_stack();
+
     // 5. Per-kernel benchmarks.
     let mut clock = RealClock;
     firmware_log!("{}", crate::report::HEADER);

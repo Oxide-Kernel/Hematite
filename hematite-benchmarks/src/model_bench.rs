@@ -335,7 +335,7 @@ pub mod zoo_runners {
             pub fn scratch_len(&self) -> usize {
                 SCRATCH_LEN
             }
-            pub fn run(&self, input: &[i8], output: &mut [i8], scratch: &mut [u8]) -> bool {
+            pub fn run(&mut self, input: &[i8], output: &mut [i8], scratch: &mut [u8]) -> bool {
                 let input_arr: &[i8; INPUT_LEN] = match input.try_into() {
                     Ok(a) => a,
                     Err(_) => return false,
@@ -369,7 +369,7 @@ pub mod zoo_runners {
             pub fn scratch_len(&self) -> usize {
                 SCRATCH_LEN
             }
-            pub fn run(&self, input: &[i8], output: &mut [i8], scratch: &mut [u8]) -> bool {
+            pub fn run(&mut self, input: &[i8], output: &mut [i8], scratch: &mut [u8]) -> bool {
                 let input_arr: &[i8; INPUT_LEN] = match input.try_into() {
                     Ok(a) => a,
                     Err(_) => return false,
@@ -403,7 +403,7 @@ pub mod zoo_runners {
             pub fn scratch_len(&self) -> usize {
                 SCRATCH_LEN
             }
-            pub fn run(&self, input: &[i8], output: &mut [i8], scratch: &mut [u8]) -> bool {
+            pub fn run(&mut self, input: &[i8], output: &mut [i8], scratch: &mut [u8]) -> bool {
                 let input_arr: &[i8; INPUT_LEN] = match input.try_into() {
                     Ok(a) => a,
                     Err(_) => return false,
@@ -437,7 +437,7 @@ pub mod zoo_runners {
             pub fn scratch_len(&self) -> usize {
                 SCRATCH_LEN
             }
-            pub fn run(&self, input: &[i8], output: &mut [i8], scratch: &mut [u8]) -> bool {
+            pub fn run(&mut self, input: &[i8], output: &mut [i8], scratch: &mut [u8]) -> bool {
                 let input_arr: &[i8; INPUT_LEN] = match input.try_into() {
                     Ok(a) => a,
                     Err(_) => return false,
@@ -471,7 +471,7 @@ pub mod zoo_runners {
             pub fn scratch_len(&self) -> usize {
                 SCRATCH_LEN
             }
-            pub fn run(&self, input: &[i8], output: &mut [i8], scratch: &mut [u8]) -> bool {
+            pub fn run(&mut self, input: &[i8], output: &mut [i8], scratch: &mut [u8]) -> bool {
                 let input_arr: &[i8; INPUT_LEN] = match input.try_into() {
                     Ok(a) => a,
                     Err(_) => return false,
@@ -505,7 +505,7 @@ pub mod zoo_runners {
             pub fn scratch_len(&self) -> usize {
                 SCRATCH_LEN
             }
-            pub fn run(&self, input: &[i8], output: &mut [i8], scratch: &mut [u8]) -> bool {
+            pub fn run(&mut self, input: &[i8], output: &mut [i8], scratch: &mut [u8]) -> bool {
                 let input_arr: &[i8; INPUT_LEN] = match input.try_into() {
                     Ok(a) => a,
                     Err(_) => return false,

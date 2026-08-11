@@ -505,3 +505,79 @@ pub fn validate_all_s3() {
     validate_s3_mobilenet();
     crate::firmware::uart0_log!("=== MODEL VALIDATION S3 DONE ===");
 }
+
+// ── person_detect on-device stack-probe (plan composed-kernels T5.2) ─────────
+//
+// T1.3's liveness arena cut person_detect's intermediates from ~232 KB of
+// per-tensor stack locals to ONE 55,296 B arena local (t13-arena.md
+// Decision 4) — a 4.2× cut that MAY now fit the ~65 KB device stack.  The
+// two SKIP arms above (`validate_person_detect` / `validate_s3_person_detect`)
+// still record the historical `reason=stack` state; this probe is the T5.2
+// attempt that supersedes it:
+//
+// * it runs `predict_with_scratch` on the REAL device stack budget, both
+//   through `RefBackend` (scalar oracle) and `S3Backend` (the fused path);
+// * FIT is reported as `FIT + PASS` (fnv matches golden) or
+//   `FIT (golden mismatch at idx …)` — never silently weakened;
+// * a shortfall manifests as the device's load/store exception → the
+//   `__wrap___user_exception` UART0 dump + `PANIC:` line (the honest
+//   signal, exactly what task-5 recorded as `reason=stack`);
+// * NO `static mut` decision is made here — a shortfall is recorded for the
+//   owner per T1.3 Decision 4 (the emitted code has no `unsafe`).
+//
+// The probe is wired AFTER the SIMD correctness sweep (firmware.rs) so a
+// stack overflow here can never mask the sweep results.
+
+#[cfg(not(feature = "qemu"))]
+pub fn probe_person_detect_stack() {
+    crate::firmware::uart0_log!("=== PERSON_DETECT STACK PROBE (T5.2, device) ===");
+    crate::firmware::uart0_log!(
+        "person_detect arena peak = {} B (ARENA_LEN); scratch = {} B (SCRATCH_LEN); output = {} B",
+        model_person_detect::ARENA_LEN,
+        model_person_detect::SCRATCH_LEN,
+        model_person_detect::OUTPUT_LEN,
+    );
+
+    // S3Backend arm first — the fused path is the sweep's subject.  The
+    // emitted `predict_with_scratch` puts the 55,296 B arena on the stack.
+    let mut s3_out = [0i8; model_person_detect::OUTPUT_LEN];
+    {
+        let scratch = carve_scratch(model_person_detect::SCRATCH_LEN);
+        let model = model_person_detect::Model::<S3Backend>::new(S3Backend);
+        let _ = model.predict_with_scratch(
+            &model_person_detect::golden::INPUT_DATA,
+            &mut s3_out,
+            scratch,
+        );
+    }
+    let s3_fnv = fnv1a(bytemuck_cast(&s3_out));
+    match golden_mismatch(&s3_out, &model_person_detect::golden::EXPECTED_OUTPUT) {
+        None => crate::firmware::uart0_log!(
+            "person_detect stack probe [s3]: FIT + PASS (fnv=0x{:08x}; matches golden)",
+            s3_fnv
+        ),
+        Some((i, g, w)) => crate::firmware::uart0_log!(
+            "person_detect stack probe [s3]: FIT (fnv=0x{:08x}; golden mismatch at idx {}: got={} want={})",
+            s3_fnv, i, g, w
+        ),
+    }
+
+    // RefBackend arm — the scalar oracle on the same stack budget.
+    let mut ref_out = [0i8; model_person_detect::OUTPUT_LEN];
+    {
+        let scratch = carve_scratch(model_person_detect::SCRATCH_LEN);
+        let model = model_person_detect::Model::<RefBackend>::new(RefBackend);
+        let _ = model.predict_with_scratch(
+            &model_person_detect::golden::INPUT_DATA,
+            &mut ref_out,
+            scratch,
+        );
+    }
+    let ref_fnv = fnv1a(bytemuck_cast(&ref_out));
+    crate::firmware::uart0_log!(
+        "person_detect stack probe [ref]: FIT (fnv=0x{:08x}; s3==ref: {})",
+        ref_fnv,
+        s3_out == ref_out,
+    );
+    crate::firmware::uart0_log!("=== PERSON_DETECT STACK PROBE DONE ===");
+}
