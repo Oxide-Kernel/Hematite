@@ -6,6 +6,9 @@
 pub(crate) mod fusion;
 pub(crate) mod layout;
 pub(crate) mod arena;
+// T4.2 — static rule-tier composed-kernel selector + input-staging decision
+// (consumed by the generate.rs emit path and the W0 profile).
+pub(crate) mod selector;
 
 // T0.2 — test-only fused-pattern profile over the real zoo models (writes
 // local-notes/evidence/composed-kernels/fused-profile.md).  Never compiled outside

@@ -54,32 +54,37 @@ use crate::optimize::fusion::{
     AbsorbedElementwise, ElementwiseKind as FusedStepKind, FusedActivationKind, FusedGroup,
     FusedSchedule,
 };
+use crate::optimize::selector::{self, ComposedKind, GroupSelection};
 use hematite_memory::{ArenaPlan, OFFSET_NONE};
 
 /// Emit the full model wrapper for `subgraph[0]` of a parsed model — the
 /// plain **unfused** per-op straight-line sequence (no fusion schedule).
 ///
 /// This is the T4.1 emission, kept reachable as the unfused reference of the
-/// T1.2 fused-vs-unfused equivalence gate (and by `#[model_unfused]`).
+/// T1.2 fused-vs-unfused equivalence gate (and by `#[model_unfused]`).  The
+/// T4.2 input-staging decision applies here too (single-op first-layer
+/// group), so fused and unfused arms stage identically.
 pub(crate) fn emit_model(model: &ParsedModel) -> Result<TokenStream, String> {
-    emit_model_with(model, None)
+    emit_model_with(model, None, true)
 }
 
 /// Emit the full model wrapper for `subgraph[0]`, honoring a fused schedule
 /// (T1.2 wiring of the T4.2a fusion pass).
 ///
-/// Groups whose anchor has a composed kernel emission (see [`composed_kind`])
-/// collapse the anchor + absorbed ops into ONE `FusedKernelBackend` composed
-/// call; the absorbed ops and their eliminated intermediate tensors vanish
-/// from the emitted code.  Everything else — including every T2 group
-/// (`requires_verification == true`) — emits exactly as the unfused
+/// Groups whose anchor the T4.2 selector maps to a composed kernel (see
+/// [`selector::select_kernel`]) collapse the anchor + absorbed ops into ONE
+/// `FusedKernelBackend` composed call; the absorbed ops and their eliminated
+/// intermediate tensors vanish from the emitted code.  Everything else —
+/// including every T2 group (`requires_verification == true`) and every
+/// mirror-ineligible composed candidate — emits exactly as the unfused
 /// [`emit_model`], so a model with zero composed groups emits byte-identical
 /// code through both entry points.
 pub(crate) fn emit_model_fused(
     model: &ParsedModel,
     schedule: &FusedSchedule,
+    stage_input: bool,
 ) -> Result<TokenStream, String> {
-    emit_model_with(model, Some(schedule))
+    emit_model_with(model, Some(schedule), stage_input)
 }
 
 /// T1.3 test arm — fused emission with the liveness arena DISABLED
@@ -88,17 +93,20 @@ pub(crate) fn emit_model_fused(
 pub(crate) fn emit_model_stack_fused(
     model: &ParsedModel,
     schedule: &FusedSchedule,
+    stage_input: bool,
 ) -> Result<TokenStream, String> {
-    emit_model_with_options(model, Some(schedule), false)
+    emit_model_with_options(model, Some(schedule), false, stage_input)
 }
 
 /// Shared emission core: `schedule: None` is the unfused path; `Some` routes
 /// composed groups through the `fused_*` backend calls (T1.2).
+/// `stage_input: true` honors the T4.2 graph-input 16B-staging decision.
 fn emit_model_with(
     model: &ParsedModel,
     schedule: Option<&FusedSchedule>,
+    stage_input: bool,
 ) -> Result<TokenStream, String> {
-    emit_model_with_options(model, schedule, true)
+    emit_model_with_options(model, schedule, true, stage_input)
 }
 
 /// `arena_enabled: false` forces per-tensor stack emission even when the
@@ -107,6 +115,7 @@ fn emit_model_with_options(
     model: &ParsedModel,
     schedule: Option<&FusedSchedule>,
     arena_enabled: bool,
+    stage_input: bool,
 ) -> Result<TokenStream, String> {
     if model.subgraph_count() != 1 {
         return Err(format!(
@@ -120,7 +129,7 @@ fn emit_model_with_options(
     }
     let ops = model.ops();
     let plan = match schedule {
-        Some(s) => Some(fused_plan(s, ops.len(), tensors.len())),
+        Some(s) => Some(fused_plan(model, s, ops.len(), tensors.len())),
         None => None,
     };
     let inputs = model.inputs();
@@ -181,6 +190,48 @@ fn emit_model_with_options(
     };
     let arena_peak = arena_plan.as_ref().map(|p| p.peak_arena_bytes).unwrap_or(0);
 
+    // ── T4.2: graph-input 16B-alignment staging decision ───────────────────
+    // The caller's `input` slice alignment is unknowable at codegen and the
+    // s3 conv1x1 SIMD path falls back to scalar on `in_ptr % 16 != 0`
+    // (conv1x1.rs:284-286).  When the FIRST emitted kernel is SIMD-eligible
+    // per the T4.1 mirror, the input region is copied into a
+    // `#[repr(C, align(16))]` local once per predict and every graph-input
+    // read goes through it (same bytes — bit-exact; the staging only
+    // guarantees alignment).  When the first kernel is scalar anyway, no
+    // staging is emitted (recorded in the selector evidence).
+    let staging: Option<selector::StagingDecision> = if stage_input {
+        let first_group = match schedule {
+            Some(s) => s.groups.first().cloned(),
+            None => ops.first().map(|op| single_op_group(0, op)),
+        };
+        first_group.map(|g| selector::input_staging_decision(model, &g))
+    } else {
+        None
+    };
+    let input_staged = staging.as_ref().is_some_and(|d| d.stage);
+    let staged_ty: Option<TokenStream> = if input_staged {
+        let n = input_len;
+        Some(quote! {
+            /// T4.2 — 16B-aligned staging buffer for the graph input region
+            /// (the caller's slice alignment is unknowable at codegen).
+            #[repr(C, align(16))]
+            struct STAGED_INPUT {
+                data: [i8; #n],
+            }
+        })
+    } else {
+        None
+    };
+    let staged_local: Option<TokenStream> = if input_staged {
+        let n = input_len;
+        Some(quote! {
+            let mut staged_input = STAGED_INPUT { data: [0i8; #n] };
+            staged_input.data.copy_from_slice(&input[..]);
+        })
+    } else {
+        None
+    };
+
     // ── Emit per-op consts + calls (straight-line, execution order) ────────
     // With a schedule, each op is either (a) an anchor of a composed group
     // → one `fused_*` call, (b) absorbed into a composed group → skipped, or
@@ -194,20 +245,22 @@ fn emit_model_with_options(
         }
         let mut actx = ArenaCtx::new(arena_plan.as_ref(), lens.as_deref().unwrap_or(&[]));
         actx.op = i;
+        actx.input_staged = input_staged;
         let em = match plan.as_ref().and_then(|p| p.anchor_group[i]) {
             Some(gi) => {
+                let plan = plan.as_ref().expect("anchor_group implies a plan");
                 let group = &schedule.expect("anchor_group implies a schedule").groups[gi];
-                match composed_kind(group) {
-                    Some(ComposedKind::Conv) => {
+                match plan.selections[gi].kernel {
+                    GroupSelection::Composed(ComposedKind::Conv) => {
                         emit_fused_conv(model, &storage, &mut actx, i, op, group)?
                     }
-                    Some(ComposedKind::Chain) => {
+                    GroupSelection::Composed(ComposedKind::Chain) => {
                         emit_fused_chain(model, &storage, &mut actx, i, op, group)?
                     }
-                    Some(ComposedKind::PoolFold) => {
+                    GroupSelection::Composed(ComposedKind::PoolFold) => {
                         emit_fused_pool_fold(model, &storage, &mut actx, i, op, group)?
                     }
-                    None => emit_op(model, &storage, &mut actx, i, op)?,
+                    GroupSelection::PerOp => emit_op(model, &storage, &mut actx, i, op)?,
                 }
             }
             None => emit_op(model, &storage, &mut actx, i, op)?,
@@ -351,6 +404,7 @@ fn emit_model_with_options(
                 }
                 #arena_local
                 #(#tensor_locals)*
+                #staged_local
                 #backend_bind
                 #(#calls)*
                 Ok(())
@@ -367,6 +421,7 @@ fn emit_model_with_options(
         pub const ARENA_LEN: usize = #arena_peak;
         #(#consts)*
         #arena_ty
+        #staged_ty
         #(#tensor_types)*
         #wrapper
     })
@@ -376,42 +431,31 @@ fn emit_model_with_options(
 // Fused-schedule wiring (T1.2)
 // ---------------------------------------------------------------------------
 
-/// Which composed `FusedKernelBackend` call replaces the anchor's per-op call.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum ComposedKind {
-    /// CONV_2D anchor with an absorbed residual-ADD and/or trailing
-    /// activation (fusion patterns (c) / (a)) → `fused_conv2d`.
-    Conv,
-    /// ADD/MUL/SUB anchor with an absorbed elementwise chain (pattern (b))
-    /// → `fused_elementwise_chain`.
-    Chain,
-    /// Pool anchor with an absorbed MUL/SUB input fold (pattern (d))
-    /// → `fused_pool_with_fold`.
-    PoolFold,
+/// A single-op group for the UNFUSED emission path — the T4.2 input-staging
+/// decision needs a "first kernel" even without a fusion schedule, so
+/// `op[0]` is wrapped as an anchor-only group (nothing absorbed).
+fn single_op_group(index: usize, op: &ParsedOp<'_>) -> FusedGroup {
+    FusedGroup {
+        anchor_op_index: index,
+        anchor_builtin: op.builtin_code,
+        inputs: op.inputs.clone(),
+        output_tensor: op.outputs.first().copied().unwrap_or(u32::MAX),
+        absorbed_ops: Vec::new(),
+        eliminated_tensors: Vec::new(),
+        activation: None,
+        elementwise_chain: Vec::new(),
+        residual_add: None,
+        input_fold: None,
+        folded_requantize: None,
+        requires_verification: false,
+    }
 }
 
-/// Classify a fused group for the T1.2 emitter.
-///
-/// Only **T1 groups** (`requires_verification == false`) are composed — T2
-/// groups (input folds, requantize folds) are algebraically transformative
-/// and stay per-op until a fused==unfused verification passes.  Only
-/// CONV_2D anchors compose as convs: [`FusedConvParams`] carries
-/// `Conv2DParams`, so a DEPTHWISE/FULLY_CONNECTED anchor with absorbed ops
-/// falls back to per-op emission (bit-exact, unchanged).  Softmax anchors
-/// never compose (their fold has no `PoolParams` representation).
-fn composed_kind(group: &FusedGroup) -> Option<ComposedKind> {
-    if group.requires_verification {
-        return None;
-    }
-    match group.anchor_builtin {
-        3 if group.residual_add.is_some() || !group.absorbed_ops.is_empty() => {
-            Some(ComposedKind::Conv)
-        }
-        0 | 18 | 41 if !group.elementwise_chain.is_empty() => Some(ComposedKind::Chain),
-        1 | 17 if group.input_fold.is_some() => Some(ComposedKind::PoolFold),
-        _ => None,
-    }
-}
+// `ComposedKind` + the per-group composed-vs-per-op decision moved to
+// `optimize::selector` (T4.2): the rule-tier selector adds the T4.1 mirror
+// eligibility gate on top of the T1.2 structural arms (see
+// `selector::select_kernel`), so a composed call is never emitted when its
+// composed SIMD path cannot engage.
 
 /// Per-op / per-tensor decisions derived from the schedule once per model.
 struct FusedPlan {
@@ -422,14 +466,26 @@ struct FusedPlan {
     absorbed: Vec<bool>,
     /// Tensor indices eliminated by composed groups (no stack array).
     eliminated: Vec<bool>,
+    /// The selector verdict per group (index-aligned with the schedule).
+    selections: Vec<selector::Selection>,
 }
 
-fn fused_plan(schedule: &FusedSchedule, op_count: usize, tensor_count: usize) -> FusedPlan {
+fn fused_plan(
+    model: &ParsedModel<'_>,
+    schedule: &FusedSchedule,
+    op_count: usize,
+    tensor_count: usize,
+) -> FusedPlan {
     let mut anchor_group = vec![None; op_count];
     let mut absorbed = vec![false; op_count];
     let mut eliminated = vec![false; tensor_count];
+    let selections: Vec<selector::Selection> = schedule
+        .groups
+        .iter()
+        .map(|g| selector::select_kernel(model, g))
+        .collect();
     for (gi, group) in schedule.groups.iter().enumerate() {
-        if composed_kind(group).is_none() {
+        if selections[gi].kernel == GroupSelection::PerOp {
             continue;
         }
         anchor_group[group.anchor_op_index] = Some(gi);
@@ -442,7 +498,7 @@ fn fused_plan(schedule: &FusedSchedule, op_count: usize, tensor_count: usize) ->
             }
         }
     }
-    FusedPlan { anchor_group, absorbed, eliminated }
+    FusedPlan { anchor_group, absorbed, eliminated, selections }
 }
 
 // ---------------------------------------------------------------------------
@@ -488,6 +544,8 @@ struct ArenaCtx<'a> {
     regions: Vec<(Ident, usize, usize)>,
     /// Op index — names the slice idents uniquely.
     op: usize,
+    /// T4.2: graph-input slices come from the 16B-aligned staging buffer.
+    input_staged: bool,
 }
 
 impl<'a> ArenaCtx<'a> {
@@ -496,13 +554,13 @@ impl<'a> ArenaCtx<'a> {
             Some(p) => (true, &p.offsets[..]),
             None => (false, &[][..]),
         };
-        Self { on, offsets, lens, regions: Vec::new(), op: 0 }
+        Self { on, offsets, lens, regions: Vec::new(), op: 0, input_staged: false }
     }
 
     /// Arena off: every slice lookup returns `None`, so callers emit the
     /// per-tensor `tensor_N.data` expressions (fallback mode).
     fn inactive() -> Self {
-        Self { on: false, offsets: &[], lens: &[], regions: Vec::new(), op: 0 }
+        Self { on: false, offsets: &[], lens: &[], regions: Vec::new(), op: 0, input_staged: false }
     }
 
     /// Register the arena slice for tensor `t`, deduped by (offset, len) so
@@ -615,7 +673,11 @@ fn operand_data(
         },
         Storage::Input { start, len } => {
             let end = start + len;
-            Ok((quote!(&input[#start..#end]), Vec::new()))
+            if ctx.input_staged {
+                Ok((quote!(&staged_input.data[#start..#end]), Vec::new()))
+            } else {
+                Ok((quote!(&input[#start..#end]), Vec::new()))
+            }
         }
         Storage::Output { .. } => Err(format!(
             "tensor {t} is a model output used as a composed operand"
@@ -678,7 +740,11 @@ fn src_expr(
     match storage.get(t).ok_or_else(|| format!("tensor index {t} out of range"))? {
         Storage::Input { start, len } => {
             let end = start + len;
-            Ok(quote!(&input[#start..#end]))
+            if ctx.input_staged {
+                Ok(quote!(&staged_input.data[#start..#end]))
+            } else {
+                Ok(quote!(&input[#start..#end]))
+            }
         }
         Storage::Tensor { idx } => match ctx.slice(*idx) {
             Some((ident, _, _)) => Ok(quote!(&#ident[..])),
@@ -2903,7 +2969,7 @@ mod tests {
     fn stack_emission_has_no_arena() {
         let model = flatbuffer::parse(KWS_TFLITE).expect("kws parses");
         let schedule = crate::optimize::fusion::fuse(&model);
-        let ts = emit_model_stack_fused(&model, &schedule).expect("kws stack emits");
+        let ts = emit_model_stack_fused(&model, &schedule, true).expect("kws stack emits");
         let s: String = ts.to_string().chars().filter(|c| !c.is_whitespace()).collect();
         assert!(!s.contains("structArena"), "stack arm must not emit the arena");
         assert!(s.contains("ARENA_LEN:usize=0usize"), "stack arm: ARENA_LEN must be 0");
@@ -2927,10 +2993,13 @@ mod tests {
             let model = flatbuffer::parse(bytes).unwrap_or_else(|e| panic!("{name}: parse: {e}"));
             let schedule = crate::optimize::fusion::fuse(&model);
             assert!(
-                schedule.groups.iter().all(|g| composed_kind(g).is_none()),
+                schedule
+                    .groups
+                    .iter()
+                    .all(|g| selector::select_kernel(&model, g).kernel == GroupSelection::PerOp),
                 "{name}: expected zero composed groups"
             );
-            let fused = emit_model_fused(&model, &schedule)
+            let fused = emit_model_fused(&model, &schedule, true)
                 .unwrap_or_else(|e| panic!("{name}: fused emit: {e}"))
                 .to_string();
             let unfused = emit_model(&model)
@@ -2966,11 +3035,13 @@ mod tests {
         let composed = schedule
             .groups
             .iter()
-            .filter(|g| composed_kind(g).is_some())
+            .filter(|g| {
+                selector::select_kernel(&model, g).kernel != GroupSelection::PerOp
+            })
             .count();
         assert_eq!(composed, 10);
 
-        let fused = emit_model_fused(&model, &schedule).expect("mv2 fused emits");
+        let fused = emit_model_fused(&model, &schedule, true).expect("mv2 fused emits");
         let fused_s: String = fused.to_string().chars().filter(|c| !c.is_whitespace()).collect();
         let unfused = emit_model(&model).expect("mv2 unfused emits");
         let unfused_s: String = unfused.to_string().chars().filter(|c| !c.is_whitespace()).collect();
@@ -3021,7 +3092,14 @@ mod tests {
 
         // Dispatch through KernelBackend, slices into the typed I/O arrays.
         assert!(s.contains("backend.fully_connected("));
-        assert!(s.contains("&input[0usize..1usize]"));
+        // T4.2: sine's first layer is an SIMD-eligible FC, so the graph input
+        // is staged into the 16B-aligned STAGED_INPUT buffer; the first op
+        // reads from it (aligned), never from the caller's misalignment-prone
+        // `input` slice.
+        assert!(s.contains("structSTAGED_INPUT"), "staged input type missing: {s}");
+        assert!(s.contains("staged_input.data.copy_from_slice(&input[..])"), "staged copy missing: {s}");
+        assert!(s.contains("&staged_input.data[0usize..1usize]"), "staged input slice wrong: {s}");
+        assert!(!s.contains("&input[0usize..1usize]"), "unstaged input slice leaked: {s}");
         assert!(s.contains("&mutoutput[0usize..1usize]"));
 
         // No unsafe or heap in the generated code.

@@ -38,7 +38,7 @@ pub(crate) mod eligibility;
 #[proc_macro_attribute]
 pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
     let proc_item = proc_macro2::TokenStream::from(item);
-    parse_and_emit_impl(attr, proc_item, true, true).into()
+    parse_and_emit_impl(attr, proc_item, true, true, true).into()
 }
 
 /// Test-support attribute: identical to [`model`], but emits the UNFUSED
@@ -47,7 +47,7 @@ pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn model_unfused(attr: TokenStream, item: TokenStream) -> TokenStream {
     let proc_item = proc_macro2::TokenStream::from(item);
-    parse_and_emit_impl(attr, proc_item, false, true).into()
+    parse_and_emit_impl(attr, proc_item, false, true, true).into()
 }
 
 /// Test-support attribute: identical to [`model`] (fused schedule honored)
@@ -56,7 +56,17 @@ pub fn model_unfused(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn model_stack(attr: TokenStream, item: TokenStream) -> TokenStream {
     let proc_item = proc_macro2::TokenStream::from(item);
-    parse_and_emit_impl(attr, proc_item, true, false).into()
+    parse_and_emit_impl(attr, proc_item, true, false, true).into()
+}
+
+/// Test-support attribute: identical to [`model`] (fused schedule honored,
+/// arena enabled) but with the T4.2 graph-input 16B staging DISABLED — the
+/// unstaged arm of the staged-vs-unstaged bit-exactness gate
+/// (`tests/staged_input.rs`).
+#[proc_macro_attribute]
+pub fn model_unstaged(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let proc_item = proc_macro2::TokenStream::from(item);
+    parse_and_emit_impl(attr, proc_item, true, true, false).into()
 }
 
 /// Read + parse the model and route through the emitter, all within one
@@ -65,11 +75,13 @@ pub fn model_stack(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// passes it to the emitter (T1.2); `false` emits per-op only.
 /// `arena: true` enables the T1.3 liveness arena for intermediates;
 /// `false` forces per-tensor stack arrays (`#[model_stack]` test arm).
+/// `stage_input: true` honors the T4.2 graph-input 16B-staging decision.
 fn parse_and_emit_impl(
     attr: TokenStream,
     proc_item: proc_macro2::TokenStream,
     fused: bool,
     arena: bool,
+    stage_input: bool,
 ) -> proc_macro2::TokenStream {
     let path = match model_path_from_attr(&attr) {
         Ok(p) => p,
@@ -97,9 +109,9 @@ fn parse_and_emit_impl(
     let emitted = if fused {
         let schedule = optimize::fusion::fuse(&model);
         if arena {
-            generate::emit_model_fused(&model, &schedule)
+            generate::emit_model_fused(&model, &schedule, stage_input)
         } else {
-            generate::emit_model_stack_fused(&model, &schedule)
+            generate::emit_model_stack_fused(&model, &schedule, stage_input)
         }
     } else {
         generate::emit_model(&model)

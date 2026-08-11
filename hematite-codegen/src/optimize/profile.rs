@@ -48,28 +48,12 @@
 
 use std::path::Path;
 
-use crate::eligibility as mir;
-use crate::flatbuffer::{self, ParsedModel, ParsedOptions, ParsedTensor, TensorType};
-use hematite_core::op_params::{
-    ElementwiseChainParams, ElementwiseChainStep, ElementwiseKind, ElementwiseParams,
-    FusedActivation, Padding, PoolParams,
-};
+use crate::flatbuffer::{self, ParsedModel, ParsedTensor, TensorType};
 use hematite_memory::{liveness_plan, ArenaPlan, OpInfo, MAX_IO_PER_OP, MAX_TENSORS};
 
 use super::arena::{self, ArenaError};
-use super::fusion::{fuse, ElementwiseKind as FusionElementwiseKind, FusedGroup, FusedSchedule};
-
-// BuiltinOperator codes — fusion.rs's consts are private; re-declared here
-// (values from the vendored v23.1-era schema, verified by T4.0).
-const ADD: i32 = 0;
-const AVERAGE_POOL_2D: i32 = 1;
-const CONV_2D: i32 = 3;
-const DEPTHWISE_CONV_2D: i32 = 4;
-const FULLY_CONNECTED: i32 = 9;
-const MAX_POOL_2D: i32 = 17;
-const MUL: i32 = 18;
-const SOFTMAX: i32 = 25;
-const SUB: i32 = 41;
+use super::fusion::{fuse, FusedGroup, FusedSchedule};
+use super::selector;
 
 // ---------------------------------------------------------------------------
 // Model corpus
@@ -167,26 +151,10 @@ struct PatternCounts {
 }
 
 /// SIMD eligibility of a group's anchor kernel — computed by the T4.1
-/// parity-tested mirror (crate::eligibility); each answer cites the s3 gate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SimdEst {
-    /// Anchor kernel is SIMD-eligible for these shapes per the cited gate.
-    Simd,
-    /// In-scope op whose gate FAILS for these shapes (scalar dispatch).
-    Scalar,
-    /// Anchor has no SIMD path in the C2/C3 composed-kernel scope.
-    NoSimdPath,
-}
-
-impl SimdEst {
-    fn label(self) -> &'static str {
-        match self {
-            SimdEst::Simd => "SIMD",
-            SimdEst::Scalar => "scalar",
-            SimdEst::NoSimdPath => "n/a",
-        }
-    }
-}
+/// parity-tested mirror via `selector::simd_eligibility` (moved there so the
+/// emit path and this profile share one copy); each answer cites the s3
+/// gate.  Re-exported here for the profile's own use.
+pub(crate) use super::selector::{simd_eligibility, SimdEst};
 
 struct GroupRow {
     anchor_idx: usize,
@@ -436,528 +404,14 @@ fn tensor_byte_size(t: &ParsedTensor<'_>) -> usize {
     (elems.saturating_mul(elem)) as usize
 }
 
-/// Flat element count of a shape (0 on dynamic/negative dims).
-fn flat_prod(shape: &[i32]) -> usize {
-    shape
-        .iter()
-        .fold(1usize, |acc, &d| if d <= 0 { 0 } else { acc.saturating_mul(d as usize) })
-}
-
-/// Channel count of a NHWC tensor = its last shape dim.
-fn last_dim(shape: &[i32]) -> usize {
-    shape.last().copied().filter(|&d| d > 0).map(|d| d as usize).unwrap_or(0)
-}
-
 // ---------------------------------------------------------------------------
-// SIMD eligibility — the T4.1 parity-tested host mirror (crate::eligibility).
-// Every anchor routes through the SAME gates the s3 dispatchers check; the
-// runtime-only halves of engagement (16B pointer alignment, scratch sizing,
-// n % 16) are not host-visible and are called out per cell.
+// SIMD eligibility — computed by the T4.1 parity-tested host mirror via
+// `selector::simd_eligibility` (moved there so the emit path and this
+// profile share one copy).  Every anchor routes through the SAME gates the
+// s3 dispatchers check; the runtime-only halves of engagement (16B pointer
+// alignment, scratch sizing, n % 16) are not host-visible and are called out
+// per cell.
 // ---------------------------------------------------------------------------
-
-fn tensor_zp(t: &ParsedTensor<'_>) -> i32 {
-    t.quant.as_ref().map(|q| q.zero_point as i32).unwrap_or(0)
-}
-
-fn tensor_scale(t: &ParsedTensor<'_>) -> Option<f64> {
-    t.quant
-        .as_ref()
-        .filter(|q| q.scale.is_finite() && q.scale > 0.0)
-        .map(|q| f64::from(q.scale))
-}
-
-/// `input_offset` exactly as the s3 dispatchers receive it: the negative of
-/// the input tensor's zero point (TFLite convention).
-fn input_offset_of(model: &ParsedModel<'_>, t: u32) -> i32 {
-    model
-        .tensor_by_index(t as usize)
-        .map(tensor_zp)
-        .map(|zp| -zp)
-        .unwrap_or(0)
-}
-
-/// `std::frexp` semantics — replicates generate.rs:747-758 (the profile is
-/// test-only; the parity-tested mirror lives in eligibility.rs).
-fn frexp(x: f64) -> (f64, i32) {
-    if x == 0.0 {
-        return (0.0, 0);
-    }
-    let bits = x.to_bits();
-    let exponent = ((bits >> 52) & 0x7ff) as i32;
-    let mantissa = bits & 0x000f_ffff_ffff_ffff;
-    let sign = bits & 0x8000_0000_0000_0000;
-    let frexp_exponent = exponent - 1022;
-    let frexp_significand_bits = sign | 0x3fe0_0000_0000_0000u64 | mantissa;
-    (f64::from_bits(frexp_significand_bits), frexp_exponent)
-}
-
-/// TFLM `QuantizeMultiplier` — replicates generate.rs:730-744 (semantics
-/// copied from hematite-int8).
-fn quantize_multiplier(scale: f64) -> (i32, i32) {
-    if scale == 0.0 {
-        return (0, 0);
-    }
-    let (sig, mut shift) = frexp(scale);
-    let mut q_fixed = (sig * (1u64 << 31) as f64 + 0.5) as i64;
-    if q_fixed == (1i64 << 31) {
-        q_fixed /= 2;
-        shift += 1;
-    }
-    if shift < -31 {
-        return (0, 0);
-    }
-    (q_fixed as i32, shift)
-}
-
-/// TFLM `CalculateActivationRangeQuantized` — replicates generate.rs:847-861.
-fn act_range(act: i8, out_scale: f64, out_zp: i32) -> (i32, i32) {
-    const QMIN: i32 = -128;
-    const QMAX: i32 = 127;
-    if out_scale <= 0.0 {
-        return (QMIN, QMAX);
-    }
-    match act {
-        1 => (out_zp.max(QMIN), QMAX),
-        3 => (
-            out_zp.max(QMIN),
-            (out_zp + (6.0 / out_scale).round() as i32).min(QMAX),
-        ),
-        _ => (QMIN, QMAX),
-    }
-}
-
-/// The elementwise quant view of one elementwise op — replicates
-/// generate.rs:1961-1996 (`elementwise_quant`): offsets from tensor zero
-/// points, multipliers via the TFLM fixed-point quantize.
-fn elementwise_params_view(
-    in1: &ParsedTensor<'_>,
-    in2: &ParsedTensor<'_>,
-    out: &ParsedTensor<'_>,
-    kind: ElementwiseKind,
-    num_elements: i32,
-) -> Option<ElementwiseParams> {
-    let in1_scale = tensor_scale(in1)?;
-    let in2_scale = tensor_scale(in2)?;
-    let out_scale = tensor_scale(out)?;
-    let (left_shift, i1m, i1s, i2m, i2s, om, os) = match kind {
-        ElementwiseKind::Add | ElementwiseKind::Sub => {
-            let twice_max = 2.0 * in1_scale.max(in2_scale);
-            let ls = 20i32;
-            let (a, b) = quantize_multiplier(in1_scale / twice_max);
-            let (c, d) = quantize_multiplier(in2_scale / twice_max);
-            let (e, f) = quantize_multiplier(twice_max / ((1i32 << ls) as f64 * out_scale));
-            (ls, a, b, c, d, e, f)
-        }
-        ElementwiseKind::Mul => {
-            let (e, f) = quantize_multiplier(in1_scale * in2_scale / out_scale);
-            (0, 0, 0, 0, 0, e, f)
-        }
-        ElementwiseKind::Relu | ElementwiseKind::Relu6 | ElementwiseKind::HardSwish => {
-            return None
-        }
-    };
-    Some(ElementwiseParams {
-        num_elements,
-        input1_offset: -tensor_zp(in1),
-        input2_offset: -tensor_zp(in2),
-        output_offset: tensor_zp(out),
-        output_multiplier: om,
-        output_shift: os,
-        left_shift,
-        input1_multiplier: i1m,
-        input1_shift: i1s,
-        input2_multiplier: i2m,
-        input2_shift: i2s,
-        quantized_activation_min: i8::MIN as i32,
-        quantized_activation_max: i8::MAX as i32,
-    })
-}
-
-fn pool_params_view(
-    model: &ParsedModel<'_>,
-    g: &FusedGroup,
-    anchor: &crate::flatbuffer::ParsedOp<'_>,
-) -> Option<PoolParams> {
-    let in_t = g.inputs.first().and_then(|&t| model.tensor_by_index(t as usize))?;
-    let out_t = model.tensor_by_index(g.output_tensor as usize)?;
-    let (padding, stride_w, stride_h, filter_w, filter_h, fused_activation) =
-        match anchor.options.as_ref() {
-            Some(ParsedOptions::Pool2D {
-                padding,
-                stride_w,
-                stride_h,
-                filter_w,
-                filter_h,
-                fused_activation,
-            }) => (*padding, *stride_w, *stride_h, *filter_w, *filter_h, *fused_activation),
-            _ => (0, 1, 1, 2, 2, 0),
-        };
-    let ch = last_dim(&in_t.shape) as i32;
-    Some(PoolParams {
-        input_shape: [1, in_t.shape.get(1).copied().unwrap_or(1), in_t.shape.get(2).copied().unwrap_or(1), ch],
-        output_shape: [
-            1,
-            out_t.shape.get(1).copied().unwrap_or(1),
-            out_t.shape.get(2).copied().unwrap_or(1),
-            last_dim(&out_t.shape) as i32,
-        ],
-        filter_width: filter_w,
-        filter_height: filter_h,
-        stride_width: stride_w,
-        stride_height: stride_h,
-        padding: if padding == 1 { Padding::Valid } else { Padding::Same },
-        activation: match fused_activation {
-            1 => FusedActivation::Relu,
-            3 => FusedActivation::Relu6,
-            _ => FusedActivation::None,
-        },
-        // The pool gate ignores the clamp range (T3.1 widened) — the values
-        // are carried for completeness only.
-        quantized_activation_min: i8::MIN as i32,
-        quantized_activation_max: i8::MAX as i32,
-    })
-}
-
-/// The absorbed input fold's elementwise params, derived from the fold op's
-/// own tensors exactly as the decomposition emits them (fused.rs:794-810's
-/// `fold_elementwise_params` mapping; the codegen `InputFold` IR carries only
-/// the real-domain ratio, so the quant pairs are re-derived via
-/// `elementwise_params_view` over the absorbed op).
-fn fold_params_view(
-    model: &ParsedModel<'_>,
-    fold: &super::fusion::InputFold,
-) -> Option<ElementwiseParams> {
-    let op = model.ops().get(fold.op_index)?;
-    let in1 = model.tensor_by_index(fold.folded_input_tensor as usize)?;
-    let in2 = model.tensor_by_index(fold.operand_tensor as usize)?;
-    let out = model.tensor_by_index(*op.outputs.first()? as usize)?;
-    let kind = match fold.builtin {
-        18 => ElementwiseKind::Mul,
-        41 => ElementwiseKind::Sub,
-        _ => return None,
-    };
-    let num_elements = flat_prod(&in1.shape) as i32;
-    elementwise_params_view(in1, in2, out, kind, num_elements)
-}
-
-/// Chain anchor elementwise params (step 0) — replicates the
-/// `emit_fused_chain` step-0 derivation (generate.rs:2264-2341): the anchor
-/// op's own quant + its fused-activation clamp.
-fn chain_anchor_step(
-    model: &ParsedModel<'_>,
-    g: &FusedGroup,
-    anchor: &crate::flatbuffer::ParsedOp<'_>,
-    num_elements: i32,
-) -> Option<ElementwiseChainStep<'static>> {
-    let kind = match g.anchor_builtin {
-        0 => ElementwiseKind::Add,
-        18 => ElementwiseKind::Mul,
-        41 => ElementwiseKind::Sub,
-        _ => return None,
-    };
-    let in1_t = *anchor.inputs.first()?;
-    let in2_t = *anchor.inputs.get(1)?;
-    let out_t = *anchor.outputs.first()?;
-    let in1 = model.tensor_by_index(in1_t as usize)?;
-    let in2 = model.tensor_by_index(in2_t as usize)?;
-    let out = model.tensor_by_index(out_t as usize)?;
-    let fused_activation = match anchor.options.as_ref() {
-        Some(ParsedOptions::Add { fused_activation, .. })
-        | Some(ParsedOptions::Sub { fused_activation, .. })
-        | Some(ParsedOptions::Mul { fused_activation }) => *fused_activation,
-        _ => 0,
-    };
-    let out_scale = tensor_scale(out)?;
-    let (amin, amax) = act_range(fused_activation, out_scale, tensor_zp(out));
-    let q = elementwise_params_view(in1, in2, out, kind, num_elements)?;
-    Some(ElementwiseChainStep {
-        kind,
-        operand: Some(&[]),
-        input1_offset: q.input1_offset,
-        input2_offset: q.input2_offset,
-        output_offset: q.output_offset,
-        output_multiplier: q.output_multiplier,
-        output_shift: q.output_shift,
-        left_shift: q.left_shift,
-        input1_multiplier: q.input1_multiplier,
-        input1_shift: q.input1_shift,
-        input2_multiplier: q.input2_multiplier,
-        input2_shift: q.input2_shift,
-        quantized_activation_min: amin,
-        quantized_activation_max: amax,
-    })
-}
-
-/// Absorbed chain steps (1..) — the fusion IR's `StepRequantize` carries the
-/// full per-step elementwise fields; the clamp comes from the step op's fused
-/// activation + the step's carried output quant (chain_step_act_range,
-/// generate.rs:2410-2429). The mirror's chain gate only tests operand
-/// PRESENCE, so `Some(&[])` stands in for the constant operand bytes.
-fn chain_absorbed_steps(
-    model: &ParsedModel<'_>,
-    g: &FusedGroup,
-) -> Vec<ElementwiseChainStep<'static>> {
-    g.elementwise_chain
-        .iter()
-        .map(|absorbed| {
-            let kind = match absorbed.kind {
-                FusionElementwiseKind::Add => ElementwiseKind::Add,
-                FusionElementwiseKind::Mul => ElementwiseKind::Mul,
-                FusionElementwiseKind::Sub => ElementwiseKind::Sub,
-                FusionElementwiseKind::Relu => ElementwiseKind::Relu,
-                FusionElementwiseKind::Relu6 => ElementwiseKind::Relu6,
-                FusionElementwiseKind::HardSwish => ElementwiseKind::HardSwish,
-            };
-            let fused = model
-                .ops()
-                .get(absorbed.op_index)
-                .and_then(|op| match op.options.as_ref() {
-                    Some(ParsedOptions::Add { fused_activation, .. })
-                    | Some(ParsedOptions::Sub { fused_activation, .. })
-                    | Some(ParsedOptions::Mul { fused_activation }) => Some(*fused_activation),
-                    _ => None,
-                })
-                .unwrap_or(0);
-            let (amin, amax) =
-                act_range(fused, f64::from(absorbed.output_scale), absorbed.output_zero_point as i32);
-            let rq = &absorbed.requantize;
-            ElementwiseChainStep {
-                kind,
-                operand: if absorbed.operand_tensor == u32::MAX { None } else { Some(&[]) },
-                input1_offset: rq.input1_offset,
-                input2_offset: rq.input2_offset,
-                output_offset: rq.output_offset,
-                output_multiplier: rq.output_multiplier,
-                output_shift: rq.output_shift,
-                left_shift: rq.left_shift,
-                input1_multiplier: rq.input1_multiplier,
-                input1_shift: rq.input1_shift,
-                input2_multiplier: rq.input2_multiplier,
-                input2_shift: rq.input2_shift,
-                quantized_activation_min: amin,
-                quantized_activation_max: amax,
-            }
-        })
-        .collect()
-}
-
-fn simd_eligibility(model: &ParsedModel<'_>, g: &FusedGroup) -> (SimdEst, String) {
-    let anchor = &model.ops()[g.anchor_op_index];
-    match g.anchor_builtin {
-        CONV_2D => {
-            let Some(w) = anchor.inputs.get(1).and_then(|&t| model.tensor_by_index(t as usize))
-            else {
-                return (SimdEst::NoSimdPath, "conv weight tensor missing".into());
-            };
-            let Some(input) = anchor.inputs.first().and_then(|&t| model.tensor_by_index(t as usize))
-            else {
-                return (SimdEst::NoSimdPath, "conv input tensor missing".into());
-            };
-            let Some(out) = model.tensor_by_index(g.output_tensor as usize) else {
-                return (SimdEst::NoSimdPath, "conv output tensor missing".into());
-            };
-            let in_c = last_dim(&w.shape);
-            let out_c = last_dim(&out.shape);
-            let (fh, fw) = (
-                w.shape.get(1).copied().unwrap_or(0),
-                w.shape.get(2).copied().unwrap_or(0),
-            );
-            let (sw, sh, dw, dh) = match anchor.options.as_ref() {
-                Some(ParsedOptions::Conv2D {
-                    stride_w,
-                    stride_h,
-                    dilation_w,
-                    dilation_h,
-                    ..
-                }) => (*stride_w, *stride_h, *dilation_w, *dilation_h),
-                _ => (1, 1, 1, 1),
-            };
-            let input_offset = input_offset_of(model, anchor.inputs[0]);
-            let (in_h, in_w) = (
-                input.shape.get(1).copied().unwrap_or(1) as usize,
-                input.shape.get(2).copied().unwrap_or(1) as usize,
-            );
-            let (out_h, out_w) = (
-                out.shape.get(1).copied().unwrap_or(1) as usize,
-                out.shape.get(2).copied().unwrap_or(1) as usize,
-            );
-            if fh == 1 && fw == 1 {
-                if mir::conv1x1_dispatch_eligible(
-                    in_c, out_c, sh, sw, dh, dw, in_h, in_w, out_h, out_w,
-                ) {
-                    (
-                        SimdEst::Simd,
-                        "conv1x1: mirror of conv1x1_accx_dispatch (conv1x1.rs:214-224); ptr-align/scratch runtime-only".into(),
-                    )
-                } else {
-                    (
-                        SimdEst::Scalar,
-                        "conv1x1: mirror conv1x1_dispatch_eligible fails (conv1x1.rs:214-224)".into(),
-                    )
-                }
-            } else if mir::conv3x3_dispatch_eligible(in_c, out_c, fh, fw, dh, dw, input_offset) {
-                (
-                    SimdEst::Simd,
-                    "conv3x3: mirror of conv3x3_accx_dispatch (conv3x3.rs:128-139); ptr-align/scratch runtime-only".into(),
-                )
-            } else {
-                (
-                    SimdEst::Scalar,
-                    "conv3x3: mirror conv3x3_dispatch_eligible fails (conv3x3.rs:128-139)".into(),
-                )
-            }
-        }
-        DEPTHWISE_CONV_2D => {
-            let Some(input) = anchor.inputs.first().and_then(|&t| model.tensor_by_index(t as usize))
-            else {
-                return (SimdEst::NoSimdPath, "depthwise input tensor missing".into());
-            };
-            let Some(w) = anchor.inputs.get(1).and_then(|&t| model.tensor_by_index(t as usize))
-            else {
-                return (SimdEst::NoSimdPath, "depthwise weight tensor missing".into());
-            };
-            let Some(out) = model.tensor_by_index(g.output_tensor as usize) else {
-                return (SimdEst::NoSimdPath, "depthwise output tensor missing".into());
-            };
-            let in_c = last_dim(&input.shape);
-            let out_c = last_dim(&out.shape);
-            let (fh, fw) = (
-                w.shape.get(1).copied().unwrap_or(0),
-                w.shape.get(2).copied().unwrap_or(0),
-            );
-            let (dm, dw, dh) = match anchor.options.as_ref() {
-                Some(ParsedOptions::DepthwiseConv2D {
-                    depth_multiplier,
-                    dilation_w,
-                    dilation_h,
-                    ..
-                }) => (*depth_multiplier, *dilation_w, *dilation_h),
-                _ => (1, 1, 1),
-            };
-            let input_offset = input_offset_of(model, anchor.inputs[0]);
-            if mir::depthwise_dispatch_eligible(
-                in_c, out_c, dm, fh, fw, dh, dw, input_offset,
-            ) {
-                (
-                    SimdEst::Simd,
-                    "depthwise: mirror of depthwise_accx_dispatch (depthwise.rs:310-324); ptr-align/scratch runtime-only".into(),
-                )
-            } else {
-                (
-                    SimdEst::Scalar,
-                    "depthwise: mirror depthwise_dispatch_eligible fails (depthwise.rs:310-324)".into(),
-                )
-            }
-        }
-        FULLY_CONNECTED => {
-            let in_dim = g
-                .inputs
-                .first()
-                .and_then(|&t| model.tensor_by_index(t as usize))
-                .map(|t| flat_prod(&t.shape))
-                .unwrap_or(0);
-            let out_dim = model
-                .tensor_by_index(g.output_tensor as usize)
-                .map(|t| flat_prod(&t.shape))
-                .unwrap_or(0);
-            if mir::fc_dispatch_eligible(in_dim, out_dim) {
-                (
-                    SimdEst::Simd,
-                    "fc: mirror of fc_accx_dispatch (gemm.rs:137, accx_eligible_1x1_padded); ptr-align/scratch runtime-only".into(),
-                )
-            } else {
-                (
-                    SimdEst::Scalar,
-                    "fc: mirror fc_dispatch_eligible fails (gemm.rs:137)".into(),
-                )
-            }
-        }
-        AVERAGE_POOL_2D | MAX_POOL_2D => {
-            let Some(pool) = pool_params_view(model, g, anchor) else {
-                return (SimdEst::NoSimdPath, "pool tensor/options missing".into());
-            };
-            let pool_ok = mir::simd_eligible_pool(&pool);
-            let fold_ok = match &g.input_fold {
-                None => true,
-                Some(fold) => match fold_params_view(model, fold) {
-                    Some(ep) => match fold.builtin {
-                        18 => mir::simd_eligible_mul(&ep).is_some(),
-                        41 => mir::simd_eligible_add_sub(&ep),
-                        _ => false,
-                    },
-                    None => false,
-                },
-            };
-            if pool_ok && fold_ok {
-                (
-                    SimdEst::Simd,
-                    "pool: mirror simd_eligible_pool (pool.rs:1171-1208) + fold_simd_exact (fused.rs:677-684); ptr-align runtime-only".into(),
-                )
-            } else if pool_ok {
-                (
-                    SimdEst::Scalar,
-                    "pool: mirror simd_eligible_pool OK but fold_simd_exact fails (fused.rs:677-684)".into(),
-                )
-            } else {
-                (
-                    SimdEst::Scalar,
-                    "pool: mirror simd_eligible_pool fails (pool.rs:1171-1208)".into(),
-                )
-            }
-        }
-        SOFTMAX => {
-            let row_size = g
-                .inputs
-                .first()
-                .and_then(|&t| model.tensor_by_index(t as usize))
-                .map(|t| last_dim(&t.shape) as i32)
-                .unwrap_or(0);
-            if mir::softmax_row_simd_eligible(row_size) {
-                (
-                    SimdEst::Simd,
-                    "softmax: mirror row_size>=16 (softmax.rs:383-387); ptr-align/scratch runtime-only".into(),
-                )
-            } else {
-                (
-                    SimdEst::Scalar,
-                    "softmax: mirror softmax_row_simd_eligible fails (softmax.rs:383-387)".into(),
-                )
-            }
-        }
-        ADD | SUB | MUL => {
-            let num_elements = g
-                .inputs
-                .first()
-                .and_then(|&t| model.tensor_by_index(t as usize))
-                .map(|t| flat_prod(&t.shape) as i32)
-                .unwrap_or(0);
-            let Some(anchor_step) = chain_anchor_step(model, g, anchor, num_elements) else {
-                return (SimdEst::NoSimdPath, "chain anchor params not derivable".into());
-            };
-            let mut steps = vec![anchor_step];
-            steps.extend(chain_absorbed_steps(model, g));
-            let params = ElementwiseChainParams {
-                num_elements,
-                steps: &steps,
-            };
-            if mir::chain_simd_eligible(&params) {
-                (
-                    SimdEst::Simd,
-                    "elementwise chain: mirror chain_simd_eligible (fused.rs:486-502); n%16/ptr-align runtime-only".into(),
-                )
-            } else {
-                (
-                    SimdEst::Scalar,
-                    "elementwise chain: mirror chain_simd_eligible fails (fused.rs:486-502)".into(),
-                )
-            }
-        }
-        _ => (
-            SimdEst::NoSimdPath,
-            "no composed SIMD kernel in C2/C3 scope (data movement / pad / reshape / transpose / mean)".into(),
-        ),
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Markdown + stdout rendering
@@ -1122,6 +576,190 @@ fn profile_zoo_models() {
         std::fs::create_dir_all(parent).expect("create local-notes/evidence/composed-kernels");
     }
     std::fs::write(&path, &markdown).unwrap_or_else(|e| {
+        panic!("failed to write {}: {e}", path.display())
+    });
+    println!("wrote {}", path.display());
+}
+
+// ---------------------------------------------------------------------------
+// T4.2 — selector-output evidence + W0 acceptance gate
+// ---------------------------------------------------------------------------
+
+fn selector_evidence_path() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("local-notes")
+        .join("evidence")
+        .join("composed-kernels")
+        .join("selector-output.md")
+}
+
+/// Render the T4.2 selector output table: per group — the selected tier
+/// (composed kind or per-op), the mirror SIMD estimate, and the why.
+fn render_selector_output(
+    name: &str,
+    schedule: &FusedSchedule,
+    selections: &[selector::Selection],
+    staging: &selector::StagingDecision,
+) -> String {
+    let mut s = String::new();
+    s.push_str(&format!("### {name}\n\n"));
+    let composed: usize = selections
+        .iter()
+        .filter(|sel| sel.kernel != selector::GroupSelection::PerOp)
+        .count();
+    let simd: usize = selections.iter().filter(|sel| sel.simd == selector::SimdEst::Simd).count();
+    s.push_str(&format!(
+        "groups: {} | composed: {} | per-op: {} | SIMD-eligible (composed+per-op): {}/{} | staging: {}\n\n",
+        schedule.groups.len(),
+        composed,
+        schedule.groups.len() - composed,
+        simd,
+        schedule.groups.len(),
+        if staging.stage {
+            format!("YES — {} B staged", staging.bytes)
+        } else {
+            "no".to_string()
+        },
+    ));
+    s.push_str(&format!("staging detail: {}\n\n", staging.reason));
+    s.push_str("| group | anchor op | anchor builtin | selected | SIMD | why |\n");
+    s.push_str("|---|---|---|---|---|---|\n");
+    for (i, (g, sel)) in schedule.groups.iter().zip(selections.iter()).enumerate() {
+        let tier = match sel.kernel {
+            selector::GroupSelection::Composed(k) => match k {
+                selector::ComposedKind::Conv => "fused_conv2d",
+                selector::ComposedKind::Chain => "fused_elementwise_chain",
+                selector::ComposedKind::PoolFold => "fused_pool_with_fold",
+            },
+            selector::GroupSelection::PerOp => "per-op",
+        };
+        s.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} |\n",
+            i,
+            g.anchor_op_index,
+            g.anchor_builtin,
+            tier,
+            sel.simd.label(),
+            sel.reason,
+        ));
+    }
+    s.push('\n');
+    s
+}
+
+/// T4.2 acceptance gate over the 6 zoo models:
+///
+/// * The per-group selector output == the W0 profile expectation pinned in
+///   the committed `fused-profile.md` (d9d50e8): the SIMD-eligible group
+///   counts (composed + per-op) are sine 1/1, hello_world 3/3,
+///   anomaly_detect 10/10, person_detect 28/31, mobilenet_v2 53/74,
+///   kws_micro_speech 2/4.
+/// * No group with a structural composed candidate that the mirror says is
+///   SIMD-eligible is silently left per-op.
+/// * The staging decision matches each model's first kernel: stage
+///   sine/hello_world/anomaly_detect (16B-aligned copy), skip the rest.
+///
+/// Writes `local-notes/evidence/composed-kernels/selector-output.md` (gitignored —
+/// see the T4.1 fused-profile precedent for the write path).
+#[test]
+fn selector_output_zoo_models() {
+    let w0: &[(&str, usize, usize)] = &[
+        ("sine", 1, 1),
+        ("hello_world", 3, 3),
+        ("anomaly_detect", 10, 10),
+        ("person_detect", 28, 31),
+        ("mobilenet_v2_1.0_224", 53, 74),
+        ("kws_micro_speech", 2, 4),
+    ];
+
+    let mut md = String::new();
+    md.push_str("<!-- Generated by hematite-codegen optimize::profile::selector_output_zoo_models (T4.2). Do not edit by hand. -->\n");
+    md.push_str("# Composed-kernel selector output — zoo models (T4.2)\n\n");
+    md.push_str("Per-group verdict of `selector::select_kernel` (rule tier: conv-family composed > chain composed > pool-fold composed > per-op; T2 groups per-op until W5) plus the graph-input 16B-staging decision.\n\n");
+
+    for spec in MODELS {
+        let model = flatbuffer::parse(spec.bytes).unwrap_or_else(|e| {
+            panic!("{} failed to parse: {e}", spec.path)
+        });
+        let schedule = fuse(&model);
+        let selections: Vec<selector::Selection> = schedule
+            .groups
+            .iter()
+            .map(|g| selector::select_kernel(&model, g))
+            .collect();
+        let staging = selector::input_staging_decision(&model, &schedule.groups[0]);
+
+        // W0 acceptance: SIMD-eligible groups (composed + per-op) match the
+        // committed fused-profile expectation.
+        let simd = selections.iter().filter(|sel| sel.simd == selector::SimdEst::Simd).count();
+        let (want_simd, want_groups) = w0
+            .iter()
+            .find(|(n, _, _)| *n == spec.name)
+            .map(|(_, s, g)| (*s, *g))
+            .unwrap_or_else(|| panic!("{}: no W0 expectation row", spec.name));
+        assert_eq!(
+            schedule.groups.len(),
+            want_groups,
+            "{}: group count changed vs W0 profile",
+            spec.name
+        );
+        assert_eq!(
+            simd, want_simd,
+            "{}: SIMD-eligible groups {} != W0 expectation {} (fused-profile.md, d9d50e8)",
+            spec.name, simd, want_simd
+        );
+
+        // No eligible composed candidate silently left per-op.
+        for (i, (g, sel)) in schedule.groups.iter().zip(selections.iter()).enumerate() {
+            if selector::has_composed_candidate(g) && sel.kernel == selector::GroupSelection::PerOp
+            {
+                assert_ne!(
+                    sel.simd,
+                    selector::SimdEst::Simd,
+                    "{}: group {i} has a composed candidate the mirror says is SIMD-eligible but was left per-op: {}",
+                    spec.name,
+                    sel.reason
+                );
+            }
+        }
+
+        // Staging decision: stage exactly when the first kernel is SIMD.
+        let first_simd = selections[0].simd == selector::SimdEst::Simd;
+        assert_eq!(
+            staging.stage, first_simd,
+            "{}: staging decision ({}) disagrees with the first kernel's SIMD estimate ({})",
+            spec.name, staging.stage, first_simd
+        );
+
+        md.push_str(&render_selector_output(spec.name, &schedule, &selections, &staging));
+    }
+
+    // The W0 staging rows: sine/hello_world/anomaly_detect stage their
+    // (tiny) input regions; kws/person_detect/mobilenet_v2 do not.
+    for (name, bytes) in [
+        ("sine", 1usize),
+        ("hello_world", 1usize),
+        ("anomaly_detect", 640usize),
+    ] {
+        let model = flatbuffer::parse(
+            MODELS.iter().find(|s| s.name == name).unwrap().bytes,
+        )
+        .expect("parse");
+        let schedule = fuse(&model);
+        let d = selector::input_staging_decision(&model, &schedule.groups[0]);
+        assert!(d.stage, "{name}: expected staging");
+        assert_eq!(d.bytes, bytes, "{name}: staged bytes");
+    }
+
+    println!("===== selector output over zoo models (T4.2) =====");
+    println!("{md}");
+
+    let path = selector_evidence_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create local-notes/evidence/composed-kernels");
+    }
+    std::fs::write(&path, &md).unwrap_or_else(|e| {
         panic!("failed to write {}: {e}", path.display())
     });
     println!("wrote {}", path.display());

@@ -8,8 +8,9 @@
 //! FNV-1a checksums.
 //!
 //! * The other five zoo models have zero composed groups: their fused
-//!   emission is byte-identical to the per-op emission, so equality is
-//!   structural.  The test still asserts it at runtime.
+//!   emission is token-identical to the per-op emission (the T4.2 input
+//!   staging applies identically to both arms).  The test still asserts
+//!   equality at runtime.
 //! * mobilenet_v2_1.0_224 is the ONLY model with composed groups (10
 //!   residual-add groups per the W0 profile) — its fused-vs-unfused
 //!   equality is the real gate on the composed param derivation.  Its
