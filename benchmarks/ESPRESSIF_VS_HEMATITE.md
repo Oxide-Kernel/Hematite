@@ -277,7 +277,7 @@ per-op table).
 
 | Zoo model | Hematite cycles (min/med) | Hematite ms @ 240 MHz | ESP-NN cycles (min/med) | Speedup | Notes |
 |---|---|---|---|---|---|
-| KWS `kws_micro_speech_int8` (1×1960→4) | 13,091,330 / 13,091,344 | 54 / 54 | — | — | C side `—`: no esp-nn runner yet (needs new harness code; feasible when toolchain returns — 18.8 KB model). **54 ms root-caused (todo 21):** the KWS depthwise has `depth_multiplier=8` (in_c=1, out_c=8) and the bespoke per-lane depthwise SIMD kernel requires `input_c==output_c` (dm==1) — structurally ineligible, runs scalar. Also fixed: zoo-model SIMD was silently disabled because codegen emitted `scratch: 0` (→ `SCRATCH_LEN=0` → every op got an empty scratch → scalar fallback); codegen now computes real per-op scratch (conv2d/depthwise/softmax/fc) and emits `#[repr(C, align(16))]` weight wrappers so the ACCX `w_ptr%16` gate engages. out_fnv `0x2131fda5` |
+| KWS `kws_micro_speech_int8` (1×1960→4) | 13,091,330 / 13,091,344 | 54 / 54 | — | — | C side `—`: no esp-nn runner yet (needs new harness code; feasible when toolchain returns — 18.8 KB model). **54 ms root-caused (todo 21):** the KWS depthwise has `depth_multiplier=8` (in_c=1, out_c=8) and the bespoke per-lane depthwise SIMD kernel requires `input_c==output_c` (dm==1) — structurally ineligible, runs scalar. Also fixed: zoo-model SIMD was silently disabled because codegen emitted `scratch: 0` (→ `SCRATCH_LEN=0` → every op got an empty scratch → scalar fallback); codegen now computes real per-op scratch (conv2d/depthwise/softmax/fc) and emits `#[repr(C, align(16))]` weight wrappers so the ACCX `w_ptr%16` gate engages. **Closed since (Phase 19, T3.5b):** the dm=8 10×8 filter now runs the chunked anytap SIMD kernel — on-device bit-exact PASS run 1 (`depthwise_kws_49x40x1_10x8_dm8` fnv 0x3ad38cac, `device-silicon-run1.log:77`); the pre-opt row above is the closure baseline. out_fnv `0x2131fda5` |
 | sine (1→1 smoke) | 536 / 536 | 0 / 0 | — | — | C side `—`: no runner yet (needs new harness code). out_fnv `0x040c5b8c` |
 | hello_world `hello_world_int8` (1→1) | 11,329 / 11,329 | 0 / 0 | — | — | C side `—`: no runner yet (needs new harness code). out_fnv `0xfaf3a2e1` |
 | anomaly_detect `anomaly_detect_int8` (640→640) | 19,669,640 / 19,669,640 | 81 / 81 | — | — | C side `—`: no runner yet; 277 KB model embed is above the ~200 KB app-write ceiling this USB adapter sustained (T16 finding) — verify flash path before trusting a C row. 10×FC model — FC SIMD now engages post-todo-21 (aligned weights + codegen scratch); run-4 re-measure pending board replug. out_fnv `0xe8f86342` |
@@ -317,8 +317,17 @@ stacks (stack budget / no PSRAM) — SKIP on both sides, never fabricated.
 
 **These rows set the optimization targets** (composed-kernels plan):
 T3.5 depthwise `dm>1` for kws; T3.6 small-shape FC for sine/hello/anomaly.
-The Hematite "now" column is the pre-optimization baseline; re-run
-measurements wherever the ESP-IDF toolchain is present, never guess numbers.
+**Closure status (Phase 19):** T3.5/T3.5b (dm>1 + arbitrary-filter anytap
+depthwise) and T3.6 (small-shape FC pad gates) **landed and are bit-exact on
+device** — real-silicon run 1 (2026-08-11 17:34) PASSes `depthwise_kws_
+49x40x1_10x8_dm8` (the real 10×8 dm=8 filter, fnv 0x3ad38cac) and all 7
+`fc_small` shapes on the fused path (`device-silicon-run1.log`). The
+post-optimization **cycle rows** (targets: sine < 190, hello < 4,675, kws <
+1,059,889, anomaly < 7,758,145 cyc) are PENDING — real-silicon run 1
+panicked at the mean check before the model-bench section
+(`device-sweep.md §9`). The Hematite "now" column is the pre-optimization
+baseline; re-run measurements wherever the run-1 panic is fixed, never guess
+numbers.
 
 ## Zoo-model + A/B/C head-to-head — ledger rows (composed-kernels T6.2)
 
@@ -331,12 +340,15 @@ speedup-loss identification with root-cause classes and next levers) lives in
 **Provenance:** A/B/C rows = real-device 2026-08-10 (Hematite measured-code
 HEAD `33d498a` per this doc's normalized-per-op note; C = espnn-baseline T0.3
 era). Zoo rows = user-verified real-device 2026-08-10 (Hematite pre-opt
-`model_bench`; C = `3d74726` T0.3 harness). All 4 zoo on-device fused-vs-
-unfused deltas are **BLOCKED-BY-HARDWARE** (board permanently flash-encrypted,
-`SPI_BOOT_CRYPT_CNT=0x7`, espflash no-encrypt — `model-cycles.md §1`); the W0
-fused profile shows **zero composed groups** in these models, so fused ==
-unfused emission (`fused-equivalence.md`, `fused-profile.md`). QEMU-emulated
-rows are labeled HOST-EMULATED — never device cycles.
+`model_bench`; C = `3d74726` T0.3 harness). **Real-silicon run 1 (2026-08-11
+17:34)** executed model validation + 35/40 SIMD checks on the fused path
+(owner-approved `esptool.py write_flash --encrypt` @ 921600); the 4 zoo
+on-device fused-vs-unfused cycle deltas and the A/B/C fused-path re-capture
+are **BLOCKED-BY-PANIC** (deterministic mean-check stack-vs-arena-end
+clobber, `device-sweep.md §9`), not BLOCKED-BY-HARDWARE. The W0 fused
+profile shows **zero composed groups** in the 4 runnable zoo models, so
+fused == unfused emission (`fused-equivalence.md`, `fused-profile.md`).
+QEMU-emulated rows are labeled HOST-EMULATED — never device cycles.
 
 ### A/B/C benchmark graphs (device, 2026-08-10)
 
@@ -358,7 +370,7 @@ Model C margin is **1.007×** (650,773 vs 655,303) — maintained ≥ 1.007×. T
 | hello_world | fused == unfused (W0) | 2026-08-10 | Hematite pre-opt; C `3d74726` | 10,314 | 0 | 4,675 / 4,675 | 0 | **C 2.2×** | 3×FC, SRAM; out_fnv `0xfaf3a2e1` |
 | kws | fused == unfused (W0) | 2026-08-10 | Hematite pre-opt; C `3d74726` | 12,983,503 | 54 | 1,059,889 / 1,060,258 | 4 | **C 12.3×** (largest) | dw(dm=8)+FC+softmax, SRAM; out_fnv `0x2131fda5` |
 | anomaly_detect | fused == unfused (W0) | 2026-08-10 | Hematite pre-opt; C `3d74726` | 28,550,253 | 118 | 7,758,145 / 7,758,250 | 32 | **C 3.7×** | 10×FC, SRAM; out_fnv `0xe8f86342` |
-| person_detect | — | 2026-08-10 | — | **SKIP reason=stack** | — | **SKIP** | — | — | arena 55,296 B vs ~65 KB stack; **PENDING device probe** |
+| person_detect | — | 2026-08-10 | — | **SKIP reason=stack** | — | **SKIP** | — | — | arena 55,296 B vs ~65 KB stack; **probe PENDING** (real-silicon run 1 panicked at the mean check before the probe — `device-sweep.md §9`) |
 | mobilenet_v2 | — | 2026-08-10 | — | **SKIP reason=no-psram** | — | **SKIP** | — | — | `PSRAM: 0 bytes`; bar 1294.5 ms hold-as-documented |
 
 ### HOST-EMULATED rows (QEMU esp32s3, `-icount 3`, commit `28482eb`, 2026-08-11T15:43:38+05:30) — NOT device cycles
@@ -379,14 +391,15 @@ Model C margin is **1.007×** (650,773 vs 655,303) — maintained ≥ 1.007×. T
 - **Zoo losses, by root-cause class:**
   - **(d) algorithmic** — kws dm=8 depthwise (the 12.3× gap). **Closed by
     T3.5b**: the real 10×8 filter now engages the chunked anytap SIMD
-    (on-device bit-exact PASS `t61-device.log:77`); the on-device cycle row is
-    the remaining measurement (target < 1,059,889 cyc / 4 ms).
+    (on-device bit-exact PASS `t61-device.log:77` / `device-silicon-run1.log:77`);
+    the on-device cycle row is the remaining measurement (target < 1,059,889 cyc / 4 ms).
   - **(b) dispatch/model-wrapper overhead** — sine, hello_world, anomaly_detect
     (small-FC model dispatch; 10 dense FCs for anomaly). Pre-T3.6 each also had
     one **(a) kernel-gated** small FC; T3.6 pad gates close those (1→1, 1→16,
     8→128). Prepared-path handles are the recorded lever for the wrapper class.
   - **(e) hardware-gated** — person_detect (stack) and mobilenet_v2 (PSRAM);
-    both SKIP on both stacks, PENDING-FLASH-DECISION / PSRAM board.
+    both SKIP on both stacks; on-device re-measurement BLOCKED-BY-PANIC
+    (run 1, `device-sweep.md §9`) / PSRAM board.
 - **Per-kernel:** Hematite's public-API rows trail the C raw-asm entries on
   every matched shape (6.8× conv1x1 down to 1.6× mul) — classified **(b)**
   wrapper overhead; the prepared path closes most of it (conv1x1 1.42×,

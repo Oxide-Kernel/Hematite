@@ -13,6 +13,8 @@ drops (plan T5.2, B5 resolution).
 | `speaker_verification` | **Deferred (plan-specified)** | P4/S31-only, no S3 build (plan T5.2, recorded here for completeness) |
 | `pp_ocr_v6` (det/rec_s8/rec_s16) | **Deferred (plan-specified)** | P4-only (plan T5.2, recorded here for completeness) |
 | `motion_detect`, `color_detect` | **Out of scope by definition** | Algorithmic (no `.espdl`/`.tflite` artifact) — noted not tested (plan T5.2) |
+| `anomaly_ae` (substitution) | **⚠️ compile+execute, documented ±1 class** | 210/640 elements differ by exactly ±1 — gemmlowp double-rounding vs hematite single-rounding (§6). Reproduced identically on real silicon (run 1, 2026-08-11: `FAIL at idx 1: got=41 want=42`, s3==ref, fnv 0xf2a76cd6) |
+| `mobilenet_v2` (substitution) | **⚠️ compile+execute, PAD-fill class** | 984/1000 elements differ (890 PAD-fill, 94 rounding) — `PadParams` carries no pad-value/zero-point. **Phase 19 T5.3 decision: DEFER the plumbing** (T10 follow-up, pad-decision.md) (§7) |
 
 ## 1. ESP-DL models — format barrier (`.espdl`, not `.tflite`)
 
@@ -182,3 +184,42 @@ attempted in todo 11 — kernel/param code is out of scope). Both backends
 share the identical raw-0 fill, so the relative s3 == ref gate holds exactly.
 (An earlier 861/1000 estimate from todo 25 is superseded by this direct
 measurement.)
+
+## 8. Phase 19 (composed-kernels T5.3) — PAD plumbing decision + real-silicon confirmation
+
+### 8.1 PAD zero-point plumbing — DECISION: DEFER (T5.3, pad-decision.md)
+
+The pad-value/zero-point plumbing (`PadParams` field + codegen emission +
+both backends) is **deferred** and recorded as an explicit follow-up
+(**T10**, kernel workstream) — it is NOT implemented in this plan. Rationale
+(recorded in full in `local-notes/evidence/composed-kernels/pad-decision.md`):
+
+1. **PAD never fuses** (no fusion pattern covers it) — the composed-kernels
+   workstream neither emits nor transforms any PAD call, so the fused path
+   is orthogonal to the fill semantics.
+2. **A substitute gate already covers mv2's claim:** the T5.1 host harness
+   asserts fused==unfused element-equal + identical FNV-1a for mv2 (both
+   arms share the same raw-0 fill), which verifies the composed-param
+   derivation — the only thing this plan changes.
+3. **Deferral preserves the s3==ref identical-fill gate** — plumbing a zero
+   point through one backend only would break it; the full change must land
+   atomically with golden regeneration (T10).
+
+**Consequences (honest):** mv2 stays ⚠️ compiled-not-bit-exact vs the
+executed-TFLM golden (984/1000 deltas; 890 PAD-fill class, |d|≥3, max 60;
+94 rounding class) until T10 lands. "Bit-exact vs TFLM" must not be claimed
+for PAD-heavy models; only the relative ref↔s3, fused↔unfused claims hold.
+
+### 8.2 Real-silicon confirmation (run 1, 2026-08-11 17:34)
+
+The two ⚠️ models' divergences were re-confirmed on real silicon through the
+fused `Model::<S3Backend>` path (log `local-notes/evidence/composed-kernels/
+device-silicon-run1.log`):
+
+| Model | device run-1 result | consistent with |
+|---|---|---|
+| `anomaly_detect_int8` | `FAIL at idx 1: got=41 want=42` (fnv 0xf2a76cd6), **s3==ref (`ref_match=true`, golden_match=false)** | §6 documented ±1 double-rounding class — identical on device, QEMU and host; not a new divergence |
+| `mobilenet_v2_1.0_224_int8` | `SKIP reason=no-psram` (board probe `PSRAM: 0 bytes` re-confirmed) | §7 — model cannot run without PSRAM; host-side fused==unfused substitute gate holds (T5.1) |
+
+Both rows are recorded, never masked, and the relative gates (s3==ref /
+fused==unfused) are asserted and green.
