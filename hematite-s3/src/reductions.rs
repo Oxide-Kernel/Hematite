@@ -200,6 +200,20 @@ pub fn mean(
 /// lane sums via the verified two-pass QACC read-back. The bit-exact
 /// round-half-away division + per-tensor requantize run in Rust from the
 /// raw sums (identical arithmetic to the scalar path).
+///
+/// ## T3.4 — looped accumulation beyond the landed limits
+///
+/// The landed dispatch limited `positions <= 256` (a QACC 16-bit lane bound)
+/// and `in_c <= 256` (the int32 accs scratch). The extension lifts both by
+/// looping: positions are chunked into `<= 256`-position `s8_mean_reduce`
+/// calls and channels into `<= 256`-wide passes; each call's per-lane i32
+/// sums are folded into an `in_c * 4`-byte accs buffer and the kernel is
+/// invoked ONCE per chunk with the SAME `s8_mean_reduce` asm. The final
+/// round-half-away division + requantize run once, from the accumulated
+/// sums. Per-channel i32 sums are order-independent (and `|sum| <=
+/// positions * 128` never approaches i32 overflow), so the accumulated total
+/// equals the scalar single-pass sum bit-exactly — the MobileNetV2 global
+/// mean (7×7×1280 → 1×1×1280: positions 49, in_c 1280) now dispatches SIMD.
 #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
 mod reduction_simd {
     use core::arch::{asm, global_asm};
@@ -235,16 +249,118 @@ mod reduction_simd {
     }
 }
 
+// ── T3.4 — looped-accumulation pass plan (host-testable) ─────────────────────
+//
+// The landed limits (positions <= 256, in_c <= 256) are lifted by looping:
+// positions and channels are processed in bounded passes whose per-lane i32
+// sums fold into an `in_c * 4`-byte accs buffer, with ONE final
+// round-half-away division + requantize. Per-channel sums are
+// order-independent i32 additions (|sum| <= positions * 128), so the
+// accumulated total equals the scalar single-pass sum bit-exactly. The same
+// plan drives the device dispatch (asm per pass) and the host model (scalar
+// per pass) so the host matrix proves the device chunking.
+
+/// Maximum spatial positions per `s8_mean_reduce` call — the QACC lanes hold
+/// at most `127 * positions`, a signed-16-bit bound (see the asm doc).
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+pub(crate) const MEAN_MAX_POS_PER_CALL: usize = 256;
+
+/// Maximum channels the accs buffer holds — the stack local is
+/// `(MEAN_MAX_ACC_C + 16) * 4` bytes (8 KB; `in_c * 4` = 5 KB for the mv2
+/// 1280 with headroom). Shapes with more channels fall back to scalar.
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+pub(crate) const MEAN_MAX_ACC_C: usize = 2048;
+
+/// Maximum real channels per kernel call. `in_c <= 256` runs as a single
+/// channel pass; larger `in_c` splits into staged channel passes.
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+pub(crate) const MEAN_MAX_C_PASS: usize = 256;
+
+/// Zero-padded channel-staging buffer length (bytes) — every staged pass
+/// satisfies `pos_chunk * pad16(pass_c) <= MEAN_STAGE_LEN`.
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+pub(crate) const MEAN_STAGE_LEN: usize = 4096;
+
+/// One `s8_mean_reduce` pass: sum `[pos_chunk, pass_c]` channels starting at
+/// input row `pos_off`, channel `c_off`.
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MeanPass {
+    /// First spatial position.
+    pub pos_off: usize,
+    /// Positions in this pass (`<= MEAN_MAX_POS_PER_CALL`).
+    pub pos_chunk: usize,
+    /// First channel.
+    pub c_off: usize,
+    /// Real channels in this pass.
+    pub pass_c: usize,
+    /// `true` when the kernel must read a zero-padded contiguous stage
+    /// instead of the NHWC input directly (padding needed, or a channel pass
+    /// whose width differs from the row stride `in_c`).
+    pub staged: bool,
+}
+
+/// Enumerate the looped-accumulation passes for a spatial-full
+/// `[positions, in_c]` MEAN. Positions are chunked to
+/// [`MEAN_MAX_POS_PER_CALL`]; `in_c <= MEAN_MAX_C_PASS` runs as one channel
+/// pass (direct when `in_c % 16 == 0`, staged when padding is needed),
+/// larger `in_c` splits into staged channel passes whose width keeps
+/// `pos_chunk * pad16(pass_c) <= MEAN_STAGE_LEN`. Per-channel i32 sums are
+/// order-independent, so any pass order reproduces the scalar sum.
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+pub(crate) fn for_each_mean_pass<F>(positions: usize, in_c: usize, mut f: F)
+where
+    F: FnMut(MeanPass),
+{
+    fn pad16(n: usize) -> usize {
+        (n + 15) & !15
+    }
+    let mut pos_off = 0;
+    while pos_off < positions {
+        if in_c <= MEAN_MAX_C_PASS {
+            // One channel pass per position chunk.
+            let staged = in_c % 16 != 0;
+            let pos_chunk = if staged {
+                (MEAN_STAGE_LEN / pad16(in_c))
+                    .min(MEAN_MAX_POS_PER_CALL)
+                    .min(positions - pos_off)
+            } else {
+                (positions - pos_off).min(MEAN_MAX_POS_PER_CALL)
+            };
+            f(MeanPass { pos_off, pos_chunk, c_off: 0, pass_c: in_c, staged });
+            pos_off += pos_chunk;
+        } else {
+            // Channel passes — the pass width differs from the row stride
+            // `in_c`, so every pass stages a contiguous `[pos_chunk, padded]`
+            // block.
+            let pos_chunk = (positions - pos_off).min(MEAN_MAX_POS_PER_CALL);
+            let pass_cap = ((MEAN_STAGE_LEN / pos_chunk) / 16) * 16;
+            let mut c_off = 0;
+            while c_off < in_c {
+                let pass_c = (in_c - c_off).min(pass_cap);
+                f(MeanPass { pos_off, pos_chunk, c_off, pass_c, staged: true });
+                c_off += pass_c;
+            }
+            pos_off += pos_chunk;
+        }
+    }
+}
+
 /// Mean SIMD eligibility + dispatch — device-only.
 ///
 /// Handles the MEAN-over-spatial-axes case bit-exactly:
 /// * reduction axes are exactly {H, W} (fully reduced: `out_h == out_w == 1`),
 ///   channels preserved;
-/// * `positions = in_h * in_w <= 256` — the QACC lanes hold `127*positions`
-///   max, a signed-16-bit bound (see the kernel doc);
-/// * `in_c <= 256` — the int32 accs scratch fits a bounded stack local;
-/// * `in_c % 16 == 0` OR `positions * padded_c <= 4096` so the zero-padded
-///   channel staging fits a bounded stack local.
+/// * `positions` unbounded — chunked to [`MEAN_MAX_POS_PER_CALL`] passes (the
+///   QACC lanes hold `127 * positions` max, a signed-16-bit bound);
+/// * `in_c <= MEAN_MAX_ACC_C` — the int32 accs buffer is an `in_c * 4`-byte
+///   stack local; `in_c <= MEAN_MAX_C_PASS` runs as a single channel pass
+///   (zero-padded when `in_c % 16 != 0`), larger `in_c` splits into staged
+///   channel passes.
+///
+/// The looped accumulation folds each pass's lane sums into the accs buffer
+/// and requantizes ONCE at the end — bit-exact vs the scalar mean (per-channel
+/// i32 sums are order-independent; `|sum| <= positions * 128` never overflows).
 ///
 /// Returns `Ok(true)` when the SIMD path handled the mean, `Ok(false)` when
 /// the shape is ineligible (caller falls through to scalar).
@@ -273,53 +389,71 @@ fn mean_accx_dispatch(
         return Ok(false);
     }
     let positions = in_h * in_w;
-    if positions < 1 || positions > 256 || in_c < 1 || in_c > 256 {
+    if positions < 1 || in_c < 1 || in_c > MEAN_MAX_ACC_C {
         return Ok(false);
     }
 
-    let padded_c = ((in_c + 15) / 16) * 16;
-    let needs_channel_pad = padded_c != in_c;
-    if needs_channel_pad && positions * padded_c > 4096 {
-        return Ok(false);
-    }
-    // EE.VLD.128 / EE.VST.128 require 16-byte alignment (depthwise enforces
-    // it with `(off + 15) & !15`); misaligned VST silently zeroed accs on
-    // device (task-21 finding — const-test with a 16-aligned static passed).
-    #[repr(align(16))]
-    struct AlignedStage([i8; 4096]);
-    #[repr(align(16))]
-    struct AlignedAccs([i32; 256]);
-    let mut accs = AlignedAccs([0i32; 256]);
-    let count = (in_h * in_w) as i32;
+    let count = positions as i32;
     let mult = params.output_multiplier;
     let shift = params.output_shift;
     let out_off = params.output_offset;
     let act_min = params.quantized_activation_min;
     let act_max = params.quantized_activation_max;
 
-    // The padded channel stage must outlive the kernel call — a `padded`
-    // local scoped to the branch below would be dropped (stack slot reused)
-    // before `mean_reduce` reads it, producing a dangling input pointer
-    // (task-18 device finding: all-zero lane sums).
-    let mut padded_stage = AlignedStage([0i8; 4096]);
-    let k_input: *const i8;
-    unsafe {
-        if needs_channel_pad {
-            let src = input.as_ptr();
-            let dst = padded_stage.0.as_mut_ptr();
-            for pos in 0..positions {
-                core::ptr::copy_nonoverlapping(
-                    src.add(pos * in_c),
-                    dst.add(pos * padded_c),
+    // Accs buffer: `in_c * 4` bytes (5 KB for the mv2 1280) + 16 guard lanes
+    // for a padded tail pass's whole-16-lane-group store. EE.VLD.128 /
+    // EE.VST.128 require 16-byte alignment (a misaligned VST silently zeroed
+    // accs on device — task-21 finding).
+    #[repr(align(16))]
+    struct AlignedAccs([i32; MEAN_MAX_ACC_C + 16]);
+    // Per-pass kernel destination — the kernel OVERWRITES its acc_out, so the
+    // running sums live in `accs` and each pass's sums land here first, then
+    // fold into `accs`.
+    #[repr(align(16))]
+    struct AlignedKernelOut([i32; MEAN_MAX_C_PASS + 16]);
+    // Zero-padded channel stage — one stack local reused across all passes (a
+    // branch-scoped local is dropped/reused before the asm reads it,
+    // producing all-zero lane sums — task-18 device finding).
+    #[repr(align(16))]
+    struct AlignedStage([i8; MEAN_STAGE_LEN]);
+    let mut accs = AlignedAccs([0i32; MEAN_MAX_ACC_C + 16]);
+    let mut kernel_out = AlignedKernelOut([0i32; MEAN_MAX_C_PASS + 16]);
+    let mut stage = AlignedStage([0i8; MEAN_STAGE_LEN]);
+
+    for_each_mean_pass(positions, in_c, |pass| {
+        unsafe {
+            if pass.staged {
+                let padded = ((pass.pass_c + 15) / 16) * 16;
+                stage.0.fill(0);
+                for p in 0..pass.pos_chunk {
+                    core::ptr::copy_nonoverlapping(
+                        input
+                            .as_ptr()
+                            .add((pass.pos_off + p) * in_c + pass.c_off),
+                        stage.0.as_mut_ptr().add(p * padded),
+                        pass.pass_c,
+                    );
+                }
+                reduction_simd::mean_reduce(
+                    stage.0.as_ptr(),
+                    kernel_out.0.as_mut_ptr(),
+                    pass.pos_chunk,
+                    padded,
+                );
+            } else {
+                reduction_simd::mean_reduce(
+                    input.as_ptr().add(pass.pos_off * in_c),
+                    kernel_out.0.as_mut_ptr(),
+                    pass.pos_chunk,
                     in_c,
                 );
             }
-            k_input = padded_stage.0.as_ptr();
-        } else {
-            k_input = input.as_ptr();
         }
-        reduction_simd::mean_reduce(k_input, accs.0.as_mut_ptr(), positions, padded_c);
-    }
+        // Fold this pass's lane sums into the running accs.
+        for oc in 0..pass.pass_c {
+            accs.0[pass.c_off + oc] += kernel_out.0[oc];
+        }
+    });
 
     for oc in 0..in_c {
         let acc = accs.0[oc];
@@ -347,5 +481,156 @@ pub fn mean_took_simd() -> bool {
     #[cfg(not(all(target_arch = "xtensa", not(feature = "qemu"))))]
     {
         false
+    }
+}
+
+// ── T3.4 host model + bit-exact matrix (test-only) ───────────────────────────
+//
+// The device dispatch's looped accumulation is proven bit-exact on the host:
+// the model below walks the SAME `for_each_mean_pass` plan the device uses
+// (scalar per-pass sums in place of `s8_mean_reduce`), then runs the single
+// round-half-away division + requantize. Comparing it against the independent
+// `hematite-ref` scalar mean across the acceptance matrix proves the chunking
+// never changes the per-channel sum — i32 addition is order-independent.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    extern crate std;
+    use std::vec;
+    use std::vec::Vec;
+
+    /// Host model of the looped-accumulation SIMD mean — mirrors the device
+    /// dispatch: the shared [`for_each_mean_pass`] plan, a scalar per-pass
+    /// sum, and one final round-half-away division + requantize.
+    fn mean_looped_model(input: &[i8], params: &ReduceParams, output: &mut [i8]) {
+        let in_h = params.input_shape[1] as usize;
+        let in_w = params.input_shape[2] as usize;
+        let in_c = params.input_shape[3] as usize;
+        let positions = in_h * in_w;
+        let count = positions as i32;
+        let mut accs = vec![0i32; in_c];
+        for_each_mean_pass(positions, in_c, |pass| {
+            let base = pass.pos_off * in_c + pass.c_off;
+            for p in 0..pass.pos_chunk {
+                let row = &input[base + p * in_c..base + p * in_c + pass.pass_c];
+                for (oc, &v) in row.iter().enumerate() {
+                    accs[pass.c_off + oc] += i32::from(v);
+                }
+            }
+        });
+        let mult = params.output_multiplier;
+        let shift = params.output_shift;
+        let out_off = params.output_offset;
+        let act_min = params.quantized_activation_min;
+        let act_max = params.quantized_activation_max;
+        for oc in 0..in_c {
+            let averaged = if count == 0 {
+                0
+            } else {
+                round_half_away_zero(accs[oc], count)
+            };
+            let scaled = multiply_by_quantized_multiplier(averaged, mult, shift);
+            let val = (scaled + out_off).max(act_min).min(act_max);
+            output[oc] = saturating_cast(val);
+        }
+    }
+
+    /// `ReduceParams` for a spatial-full mean over `[1, positions, 1, in_c]`.
+    fn mean_params(positions: usize, in_c: usize, mult: i32, shift: i32) -> ReduceParams {
+        ReduceParams {
+            keep_dims: false,
+            axis: [1, 2, 0, 0],
+            axis_count: 2,
+            input_shape: [1, positions as i32, 1, in_c as i32],
+            output_shape: [1, 1, 1, in_c as i32],
+            output_type: 0,
+            input_offset: 0,
+            output_offset: 0,
+            output_multiplier: mult,
+            output_shift: shift,
+            quantized_activation_min: -128,
+            quantized_activation_max: 127,
+        }
+    }
+
+    fn pattern(n: usize, seed: u32) -> Vec<i8> {
+        let mut out = vec![0i8; n];
+        let mut x = seed;
+        for v in out.iter_mut() {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *v = (x >> 16) as i8;
+        }
+        out
+    }
+
+    fn assert_model_matches_ref(positions: usize, in_c: usize, mult: i32, shift: i32, tag: &str) {
+        let input = pattern(positions * in_c, 0x1D4A_7EE5 ^ (positions as u32) ^ (in_c as u32));
+        let params = mean_params(positions, in_c, mult, shift);
+        let mut want = vec![0i8; in_c];
+        let mut got = vec![0i8; in_c];
+        hematite_ref::reductions::mean(&input, &params, &mut want)
+            .unwrap_or_else(|e| panic!("{tag}: ref mean rejected: {e:?}"));
+        mean_looped_model(&input, &params, &mut got);
+        assert_eq!(
+            got, want,
+            "{tag}: looped-accumulation model != hematite-ref scalar mean"
+        );
+    }
+
+    /// T3.4 acceptance matrix: positions {256, 1024, 62720} × in_c {16, 256,
+    /// 1280} + the mv2 global-mean shape (49 × 1280), across three quant
+    /// variants. Exercises the direct single-pass, position-chunked and
+    /// channel-passed plans through the SHARED `for_each_mean_pass`.
+    #[test]
+    fn mean_extended_simd_model_matches_ref_bit_exact() {
+        let quant_cases: &[(i32, i32)] = &[(1 << 30, 1), (1_717_986_918, -3), (1 << 30, 0)];
+        for &positions in &[256usize, 1024] {
+            for &in_c in &[16usize, 256, 1280] {
+                for (qi, &(m, s)) in quant_cases.iter().enumerate() {
+                    assert_model_matches_ref(
+                        positions,
+                        in_c,
+                        m,
+                        s,
+                        &std::format!("positions={positions} in_c={in_c} quant={qi}"),
+                    );
+                }
+            }
+        }
+        // 62720 × 1280 is an 80 MB tensor — one quant variant bounds the
+        // host-test time (the accumulation semantics are quant-independent).
+        for &positions in &[62720usize] {
+            for &in_c in &[16usize, 256, 1280] {
+                assert_model_matches_ref(positions, in_c, 1 << 30, 1, "62720-positions identity");
+            }
+        }
+        // The mv2 global-mean shape (7×7×1280 → 1×1×1280).
+        for (qi, &(m, s)) in quant_cases.iter().enumerate() {
+            let input = pattern(49 * 1280, 0xBEAD_1EAF);
+            let params = ReduceParams {
+                keep_dims: false,
+                axis: [1, 2, 0, 0],
+                axis_count: 2,
+                input_shape: [1, 7, 7, 1280],
+                output_shape: [1, 1, 1, 1280],
+                output_type: 0,
+                input_offset: 0,
+                output_offset: 0,
+                output_multiplier: m,
+                output_shift: s,
+                quantized_activation_min: -128,
+                quantized_activation_max: 127,
+            };
+            let mut want = vec![0i8; 1280];
+            let mut got = vec![0i8; 1280];
+            hematite_ref::reductions::mean(&input, &params, &mut want)
+                .expect("mv2 global mean: ref shape");
+            mean_looped_model(&input, &params, &mut got);
+            assert_eq!(
+                got, want,
+                "mv2 49x1280 looped-accumulation model != ref at quant={qi}"
+            );
+        }
     }
 }

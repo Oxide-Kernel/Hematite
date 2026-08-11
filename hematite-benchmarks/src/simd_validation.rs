@@ -1096,6 +1096,56 @@ fn check_mean_simd_matches_ref() {
     report(&compare("mean_hw_2x2x4", &got.0, &want.0));
 }
 
+// ── Mean (T3.4): mv2 global 7x7x1280 (in_c > 256) ───────────────────────────
+//
+// The shape that actually bites the landed gate: positions 49 (single
+// position pass) but in_c 1280 > 256 — the looped-accumulation dispatch
+// folds staged channel passes into the in_c*4-byte accs buffer and
+// requantizes once. The full mv2 model stays PSRAM-gated (board reports
+// PSRAM: 0 bytes); this is the kernel row standalone (T5.2 consumes).
+
+const MEAN_MV2_IN: usize = 7 * 7 * 1280;
+const MEAN_MV2_OUT: usize = 1280;
+
+fn check_mean_mv2_global_simd_matches_ref() {
+    // 64 KB of buffers carved from the SRAM bench arena — NOT stack locals
+    // (see `arena_carve` for the task-18 OOB device finding). The 62 KB
+    // input is filled at runtime (`fill_pattern_slice`) — a `make_pattern`
+    // const would materialize a 62 KB stack temporary.
+    let mut off = 0;
+    let input = arena_carve_i8(&mut off, MEAN_MV2_IN);
+    let want = arena_carve_i8(&mut off, MEAN_MV2_OUT);
+    let got = arena_carve_i8(&mut off, MEAN_MV2_OUT);
+    fill_pattern_slice(0xBEAD_1EAF, input);
+    want.fill(0);
+    got.fill(0);
+    let params = ReduceParams {
+        keep_dims: false,
+        axis: [1, 2, 0, 0],
+        axis_count: 2,
+        input_shape: [1, 7, 7, 1280],
+        output_shape: [1, 1, 1, 1280],
+        output_type: 0,
+        input_offset: 0,
+        output_offset: -128,
+        output_multiplier: 1 << 30,
+        output_shift: 1,
+        quantized_activation_min: -128,
+        quantized_activation_max: 127,
+    };
+
+    hematite_ref::reductions::mean(input, &params, want).expect("harness: ref mv2 global mean");
+    hematite_s3::reductions::mean(input, &params, got).expect("harness: s3 mv2 global mean");
+
+    let simd = if hematite_s3::reductions::mean_took_simd() {
+        "SIMD"
+    } else {
+        "scalar"
+    };
+    crate::firmware::uart0_log!("simd mean 7x7x1280 path: {}", simd);
+    report(&compare("mean_mv2_7x7x1280", got, want));
+}
+
 // ── FC small / non-16 input dims (T3.6 pad-in-scratch widening) ─────────────
 //
 // The zoo FC-bound shapes: sine 1→1, hello_world 1→16 / 16→1,
@@ -1450,6 +1500,7 @@ pub fn validate_all() {
     check_fc_simd_matches_ref();
     check_fc_small_simd_matches_ref();
     check_mean_simd_matches_ref();
+    check_mean_mv2_global_simd_matches_ref();
     check_fused_conv2d_simd_matches_ref();
     check_fused_chain_simd_matches_ref();
     check_fused_pool_fold_simd_matches_ref();

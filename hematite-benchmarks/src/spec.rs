@@ -30,7 +30,8 @@ use hematite_core::op_params::{
     ActivationEpilogueParams, ActivationParams, ComposedActivation, Conv2DParams,
     DepthwiseConv2DParams, ElementwiseChainParams, ElementwiseChainStep, ElementwiseKind,
     ElementwiseParams, FoldedPoolParams, FusedConvParams, FullyConnectedParams,
-    FusedActivation, Padding, PoolInputFold, PoolKind, PoolParams, ResidualAddParams, SoftmaxParams,
+    FusedActivation, Padding, PoolInputFold, PoolKind, PoolParams, ReduceParams,
+    ResidualAddParams, SoftmaxParams,
 };
 use hematite_core::KernelError;
 
@@ -112,6 +113,10 @@ pub enum OpKind {
     /// anchor pool's own shape; the fold operand is a const tensor embedded
     /// in the params.
     FusedPoolFold,
+    /// Reduce-MEAN over the spatial axes (H,W) keeping channels (T3.4) — the
+    /// MobileNetV2 global-average-pool shape; the s3 `reductions::mean`
+    /// dispatches the looped-accumulation SIMD path on device.
+    Mean,
 }
 
 /// A documented competitor / acceptance baseline for a row.
@@ -143,6 +148,7 @@ pub enum KernelParams {
     FusedConv(&'static FusedConvParams<'static>),
     FusedChain(&'static ElementwiseChainParams<'static>),
     FusedPool(&'static FoldedPoolParams<'static>),
+    Reduce(&'static ReduceParams),
 }
 
 /// A single per-kernel benchmark row.
@@ -330,6 +336,77 @@ const AVGPOOL_7X7_1280_PARAMS: PoolParams = PoolParams {
     stride_height: 7,
     padding: Padding::Valid,
     activation: FusedActivation::None,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+// ── T3.4 mean rows — spatial-full MEAN (H,W reduced, channels kept) ──────────
+
+/// The mv2 global-average-pool MEAN: 7×7×1280 → 1×1×1280. positions 49
+/// (single position pass) but in_c 1280 — the limit the landed gate could
+/// not serve — now dispatchable via looped accumulation.
+const MV2_GLOBAL_MEAN_7X7_1280_PARAMS: ReduceParams = ReduceParams {
+    keep_dims: false,
+    axis: [1, 2, 0, 0],
+    axis_count: 2,
+    input_shape: [1, 7, 7, 1280],
+    output_shape: [1, 1, 1, 1280],
+    output_type: 0,
+    input_offset: 0,
+    output_offset: 0,
+    output_multiplier: 1 << 30,
+    output_shift: 1,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 16×16×16 → 1×1×16: positions 256, in_c 16 — a single direct
+/// position/channel pass (the landed in-limit path, unchanged).
+const MEAN_16X16_16_PARAMS: ReduceParams = ReduceParams {
+    keep_dims: false,
+    axis: [1, 2, 0, 0],
+    axis_count: 2,
+    input_shape: [1, 16, 16, 16],
+    output_shape: [1, 1, 1, 16],
+    output_type: 0,
+    input_offset: 0,
+    output_offset: 0,
+    output_multiplier: 1 << 30,
+    output_shift: 1,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 32×32×64 → 1×1×64: positions 1024 > 256 — chunked into 4 position passes;
+/// in_c 64 (single channel pass, direct).
+const MEAN_32X32_64_PARAMS: ReduceParams = ReduceParams {
+    keep_dims: false,
+    axis: [1, 2, 0, 0],
+    axis_count: 2,
+    input_shape: [1, 32, 32, 64],
+    output_shape: [1, 1, 1, 64],
+    output_type: 0,
+    input_offset: 0,
+    output_offset: 0,
+    output_multiplier: 1 << 30,
+    output_shift: 1,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 1×1×1280 → 1×1×1280: positions 1, in_c 1280 > 256 — the single-position
+/// in_c>256 case (channel-passed, staged).
+const MEAN_1X1_1280_PARAMS: ReduceParams = ReduceParams {
+    keep_dims: false,
+    axis: [1, 2, 0, 0],
+    axis_count: 2,
+    input_shape: [1, 1, 1, 1280],
+    output_shape: [1, 1, 1, 1280],
+    output_type: 0,
+    input_offset: 0,
+    output_offset: 0,
+    output_multiplier: 1 << 30,
+    output_shift: 1,
     quantized_activation_min: -128,
     quantized_activation_max: 127,
 };
@@ -2155,6 +2232,38 @@ pub const fn kernel_specs() -> &'static [KernelSpec] {
             reference: None,
             note: "Global average pool, filter 7×7 stride 7.",
         },
+        KernelSpec {
+            name: "mean_s8 7x7x1280 (mv2 global, T3.4 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Mean,
+            params: KernelParams::Reduce(&MV2_GLOBAL_MEAN_7X7_1280_PARAMS),
+            reference: None,
+            note: "MobileNetV2 global-average-pool MEAN: positions 49 (single position pass), in_c 1280 — the landed gate's in_c>256 limit that bit. The T3.4 looped accumulation folds staged channel passes into an in_c*4-byte accs buffer and requantizes once; SIMD-engages on device. FIRST mean per-kernel cycle baseline (plan T0.1 Item 3).",
+        },
+        KernelSpec {
+            name: "mean_s8 16x16x16 (T3.4 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Mean,
+            params: KernelParams::Reduce(&MEAN_16X16_16_PARAMS),
+            reference: None,
+            note: "positions 256, in_c 16 — single direct position/channel pass, identical to the landed 7b5ddc8 in-limit behavior (regression control); SIMD-engages on device.",
+        },
+        KernelSpec {
+            name: "mean_s8 32x32x64 (T3.4 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Mean,
+            params: KernelParams::Reduce(&MEAN_32X32_64_PARAMS),
+            reference: None,
+            note: "positions 1024 > 256 — chunked into 4 position passes folded into the accs buffer; in_c 64 (single direct channel pass); SIMD-engages on device.",
+        },
+        KernelSpec {
+            name: "mean_s8 1x1x1280 (T3.4 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Mean,
+            params: KernelParams::Reduce(&MEAN_1X1_1280_PARAMS),
+            reference: None,
+            note: "positions 1, in_c 1280 > 256 — the single-position in_c>256 case: staged channel passes accumulate into the 5 KB accs buffer; SIMD-engages on device.",
+        },
     ]
 }
 
@@ -2274,6 +2383,16 @@ pub fn layout(spec: &KernelSpec) -> SpecLayout {
             weights_len: 0,
             bias_len: 0,
             output_len: shape_product(&p.pool.output_shape),
+            transform_len: 0,
+        },
+        // The mean consumes the reduction input and produces the reduced
+        // output (no weights or bias — mean keeps channels, so output_len is
+        // the channel count).
+        KernelParams::Reduce(p) => SpecLayout {
+            input_len: shape_product(&p.input_shape),
+            weights_len: 0,
+            bias_len: 0,
+            output_len: shape_product(&p.output_shape),
             transform_len: 0,
         },
     }
@@ -2527,6 +2646,10 @@ pub fn run_kernel(spec: &KernelSpec, bufs: &mut SpecBufs<'_>, scratch: &mut [u8]
                 &mut backend, bufs.input, p, bufs.output, scratch,
             )
         }
+        OpKind::Mean => {
+            let p = params_reduce(spec);
+            hematite_s3::reductions::mean(bufs.input, p, bufs.output)
+        }
     }
 }
 
@@ -2744,6 +2867,13 @@ fn run_kernel_scalar(
                 &mut backend, bufs.input, p, bufs.output, scratch,
             )
         }
+        OpKind::Mean => {
+            let p = match spec.params {
+                KernelParams::Reduce(p) => p,
+                _ => return Err(KernelError::Unsupported),
+            };
+            hematite_s3::reductions::mean(bufs.input, p, bufs.output)
+        }
     }
 }
 
@@ -2841,6 +2971,13 @@ pub fn prepare_kernel(spec: &KernelSpec) -> Result<PreparedKernel, KernelError> 
             KernelParams::FusedPool(_) => Ok(PreparedKernel::Scalar),
             _ => Err(KernelError::Unsupported),
         },
+        // The mean has no prepared handle either: `reductions::mean` internally
+        // dispatches the looped-accumulation SIMD path (via the accx-style
+        // dispatch), so the Scalar slot runs the public function.
+        OpKind::Mean => match spec.params {
+            KernelParams::Reduce(_) => Ok(PreparedKernel::Scalar),
+            _ => Err(KernelError::Unsupported),
+        },
         OpKind::Softmax => Ok(PreparedKernel::Scalar),
     }
 }
@@ -2915,6 +3052,14 @@ fn params_fused_pool(spec: &KernelSpec) -> &'static FoldedPoolParams<'static> {
     match spec.params {
         KernelParams::FusedPool(p) => p,
         _ => panic!("spec.op fused_pool_with_fold requires KernelParams::FusedPool"),
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
+fn params_reduce(spec: &KernelSpec) -> &'static ReduceParams {
+    match spec.params {
+        KernelParams::Reduce(p) => p,
+        _ => panic!("spec.op mean requires KernelParams::Reduce"),
     }
 }
 
@@ -2999,6 +3144,10 @@ pub fn run_ref_kernel(
             hematite_core::FusedKernelBackend::fused_pool_with_fold(
                 &mut backend, bufs.input, p, bufs.output, scratch,
             )
+        }
+        OpKind::Mean => {
+            let p = params_reduce(spec);
+            hematite_ref::reductions::mean(bufs.input, p, bufs.output)
         }
     }
 }
@@ -3132,6 +3281,13 @@ mod tests {
                     &mut backend, bufs.input, p, bufs.output, scratch,
                 )
             }
+            OpKind::Mean => {
+                let p = match spec.params {
+                    KernelParams::Reduce(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                hematite_s3::reductions::mean(bufs.input, p, bufs.output)
+            }
         };
         let out_after = bufs.output.to_vec();
         bufs.output.copy_from_slice(&out);
@@ -3259,6 +3415,13 @@ mod tests {
                 hematite_core::FusedKernelBackend::fused_pool_with_fold(
                     &mut backend, bufs.input, p, bufs.output, scratch,
                 )
+            }
+            OpKind::Mean => {
+                let p = match spec.params {
+                    KernelParams::Reduce(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                hematite_ref::reductions::mean(bufs.input, p, bufs.output)
             }
         };
         let out_after = bufs.output.to_vec();

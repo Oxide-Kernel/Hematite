@@ -3707,6 +3707,7 @@ mod tests {
         let mut n_sm = 0;
         let mut n_pool = 0;
         let mut n_fused = 0;
+        let mut n_mean = 0;
         let mut n_scratch_free = 0;
 
         // (a) spec corpus — every scratch-relevant row.
@@ -3744,6 +3745,15 @@ mod tests {
                     // (register-held running value) and the decomposition.
                     n_scratch_free += 1;
                 }
+                KernelParams::Reduce(_) => {
+                    // Mean: scratch-free on both sides — codegen emits 0
+                    // (emit_mean → `scratch: 0`) and the s3 mean kernel takes no
+                    // scratch parameter (the T3.4 looped-accumulation SIMD path
+                    // uses bounded stack locals, not caller scratch). No mirror.
+                    checked += 1;
+                    n_mean += 1;
+                    n_scratch_free += 1;
+                }
                 KernelParams::FusedConv(p) => {
                     check_fused_conv(p, &mut checked);
                     n_fused += 1;
@@ -3754,8 +3764,8 @@ mod tests {
                 }
             }
         }
-        assert!(n_conv >= 8 && n_dw >= 13 && n_fc >= 7 && n_sm >= 1 && n_pool >= 3 && n_fused >= 2,
-            "corpus shrank unexpectedly: conv={n_conv} dw={n_dw} fc={n_fc} softmax={n_sm} pool={n_pool} fused={n_fused} scratch-free={n_scratch_free}");
+        assert!(n_conv >= 8 && n_dw >= 13 && n_fc >= 7 && n_sm >= 1 && n_pool >= 3 && n_fused >= 2 && n_mean >= 4,
+            "corpus shrank unexpectedly: conv={n_conv} dw={n_dw} fc={n_fc} softmax={n_sm} pool={n_pool} fused={n_fused} mean={n_mean} scratch-free={n_scratch_free}");
 
         // (b) widened grids (spec-corpus families + corner cases).
         // conv1x1: out_c × spatial × in_c × offset. The 1×1 formula reads
