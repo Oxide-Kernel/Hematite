@@ -24,6 +24,9 @@ pub(crate) mod generate;
 // T4.2a fusion now compiles (see optimize/fusion.rs) — optimize module
 // restored into the shared build per the gating comment below.
 pub(crate) mod optimize;
+// T4.1 — host-side mirror of every s3 SIMD-eligibility gate (the selector
+// and the W0 fused-profile consume it; parity-tested in-crate).
+pub(crate) mod eligibility;
 
 /// Parses the `#[model("path.tflite")]` attribute, reads and validates the
 /// TFLite model at compile time, then emits the typed inference code for
