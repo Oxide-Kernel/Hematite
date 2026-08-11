@@ -65,7 +65,7 @@ use hematite_memory::{ArenaPlan, OFFSET_NONE};
 /// T4.2 input-staging decision applies here too (single-op first-layer
 /// group), so fused and unfused arms stage identically.
 pub(crate) fn emit_model(model: &ParsedModel) -> Result<TokenStream, String> {
-    emit_model_with(model, None, true)
+    emit_model_with(model, None, true, false)
 }
 
 /// Emit the full model wrapper for `subgraph[0]`, honoring a fused schedule
@@ -79,34 +79,66 @@ pub(crate) fn emit_model(model: &ParsedModel) -> Result<TokenStream, String> {
 /// mirror-ineligible composed candidate — emits exactly as the unfused
 /// [`emit_model`], so a model with zero composed groups emits byte-identical
 /// code through both entry points.
+#[cfg(test)]
 pub(crate) fn emit_model_fused(
     model: &ParsedModel,
     schedule: &FusedSchedule,
     stage_input: bool,
 ) -> Result<TokenStream, String> {
-    emit_model_with(model, Some(schedule), stage_input)
+    emit_model_fused_with_policy(model, schedule, stage_input, false)
+}
+
+/// T5.1 test arm — the T4.2 fused emission with the T2
+/// `requires_verification` gate optionally forced open: `force_t2: true`
+/// lets T2 groups emit composed whenever the selector's structural + mirror
+/// gates pass (the W5 flip surface), the arm the fused==unfused harness
+/// proves.  The production entry points (`emit_model_fused`,
+/// `emit_model_stack_fused`, `emit_model`) always pass `false` — this policy
+/// is unreachable from normal `#[model]` usage.
+pub(crate) fn emit_model_fused_with_policy(
+    model: &ParsedModel,
+    schedule: &FusedSchedule,
+    stage_input: bool,
+    force_t2: bool,
+) -> Result<TokenStream, String> {
+    emit_model_with(model, Some(schedule), stage_input, force_t2)
 }
 
 /// T1.3 test arm — fused emission with the liveness arena DISABLED
 /// (per-tensor stack arrays, exactly the pre-T1.3 layout): the `stack` arm
 /// of the arena-vs-stack bit-exactness gate (`#[model_stack]`).
+#[cfg(test)]
 pub(crate) fn emit_model_stack_fused(
     model: &ParsedModel,
     schedule: &FusedSchedule,
     stage_input: bool,
 ) -> Result<TokenStream, String> {
-    emit_model_with_options(model, Some(schedule), false, stage_input)
+    emit_model_stack_fused_with_policy(model, schedule, stage_input, false)
+}
+
+/// T5.1 test arm — [`emit_model_stack_fused`] with the T2 gate optionally
+/// forced open (see [`emit_model_fused_with_policy`]).
+pub(crate) fn emit_model_stack_fused_with_policy(
+    model: &ParsedModel,
+    schedule: &FusedSchedule,
+    stage_input: bool,
+    force_t2: bool,
+) -> Result<TokenStream, String> {
+    emit_model_with_options(model, Some(schedule), false, stage_input, force_t2)
 }
 
 /// Shared emission core: `schedule: None` is the unfused path; `Some` routes
 /// composed groups through the `fused_*` backend calls (T1.2).
 /// `stage_input: true` honors the T4.2 graph-input 16B-staging decision.
+/// `force_t2` is the T5.1 test-only policy (never set by production
+/// entry points).
 fn emit_model_with(
     model: &ParsedModel,
     schedule: Option<&FusedSchedule>,
     stage_input: bool,
+    force_t2: bool,
 ) -> Result<TokenStream, String> {
-    emit_model_with_options(model, schedule, true, stage_input)
+    emit_model_with_options(model, schedule, true, stage_input, force_t2)
 }
 
 /// `arena_enabled: false` forces per-tensor stack emission even when the
@@ -116,6 +148,7 @@ fn emit_model_with_options(
     schedule: Option<&FusedSchedule>,
     arena_enabled: bool,
     stage_input: bool,
+    force_t2: bool,
 ) -> Result<TokenStream, String> {
     if model.subgraph_count() != 1 {
         return Err(format!(
@@ -129,7 +162,7 @@ fn emit_model_with_options(
     }
     let ops = model.ops();
     let plan = match schedule {
-        Some(s) => Some(fused_plan(model, s, ops.len(), tensors.len())),
+        Some(s) => Some(fused_plan(model, s, ops.len(), tensors.len(), force_t2)),
         None => None,
     };
     let inputs = model.inputs();
@@ -517,14 +550,29 @@ fn fused_plan(
     schedule: &FusedSchedule,
     op_count: usize,
     tensor_count: usize,
+    force_t2: bool,
 ) -> FusedPlan {
     let mut anchor_group = vec![None; op_count];
     let mut absorbed = vec![false; op_count];
     let mut eliminated = vec![false; tensor_count];
+    // T5.1: `force_t2` (test-only, `#[model_force_t2]`) opens the T2
+    // `requires_verification` gate so the selector can emit a T2 group
+    // composed — the W5 flip surface.  Implemented here as a per-group
+    // view tweak (a clone with the flag cleared) so `selector::select_kernel`
+    // itself is untouched: the production path (`force_t2 = false`) is
+    // byte-identical to the T4.2 behavior.
     let selections: Vec<selector::Selection> = schedule
         .groups
         .iter()
-        .map(|g| selector::select_kernel(model, g))
+        .map(|g| {
+            if force_t2 && g.requires_verification {
+                let mut view = g.clone();
+                view.requires_verification = false;
+                selector::select_kernel(model, &view)
+            } else {
+                selector::select_kernel(model, g)
+            }
+        })
         .collect();
     for (gi, group) in schedule.groups.iter().enumerate() {
         if selections[gi].kernel == GroupSelection::PerOp {
