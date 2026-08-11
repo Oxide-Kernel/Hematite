@@ -51,10 +51,11 @@ pub const MAX_IO_PER_OP: usize = 4;
 
 /// Maximum number of tensors in a single model subgraph.
 ///
-/// TFLite subgraphs allow up to 64 tensors per subgraph.  This cap
-/// keeps stack usage bounded and matches the `offsets` array width
-/// in [`ArenaPlan`].
-pub const MAX_TENSORS: usize = 64;
+/// TFLite subgraphs allow up to 64 tensors per subgraph, but real-world
+/// models exceed that (MobileNetV2 224 has ~85+).  Raised to 128 to keep
+/// the liveness arena viable for the zoo models.  This cap keeps stack
+/// usage bounded and matches the `offsets` array width in [`ArenaPlan`].
+pub const MAX_TENSORS: usize = 256;
 
 /// Maximum number of blocks tracked by a [`ScratchLayout`].
 pub const MAX_SCRATCH_BLOCKS: usize = 64;

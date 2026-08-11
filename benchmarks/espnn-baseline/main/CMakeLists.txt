@@ -1,1 +1,1 @@
-idf_component_register(SRCS "main.c" INCLUDE_DIRS ".")
+idf_component_register(SRCS "main.c" "zoo_gen/zoo_common.h" "zoo_gen/zoo_hello_world.c" "zoo_gen/zoo_kws.c" "zoo_gen/zoo_anomaly.c" "zoo_gen/zoo_person_detect.c" "zoo_gen/zoo_mobilenet.c" "zoo_gen/zoo_runner.c" INCLUDE_DIRS "." "zoo_gen")

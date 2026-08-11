@@ -8,6 +8,7 @@ license.workspace = true
 hematite-core = { path = "../hematite-core" }
 hematite-int8 = { path = "../hematite-int8" }
 hematite-memory = { path = "../hematite-memory" }
+hematite-ref = { path = "../hematite-ref" }
 
 [dev-dependencies]
 hematite-tests = { path = "../hematite-tests" }

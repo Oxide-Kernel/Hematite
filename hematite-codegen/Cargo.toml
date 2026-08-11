@@ -13,6 +13,7 @@ hematite-core = { path = "../hematite-core" }
 # codegen never re-implements the algorithm. Wired even before `mod arena;`
 # lands so the arena module compiles the moment the orchestrator wires it.
 hematite-memory = { path = "../hematite-memory" }
+hematite-tflite = { path = "../hematite-tflite" }
 proc-macro2 = { workspace = true }
 quote = { workspace = true }
 syn = { workspace = true }

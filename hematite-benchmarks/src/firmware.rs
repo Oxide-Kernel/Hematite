@@ -283,6 +283,51 @@ static mut SRAM_ARENA: AlignedArena = AlignedArena([0u8; 256 * 1024]);
 /// failure, never a fabricated measurement.
 static mut PSRAM_ARENA: &'static mut [u8] = &mut [];
 
+/// Total SRAM arena bytes (the `AlignedArena` size).
+pub(crate) const SRAM_ARENA_BYTES: usize = 256 * 1024;
+
+/// Whether a PSRAM arena was mapped at runtime (i.e. the board has PSRAM).
+/// Boards without PSRAM leave `PSRAM_ARENA` empty; callers that would need it
+/// must skip honestly instead of panicking in [`arena_for`].
+pub(crate) fn psram_available() -> bool {
+    let p = core::ptr::addr_of_mut!(PSRAM_ARENA);
+    unsafe { !(&(*p)).is_empty() }
+}
+
+/// Carve a 16-aligned region of `need` bytes from SRAM when it fits, else
+/// PSRAM. Trims the base forward to a 16-byte boundary so SIMD kernels
+/// (which gate on `% 16 == 0` pointers) always engage.
+///
+/// Panics with an honest message if neither arena can hold the request —
+/// never fabricates a measurement.
+pub(crate) fn arena_for(need: usize) -> &'static mut [u8] {
+    if need <= SRAM_ARENA_BYTES {
+        let region: &'static mut [u8] = unsafe { &mut SRAM_ARENA.0[..] };
+        return align_trim(region, need);
+    }
+    let psram: &'static mut [u8] = unsafe { &mut **core::ptr::addr_of_mut!(PSRAM_ARENA) };
+    if psram.len() < need {
+        panic!(
+            "arena_for: need {need} bytes but PSRAM arena has {}",
+            psram.len(),
+        );
+    }
+    align_trim(psram, need)
+}
+
+/// Trim `region` to a 16-aligned base and require `need` bytes.
+fn align_trim(region: &'static mut [u8], need: usize) -> &'static mut [u8] {
+    if region.len() < need {
+        panic!("arena_for: need {need} bytes but arena has {}", region.len());
+    }
+    let base = region.as_mut_ptr() as usize;
+    let skip = (16 - (base % 16)) % 16;
+    if region.len() - skip < need {
+        panic!("arena_for: 16-aligning {base:#x} leaves < {need} bytes");
+    }
+    unsafe { core::slice::from_raw_parts_mut((base + skip) as *mut u8, region.len() - skip) }
+}
+
 /// Stack-canary slot.  BRING-UP: extend the linker script so this section is
 /// placed at the top of the stack region for true overflow detection; without
 /// that placement the canary still catches gross clobbers, and the
@@ -505,7 +550,7 @@ fn bench_kernel(spec: &KernelSpec, clock: &mut RealClock, canary: &mut StackCana
 /// FNV-1a 32-bit checksum over raw output bytes (seed 2166136261, prime
 /// 16777619) — mirrors the C baseline's `out_checksum` so the Rust s3 kernel
 /// output can be matched bit-exactly against the C-SIMD harness.
- fn fnv1a(data: &[i8]) -> u32 {
+pub(crate) fn fnv1a(data: &[i8]) -> u32 {
      let mut h: u32 = 2_166_136_261;
      for &b in data {
          h ^= b as u32;
@@ -800,7 +845,7 @@ fn bench_mv2real_model(clock: &mut RealClock, canary: &mut StackCanary) {
 /// `ref_fnv` / `s3_fnv` are FNV-1a checksums over the final output of the
 /// scalar-ref and s3 (SIMD where eligible) runs respectively; the s3 one is
 /// matched against the C-SIMD harness output checksum.
-fn emit_row(row: &ReportRow, ref_fnv: u32, s3_fnv: u32) {
+pub(crate) fn emit_row(row: &ReportRow, ref_fnv: u32, s3_fnv: u32) {
     firmware_log!(
         "| {} | {} | {}/{} | {}/{} | {}/{} | col1={} | col2={} | col3={} | out_fnv(ref/s3)=0x{:08x}/0x{:08x} |",
         row.label,
@@ -910,6 +955,10 @@ pub fn run_benchmarks() -> ! {
     bench_cnn_model(&mut clock, &mut canary);
     bench_mv2_model(&mut clock, &mut canary);
     bench_mv2real_model(&mut clock, &mut canary);
+    // 5a. Real zoo-model benchmarks (real weights + golden inputs). Real
+    // board only: person_detect/mobilenet_v2 carve PSRAM regions.
+    #[cfg(all(feature = "model-validation", not(feature = "qemu")))]
+    crate::zoo_bench::run_zoo_benches(&mut clock, &mut canary);
     for spec in kernel_specs() {
         bench_kernel(spec, &mut clock, &mut canary);
     }

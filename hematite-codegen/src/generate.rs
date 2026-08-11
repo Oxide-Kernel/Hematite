@@ -91,19 +91,31 @@ pub(crate) fn emit_model(model: &ParsedModel) -> Result<TokenStream, String> {
     }
 
     // ── Emit per-op consts + calls (straight-line, execution order) ────────
+    // Two passes over the same op list: the stack path (per-tensor struct
+    // arrays) and the arena path (tensors carved from a caller arena at
+    // liveness offsets).  Consts are emitted once (identical for both).
     let mut consts: Vec<TokenStream> = Vec::new();
-    let mut calls: Vec<TokenStream> = Vec::new();
+    let mut stack_calls: Vec<TokenStream> = Vec::new();
+    let mut arena_calls: Vec<TokenStream> = Vec::new();
+    let mut arena_scratch_checks: Vec<TokenStream> = Vec::new();
     let mut scratch_max = 0usize;
     for (i, op) in ops.iter().enumerate() {
-        let em = emit_op(model, &storage, i, op)?;
-        consts.extend(em.consts);
-        calls.push(em.call);
-        scratch_max = scratch_max.max(em.scratch);
+        let em_stack = emit_op(model, &storage, i, op, TensorMode::Stack)?;
+        consts.extend(em_stack.consts);
+        stack_calls.push(em_stack.call);
+        let em_arena = emit_op(model, &storage, i, op, TensorMode::Arena)?;
+        arena_calls.push(em_arena.call);
+        arena_scratch_checks.push(em_arena.scratch_check);
+        scratch_max = scratch_max.max(em_stack.scratch.max(em_arena.scratch));
     }
 
-    // ── Intermediate stack-array types ──────────────────────────────────────
+    // ── Intermediate storage: stack types + arena layout ───────────────────
     let mut tensor_types: Vec<TokenStream> = Vec::new();
     let mut tensor_locals: Vec<TokenStream> = Vec::new();
+    let mut arena_locals: Vec<TokenStream> = Vec::new();
+    let mut arena_offsets: Vec<usize> = vec![0usize; tensors.len()];
+    let mut arena_len = 0usize;
+    let mut arena_plan_ok = false;
     for s in &storage {
         if let Storage::Tensor { idx } = s {
             let len = flat_len(&tensors[*idx].shape)?;
@@ -120,11 +132,63 @@ pub(crate) fn emit_model(model: &ParsedModel) -> Result<TokenStream, String> {
             });
         }
     }
+    if let Ok(plan) = crate::optimize::arena::plan_arena_internal(model, usize::MAX / 4, None) {
+        let all_slotted = storage.iter().all(|s| match s {
+            Storage::Tensor { idx } => plan.offsets[*idx] != hematite_memory::OFFSET_NONE,
+            _ => true,
+        });
+        if all_slotted {
+            for s in &storage {
+                if let Storage::Tensor { idx } = s {
+                    arena_offsets[*idx] = plan.offsets[*idx];
+                }
+            }
+            arena_len = plan.peak_arena_bytes;
+            arena_plan_ok = true;
+        }
+    }
+    if !arena_plan_ok {
+        // Sequential 16-aligned offsets — correct without liveness coalescing
+        // (larger arena, but no shared slots).  Used when the planner rejects
+        // the schedule (e.g. > MAX_TENSORS intermediates) or a tensor has no
+        // arena slot.
+        let mut cursor = 0usize;
+        for s in &storage {
+            if let Storage::Tensor { idx } = s {
+                let len = flat_len(&tensors[*idx].shape)?;
+                cursor = (cursor + 15) & !15;
+                arena_offsets[*idx] = cursor;
+                cursor += (len + 15) & !15;
+            }
+        }
+        arena_len = cursor;
+    }
+    for s in &storage {
+        if let Storage::Tensor { idx } = s {
+            let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
+            let off = arena_offsets[*idx];
+            let len = flat_len(&tensors[*idx].shape)?;
+            arena_locals.push(quote! {
+                // SAFETY: `arena` is a single caller-owned buffer of at least
+                // `ARENA_LEN` bytes; `#off..#off+#len` lies wholly inside it
+                // (offsets are 16-aligned, within the plan's peak footprint).
+                let #var: &mut [i8] = unsafe {
+                    core::slice::from_raw_parts_mut(arena.as_mut_ptr().add(#off), #len)
+                };
+            });
+        }
+    }
 
     let input_len_ts = input_len;
     let output_len_ts = output_len;
     let scratch_ts = scratch_max;
-    let backend_bind = if calls.is_empty() {
+    let arena_len_ts = arena_len;
+    let stack_bind = if stack_calls.is_empty() {
+        quote! { let _ = &self.backend; }
+    } else {
+        quote! { let backend = &self.backend; }
+    };
+    let arena_bind = if arena_calls.is_empty() {
         quote! { let _ = &self.backend; }
     } else {
         quote! { let backend = &self.backend; }
@@ -184,17 +248,63 @@ pub(crate) fn emit_model(model: &ParsedModel) -> Result<TokenStream, String> {
                     return Err(::hematite_core::KernelError::ScratchTooSmall);
                 }
                 #(#tensor_locals)*
-                #backend_bind
-                #(#calls)*
+                #stack_bind
+                #(#stack_calls)*
+                Ok(())
+            }
+
+            /// Run inference with intermediates carved from a caller-provided
+            /// arena.
+            ///
+            /// Unlike [`predict_with_scratch`](Self::predict_with_scratch)
+            /// (per-tensor stack arrays), every intermediate tensor is carved
+            /// from `arena` at liveness-coalesced 16-aligned offsets, so a
+            /// single `ARENA_LEN`-byte buffer (SRAM or PSRAM) replaces
+            /// hundreds of kilobytes of stack.  `arena` must be at least
+            /// [`ARENA_LEN`] bytes and 16-byte aligned.
+            ///
+            /// # Errors
+            ///
+            /// * [`::hematite_core::KernelError::ScratchTooSmall`] if
+            ///   `arena.len() < ARENA_LEN` or `scratch.len() < SCRATCH_LEN`.
+            pub fn predict_with_arena(
+                &self,
+                input: &[i8; INPUT_LEN],
+                output: &mut [i8; OUTPUT_LEN],
+                arena: &mut [i8],
+                scratch: &mut [u8],
+            ) -> Result<(), ::hematite_core::KernelError> {
+                if arena.len() < ARENA_LEN {
+                    return Err(::hematite_core::KernelError::ScratchTooSmall);
+                }
+                // Runtime scratch requirement from the backend's `*_scratch_size`
+                // associated fns (constant params → const-foldable per op).  This
+                // guarantees the backend's SIMD paths get enough scratch or the
+                // call fails loudly instead of silently falling back to scalar.
+                let mut need = 0usize;
+                #(#arena_scratch_checks)*
+                if scratch.len() < need {
+                    return Err(::hematite_core::KernelError::ScratchTooSmall);
+                }
+                #(#arena_locals)*
+                #arena_bind
+                #(#arena_calls)*
                 Ok(())
             }
         }
     };
 
     Ok(quote! {
-        const INPUT_LEN: usize = #input_len_ts;
-        const OUTPUT_LEN: usize = #output_len_ts;
-        const SCRATCH_LEN: usize = #scratch_ts;
+        pub const INPUT_LEN: usize = #input_len_ts;
+        pub const OUTPUT_LEN: usize = #output_len_ts;
+        pub const SCRATCH_LEN: usize = #scratch_ts;
+        pub const ARENA_LEN: usize = #arena_len_ts;
+        /// 16-byte-aligned wrapper for weight statics — SIMD kernels gate on
+        /// `weights.as_ptr() % 16 == 0`; bare `const [i8; N]` arrays are only
+        /// 1-byte aligned in flash.
+        #[repr(align(16))]
+        #[allow(dead_code)]
+        struct WeightAlign<const N: usize>([i8; N]);
         #(#consts)*
         #(#tensor_types)*
         #wrapper
@@ -218,8 +328,18 @@ enum Storage {
     Tensor { idx: usize },
 }
 
+/// How intermediate tensors are allocated in the generated code.
+#[derive(Clone, Copy)]
+enum TensorMode {
+    /// Per-tensor `#[repr(C, align(16))]` stack arrays (`tensor_N.data`).
+    Stack,
+    /// Slices carved from a caller-provided `arena: &mut [i8]` at liveness
+    /// offsets (`tensor_N: &mut [i8]`, `&*tensor_N` / `tensor_N`).
+    Arena,
+}
+
 /// Expression naming a tensor as a kernel *input* (immutable `&[i8]`).
-fn src_expr(storage: &[Storage], t: usize) -> Result<TokenStream, String> {
+fn src_expr(storage: &[Storage], t: usize, mode: TensorMode) -> Result<TokenStream, String> {
     match storage.get(t).ok_or_else(|| format!("tensor index {t} out of range"))? {
         Storage::Input { start, len } => {
             let end = start + len;
@@ -227,7 +347,10 @@ fn src_expr(storage: &[Storage], t: usize) -> Result<TokenStream, String> {
         }
         Storage::Tensor { idx } => {
             let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
-            Ok(quote!(&#var.data))
+            match mode {
+                TensorMode::Stack => Ok(quote!(&#var.data)),
+                TensorMode::Arena => Ok(quote!(&*#var)),
+            }
         }
         Storage::Const => Err(format!(
             "tensor {t} is a constant (buffer-backed) but is used as a runtime op input; \
@@ -238,7 +361,7 @@ fn src_expr(storage: &[Storage], t: usize) -> Result<TokenStream, String> {
 }
 
 /// Expression naming a tensor as a kernel *output* (`&mut [i8]`).
-fn dst_expr(storage: &[Storage], t: usize) -> Result<TokenStream, String> {
+fn dst_expr(storage: &[Storage], t: usize, mode: TensorMode) -> Result<TokenStream, String> {
     match storage.get(t).ok_or_else(|| format!("tensor index {t} out of range"))? {
         Storage::Output { start, len } => {
             let end = start + len;
@@ -246,7 +369,10 @@ fn dst_expr(storage: &[Storage], t: usize) -> Result<TokenStream, String> {
         }
         Storage::Tensor { idx } => {
             let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
-            Ok(quote!(&mut #var.data))
+            match mode {
+                TensorMode::Stack => Ok(quote!(&mut #var.data)),
+                TensorMode::Arena => Ok(quote!(#var)),
+            }
         }
         _ => Err(format!("tensor {t} cannot be an op output (model input or const)")),
     }
@@ -451,11 +577,6 @@ fn i32_le_lit(bytes: &[u8]) -> Result<TokenStream, String> {
     Ok(quote!([ #(#vals),* ]))
 }
 
-fn const_i8(name: &Ident, bytes: &[u8], len: usize) -> TokenStream {
-    let vals = i8_lit(bytes);
-    quote!(const #name: [i8; #len] = #vals;)
-}
-
 fn const_i32(name: &Ident, values: &[i32]) -> TokenStream {
     let vals: Vec<TokenStream> = values.iter().map(|&v| quote!(#v)).collect();
     let n = values.len();
@@ -494,7 +615,12 @@ fn weight_const(model: &ParsedModel, tensor_idx: u32, name: &Ident) -> Result<To
             bytes.len()
         ));
     }
-    Ok(const_i8(name, bytes, len))
+    let vals = i8_lit(bytes);
+    // `static` (not `const`) wrapped in a `#[repr(align(16))]` struct so the
+    // symbol is 16-byte aligned in flash: the SIMD kernels gate on
+    // `weights.as_ptr() % 16 == 0`, and a bare `const [i8; N]` array has
+    // alignment 1. `&#name.0` points at field offset 0 → aligned.
+    Ok(quote!(static #name: WeightAlign<#len> = WeightAlign(#vals);))
 }
 
 /// Bias const for op `i`: int32 LE buffer, zero-padded when absent/optional.
@@ -536,6 +662,10 @@ struct OpEmission {
     call: TokenStream,
     /// Documented scratch need for this op (kernel `*_scratch_size` default 0).
     scratch: usize,
+    /// Statement advancing a `need` accumulator to the backend's runtime
+    /// scratch requirement for this op's params (only the arena path emits
+    /// these — see [`emit_model`]).
+    scratch_check: TokenStream,
 }
 
 /// Quantization context shared by the conv-family (conv/depthwise/FC).
@@ -585,27 +715,28 @@ fn emit_op(
     storage: &[Storage],
     i: usize,
     op: &ParsedOp,
+    mode: TensorMode,
 ) -> Result<OpEmission, String> {
     match op.builtin_code {
-        0 => emit_elementwise(model, storage, i, op, quote!(add), ElementwiseKind::AddSub),
-        1 => emit_pool(model, storage, i, op, quote!(average_pool_2d)),
-        3 => emit_conv2d(model, storage, i, op),
-        4 => emit_depthwise(model, storage, i, op),
-        9 => emit_fully_connected(model, storage, i, op),
-        17 => emit_pool(model, storage, i, op, quote!(max_pool_2d)),
-        18 => emit_elementwise(model, storage, i, op, quote!(mul), ElementwiseKind::Mul),
-        19 => emit_activation(model, storage, i, op, quote!(relu), 1),
-        21 => emit_activation(model, storage, i, op, quote!(relu6), 3),
-        22 => emit_reshape(model, storage, i, op),
-        25 => emit_softmax(model, storage, i, op),
-        34 => emit_pad(model, storage, i, op),
-        39 => emit_transpose(model, storage, i, op),
-        40 => emit_mean(model, storage, i, op),
-        41 => emit_elementwise(model, storage, i, op, quote!(sub), ElementwiseKind::AddSub),
-        54 => emit_prelu(model, storage, i, op),
-        97 => emit_resize(model, storage, i, op),
-        98 => emit_leaky_relu(model, storage, i, op),
-        117 => emit_activation(model, storage, i, op, quote!(hard_swish), 0),
+        0 => emit_elementwise(model, storage, i, op, quote!(add), ElementwiseKind::AddSub, mode),
+        1 => emit_pool(model, storage, i, op, quote!(average_pool_2d), mode),
+        3 => emit_conv2d(model, storage, i, op, mode),
+        4 => emit_depthwise(model, storage, i, op, mode),
+        9 => emit_fully_connected(model, storage, i, op, mode),
+        17 => emit_pool(model, storage, i, op, quote!(max_pool_2d), mode),
+        18 => emit_elementwise(model, storage, i, op, quote!(mul), ElementwiseKind::Mul, mode),
+        19 => emit_activation(model, storage, i, op, quote!(relu), 1, mode),
+        21 => emit_activation(model, storage, i, op, quote!(relu6), 3, mode),
+        22 => emit_reshape(model, storage, i, op, mode),
+        25 => emit_softmax(model, storage, i, op, mode),
+        34 => emit_pad(model, storage, i, op, mode),
+        39 => emit_transpose(model, storage, i, op, mode),
+        40 => emit_mean(model, storage, i, op, mode),
+        41 => emit_elementwise(model, storage, i, op, quote!(sub), ElementwiseKind::AddSub, mode),
+        54 => emit_prelu(model, storage, i, op, mode),
+        97 => emit_resize(model, storage, i, op, mode),
+        98 => emit_leaky_relu(model, storage, i, op, mode),
+        117 => emit_activation(model, storage, i, op, quote!(hard_swish), 0, mode),
         code => Err(format!(
             "unsupported operator (builtin_code={code}) in subgraph[0]; T4.1 dispatches only the \
              in-scope op set (conv2d, depthwise_conv2d, fully_connected, average_pool_2d, \
@@ -616,7 +747,13 @@ fn emit_op(
     }
 }
 
-fn emit_conv2d(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
+fn emit_conv2d(
+    model: &ParsedModel,
+    storage: &[Storage],
+    i: usize,
+    op: &ParsedOp,
+    mode: TensorMode,
+) -> Result<OpEmission, String> {
     let opts = match op.options.as_ref() {
         Some(ParsedOptions::Conv2D {
             padding,
@@ -679,19 +816,26 @@ fn emit_conv2d(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp
                 quantized_activation_max: #act_max,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(storage, in_t as usize, mode)?;
+    let dst = dst_expr(storage, out_t as usize, mode)?;
     let call = quote! {
-        backend.conv2d(#src, &#w_name, &#b_name, &#p_name, #dst, scratch)?;
+        backend.conv2d(#src, &(#w_name.0), &#b_name, &#p_name, #dst, scratch)?;
     };
     Ok(OpEmission {
         consts: vec![weights_c, bias_c, mult_c, shift_c, params_c],
         call,
         scratch: 0,
+        scratch_check: quote!(need = need.max(B::conv2d_scratch_size(&#p_name));),
     })
 }
 
-fn emit_depthwise(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
+fn emit_depthwise(
+    model: &ParsedModel,
+    storage: &[Storage],
+    i: usize,
+    op: &ParsedOp,
+    mode: TensorMode,
+) -> Result<OpEmission, String> {
     let opts = match op.options.as_ref() {
         Some(ParsedOptions::DepthwiseConv2D {
             padding,
@@ -764,19 +908,26 @@ fn emit_depthwise(model: &ParsedModel, storage: &[Storage], i: usize, op: &Parse
                 quantized_activation_max: #act_max,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(storage, in_t as usize, mode)?;
+    let dst = dst_expr(storage, out_t as usize, mode)?;
     let call = quote! {
-        backend.depthwise_conv2d(#src, &#w_name, &#b_name, &#p_name, #dst, scratch)?;
+        backend.depthwise_conv2d(#src, &(#w_name.0), &#b_name, &#p_name, #dst, scratch)?;
     };
     Ok(OpEmission {
         consts: vec![weights_c, bias_c, mult_c, shift_c, params_c],
         call,
         scratch: 0,
+        scratch_check: quote!(need = need.max(B::depthwise_conv2d_scratch_size(&#p_name));),
     })
 }
 
-fn emit_fully_connected(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
+fn emit_fully_connected(
+    model: &ParsedModel,
+    storage: &[Storage],
+    i: usize,
+    op: &ParsedOp,
+    mode: TensorMode,
+) -> Result<OpEmission, String> {
     let opts = match op.options.as_ref() {
         Some(ParsedOptions::FullyConnected {
             fused_activation,
@@ -827,16 +978,17 @@ fn emit_fully_connected(model: &ParsedModel, storage: &[Storage], i: usize, op: 
                 quantized_activation_max: #act_max,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(storage, in_t as usize, mode)?;
+    let dst = dst_expr(storage, out_t as usize, mode)?;
     let call = quote! {
-        backend.fully_connected(#src, &#w_name, &#b_name, &#p_name, #dst, scratch)?;
+        backend.fully_connected(#src, &(#w_name.0), &#b_name, &#p_name, #dst, scratch)?;
     };
     let _ = batches;
     Ok(OpEmission {
         consts: vec![weights_c, bias_c, mult_c, shift_c, params_c],
         call,
         scratch: 0,
+        scratch_check: TokenStream::new(),
     })
 }
 
@@ -880,6 +1032,7 @@ fn emit_pool(
     i: usize,
     op: &ParsedOp,
     method: TokenStream,
+    mode: TensorMode,
 ) -> Result<OpEmission, String> {
     let opts = match op.options.as_ref() {
         Some(ParsedOptions::Pool2D {
@@ -921,8 +1074,8 @@ fn emit_pool(
                 quantized_activation_max: #act_max,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(storage, in_t as usize, mode)?;
+    let dst = dst_expr(storage, out_t as usize, mode)?;
     let call = quote! {
         backend.#method(#src, &#p_name, #dst)?;
     };
@@ -930,10 +1083,17 @@ fn emit_pool(
         consts: vec![params_c],
         call,
         scratch: 0,
+        scratch_check: TokenStream::new(),
     })
 }
 
-fn emit_softmax(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
+fn emit_softmax(
+    model: &ParsedModel,
+    storage: &[Storage],
+    i: usize,
+    op: &ParsedOp,
+    mode: TensorMode,
+) -> Result<OpEmission, String> {
     // TFLM int8 softmax only supports beta = 1.0; a SoftmaxOptions table
     // carrying exactly that (the converter default) is accepted and ignored.
     match op.options.as_ref() {
@@ -974,8 +1134,8 @@ fn emit_softmax(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedO
                 quantized_activation_max: 127,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(storage, in_t as usize, mode)?;
+    let dst = dst_expr(storage, out_t as usize, mode)?;
     let call = quote! {
         backend.softmax(#src, &#p_name, #dst, scratch)?;
     };
@@ -984,6 +1144,7 @@ fn emit_softmax(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedO
         consts: vec![params_c],
         call,
         scratch: 0,
+        scratch_check: quote!(need = need.max(B::softmax_scratch_size(&#p_name));),
     })
 }
 
@@ -995,6 +1156,7 @@ fn emit_activation(
     op: &ParsedOp,
     method: TokenStream,
     fused: i8,
+    mode: TensorMode,
 ) -> Result<OpEmission, String> {
     let in_t = *op.inputs.first().ok_or("activation missing input tensor")?;
     let out_t = *op.outputs.first().ok_or("activation missing output tensor")?;
@@ -1039,8 +1201,8 @@ fn emit_activation(
                 output_multiplier_exponent: 0,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(storage, in_t as usize, mode)?;
+    let dst = dst_expr(storage, out_t as usize, mode)?;
     let call = quote! {
         backend.#method(#src, &#p_name, #dst)?;
     };
@@ -1048,6 +1210,7 @@ fn emit_activation(
         consts: vec![params_c],
         call,
         scratch: 0,
+        scratch_check: TokenStream::new(),
     })
 }
 
@@ -1056,6 +1219,7 @@ fn emit_leaky_relu(
     storage: &[Storage],
     i: usize,
     op: &ParsedOp,
+    mode: TensorMode,
 ) -> Result<OpEmission, String> {
     let alpha = match op.options.as_ref() {
         Some(ParsedOptions::LeakyRelu { alpha }) => f64::from(*alpha),
@@ -1101,8 +1265,8 @@ fn emit_leaky_relu(
                 output_multiplier_exponent: 0,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(storage, in_t as usize, mode)?;
+    let dst = dst_expr(storage, out_t as usize, mode)?;
     let call = quote! {
         backend.leaky_relu(#src, &#p_name, #dst)?;
     };
@@ -1110,6 +1274,7 @@ fn emit_leaky_relu(
         consts: vec![params_c],
         call,
         scratch: 0,
+        scratch_check: TokenStream::new(),
     })
 }
 
@@ -1118,6 +1283,7 @@ fn emit_prelu(
     storage: &[Storage],
     i: usize,
     op: &ParsedOp,
+    mode: TensorMode,
 ) -> Result<OpEmission, String> {
     if !matches!(op.options.as_ref(), None | Some(ParsedOptions::Prelu)) {
         return Err(format!("op {i}: unexpected options for prelu"));
@@ -1157,7 +1323,7 @@ fn emit_prelu(
                 output_multiplier_identity: 0,
                 output_shift_identity: 0,
                 alpha_offset: #alpha_zp,
-                alpha_data: &#a_name,
+                alpha_data: &(#a_name.0),
                 output_multiplier_1: #m1,
                 output_shift_1: #s1,
                 output_multiplier_2: #m2,
@@ -1168,8 +1334,8 @@ fn emit_prelu(
                 output_multiplier_exponent: 0,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(storage, in_t as usize, mode)?;
+    let dst = dst_expr(storage, out_t as usize, mode)?;
     let call = quote! {
         backend.prelu(#src, &#p_name, #dst)?;
     };
@@ -1177,6 +1343,7 @@ fn emit_prelu(
         consts: vec![alpha_c, params_c],
         call,
         scratch: 0,
+        scratch_check: TokenStream::new(),
     })
 }
 
@@ -1193,6 +1360,7 @@ fn emit_elementwise(
     op: &ParsedOp,
     method: TokenStream,
     kind: ElementwiseKind,
+    mode: TensorMode,
 ) -> Result<OpEmission, String> {
     let fused_activation = match op.options.as_ref() {
         Some(ParsedOptions::Add { fused_activation, .. })
@@ -1257,9 +1425,9 @@ fn emit_elementwise(
                 quantized_activation_max: #act_max,
             };
     };
-    let src1 = src_expr(storage, in1_t as usize)?;
-    let src2 = src_expr(storage, in2_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src1 = src_expr(storage, in1_t as usize, mode)?;
+    let src2 = src_expr(storage, in2_t as usize, mode)?;
+    let dst = dst_expr(storage, out_t as usize, mode)?;
     let call = quote! {
         backend.#method(#src1, #src2, &#p_name, #dst)?;
     };
@@ -1267,10 +1435,17 @@ fn emit_elementwise(
         consts: vec![params_c],
         call,
         scratch: 0,
+        scratch_check: TokenStream::new(),
     })
 }
 
-fn emit_mean(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
+fn emit_mean(
+    model: &ParsedModel,
+    storage: &[Storage],
+    i: usize,
+    op: &ParsedOp,
+    mode: TensorMode,
+) -> Result<OpEmission, String> {
     let (axis, keep_dims) = match op.options.as_ref() {
         Some(ParsedOptions::Mean { axis, keep_dims }) => (axis.clone(), *keep_dims),
         other => return Err(format!("op {i}: expected Mean options, got {other:?}")),
@@ -1317,8 +1492,8 @@ fn emit_mean(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) 
                 quantized_activation_max: 127,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(storage, in_t as usize, mode)?;
+    let dst = dst_expr(storage, out_t as usize, mode)?;
     let call = quote! {
         backend.mean(#src, &#p_name, #dst)?;
     };
@@ -1326,10 +1501,17 @@ fn emit_mean(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) 
         consts: vec![params_c],
         call,
         scratch: 0,
+        scratch_check: TokenStream::new(),
     })
 }
 
-fn emit_reshape(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
+fn emit_reshape(
+    model: &ParsedModel,
+    storage: &[Storage],
+    i: usize,
+    op: &ParsedOp,
+    mode: TensorMode,
+) -> Result<OpEmission, String> {
     let out_t = *op.outputs.first().ok_or("reshape missing output tensor")?;
     let in_t = *op.inputs.first().ok_or("reshape missing input tensor")?;
     let output = tensor_at(model.tensors(), out_t)?;
@@ -1365,8 +1547,8 @@ fn emit_reshape(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedO
                 shape_count: #shape_count,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(storage, in_t as usize, mode)?;
+    let dst = dst_expr(storage, out_t as usize, mode)?;
     let call = quote! {
         backend.reshape(#src, &#p_name, #dst)?;
     };
@@ -1374,12 +1556,19 @@ fn emit_reshape(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedO
         consts: vec![params_c],
         call,
         scratch: 0,
+        scratch_check: TokenStream::new(),
     })
 }
 
 /// PAD — the padding amounts come from a const int32 tensor of shape
 /// `[rank, 2]` (`[before, after]` per dim); the kernel pads with value 0.
-fn emit_pad(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
+fn emit_pad(
+    model: &ParsedModel,
+    storage: &[Storage],
+    i: usize,
+    op: &ParsedOp,
+    mode: TensorMode,
+) -> Result<OpEmission, String> {
     let in_t = *op.inputs.first().ok_or("pad missing input tensor")?;
     let pad_t = *op.inputs.get(1).ok_or("pad missing padding tensor")?;
     let out_t = *op.outputs.first().ok_or("pad missing output tensor")?;
@@ -1426,8 +1615,8 @@ fn emit_pad(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -
                 right_padding_count: #count,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(storage, in_t as usize, mode)?;
+    let dst = dst_expr(storage, out_t as usize, mode)?;
     let call = quote! {
         backend.pad(#src, &#p_name, #dst)?;
     };
@@ -1435,12 +1624,19 @@ fn emit_pad(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -
         consts: vec![params_c],
         call,
         scratch: 0,
+        scratch_check: TokenStream::new(),
     })
 }
 
 /// TRANSPOSE — the permutation comes from a const int32 tensor of length
 /// `rank`; the kernel computes the output shape from the permuted input.
-fn emit_transpose(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
+fn emit_transpose(
+    model: &ParsedModel,
+    storage: &[Storage],
+    i: usize,
+    op: &ParsedOp,
+    mode: TensorMode,
+) -> Result<OpEmission, String> {
     let in_t = *op.inputs.first().ok_or("transpose missing input tensor")?;
     let perm_t = *op.inputs.get(1).ok_or("transpose missing perm tensor")?;
     let out_t = *op.outputs.first().ok_or("transpose missing output tensor")?;
@@ -1485,8 +1681,8 @@ fn emit_transpose(model: &ParsedModel, storage: &[Storage], i: usize, op: &Parse
                 perm_count: #perm_count,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(storage, in_t as usize, mode)?;
+    let dst = dst_expr(storage, out_t as usize, mode)?;
     let call = quote! {
         backend.transpose(#src, &#p_name, #dst)?;
     };
@@ -1494,10 +1690,17 @@ fn emit_transpose(model: &ParsedModel, storage: &[Storage], i: usize, op: &Parse
         consts: vec![params_c],
         call,
         scratch: 0,
+        scratch_check: TokenStream::new(),
     })
 }
 
-fn emit_resize(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp) -> Result<OpEmission, String> {    let (align_corners, half_pixel_centers) = match op.options.as_ref() {
+fn emit_resize(
+    model: &ParsedModel,
+    storage: &[Storage],
+    i: usize,
+    op: &ParsedOp,
+    mode: TensorMode,
+) -> Result<OpEmission, String> {    let (align_corners, half_pixel_centers) = match op.options.as_ref() {
         Some(ParsedOptions::ResizeNearest {
             align_corners,
             half_pixel_centers,
@@ -1521,8 +1724,8 @@ fn emit_resize(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp
                 half_pixel_centers: #half_pixel_centers as i32,
             };
     };
-    let src = src_expr(storage, in_t as usize)?;
-    let dst = dst_expr(storage, out_t as usize)?;
+    let src = src_expr(storage, in_t as usize, mode)?;
+    let dst = dst_expr(storage, out_t as usize, mode)?;
     let call = quote! {
         backend.resize_nearest(#src, &#p_name, #dst)?;
     };
@@ -1530,6 +1733,7 @@ fn emit_resize(model: &ParsedModel, storage: &[Storage], i: usize, op: &ParsedOp
         consts: vec![params_c],
         call,
         scratch: 0,
+        scratch_check: TokenStream::new(),
     })
 }
 
@@ -1558,20 +1762,25 @@ mod tests {
         // Model<I, O> wrapper with the typed I/O bridge.
         assert!(s.contains("structModel<B>"), "Model wrapper missing");
         assert!(s.contains("fnpredict_with_scratch"), "predict_with_scratch missing");
+        assert!(s.contains("fnpredict_with_arena"), "predict_with_arena missing");
         assert!(s.contains("fnpredict("), "predict missing");
         assert!(s.contains("constfnnew("), "new missing");
         assert!(s.contains("constfninput_len"), "input_len missing");
         assert!(s.contains("constfnoutput_len"), "output_len missing");
 
         // I/O sized from tensor shapes (input [1], output [1]).
-        assert!(s.contains("INPUT_LEN:usize=1usize"));
-        assert!(s.contains("OUTPUT_LEN:usize=1usize"));
+        assert!(s.contains("pubconstINPUT_LEN:usize=1usize"));
+        assert!(s.contains("pubconstOUTPUT_LEN:usize=1usize"));
 
         // Scratch computed at macro time — kernels' *_scratch_size default 0.
-        assert!(s.contains("SCRATCH_LEN:usize=0usize"));
+        assert!(s.contains("pubconstSCRATCH_LEN:usize=0usize"));
+
+        // Arena — sine has no intermediates (fc reads I/O + consts directly),
+        // so the arena footprint is 0 and no carve locals are emitted.
+        assert!(s.contains("pubconstARENA_LEN:usize=0usize"));
 
         // Weight/bias consts from buffer bytes.
-        assert!(s.contains("WEIGHTS_0:[i8;1usize]=[51i8]"), "weight const wrong: {s}");
+        assert!(s.contains("staticWEIGHTS_0:WeightAlign<1usize>=WeightAlign([51i8])"), "weight const wrong: {s}");
         assert!(s.contains("BIAS_0:[i32;1usize]=[-3i32]"), "bias const wrong: {s}");
 
         // FC params: input_dim=1, output_dim=1, per-channel quant
