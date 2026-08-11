@@ -458,6 +458,9 @@ fn generic_pool_params(act_min: i32) -> PoolParams {
     }
 }
 
+#[inline(never)]
+
+#[inline(never)]
 fn run_generic_max_pool_checks() {
     for (act_min, name) in [(i8::MIN as i32, "max_pool_3x3_s1"), (0, "max_pool_3x3_s1_relu")] {
         let input = Aligned(make_pattern::<GEN_POOL_IN>(0x1A7E_5EED));
@@ -474,6 +477,9 @@ fn run_generic_max_pool_checks() {
     }
 }
 
+#[inline(never)]
+
+#[inline(never)]
 fn run_generic_avg_pool_check() {
     let input = Aligned(make_pattern::<GEN_POOL_IN>(0x2BAD_F00D));
     let mut want = Aligned([0i8; GEN_POOL_OUT]);
@@ -563,6 +569,7 @@ fn activation_params(input_offset: i32, output_offset: i32, act_max: i32) -> Act
 /// relu6 — the widened lane model (vector min/max clamps, 16-wide) vs ref.
 /// `quantized_six` is forwarded from `quantized_activation_max` (the S3Backend
 /// adapter's contract).
+#[inline(never)]
 fn check_relu6_simd_matches_ref() {
     let input = Aligned(make_pattern::<256>(0x6E51_0FE1));
     let mut want = Aligned([0i8; 256]);
@@ -582,6 +589,7 @@ fn check_relu6_simd_matches_ref() {
 /// the same downgraded math; hematite-ref implements the same downgraded
 /// formula (same-backend semantics — the known TFLM divergence is pinned by
 /// the goldens, not "fixed" here).
+#[inline(never)]
 fn check_hard_swish_simd_matches_ref() {
     let input = Aligned(make_pattern::<256>(0xD0D0_0D0D));
     let mut want = Aligned([0i8; 256]);
@@ -1064,6 +1072,9 @@ fn check_fc_simd_matches_ref() {
 // wave); the check lives here so the reduction is covered by the suite the
 // moment the SIMD dispatch lands.
 
+#[inline(never)]
+
+#[inline(never)]
 fn check_mean_simd_matches_ref() {
     let input = Aligned(make_pattern::<16>(0x1D4A_7EE5));
     let mut want = Aligned([0i8; 4]);
@@ -1108,6 +1119,9 @@ fn check_mean_simd_matches_ref() {
 const MEAN_MV2_IN: usize = 7 * 7 * 1280;
 const MEAN_MV2_OUT: usize = 1280;
 
+#[inline(never)]
+
+#[inline(never)]
 fn check_mean_mv2_global_simd_matches_ref() {
     // 64 KB of buffers carved from the SRAM bench arena — NOT stack locals
     // (see `arena_carve` for the task-18 OOB device finding). The 62 KB
@@ -1170,6 +1184,9 @@ const FUSED_CONV1X1_IN: usize = 4 * 4 * 16;
 const FUSED_CONV1X1_W: usize = 16 * 1 * 1 * 16;
 const FUSED_CONV1X1_OUT: usize = 4 * 4 * 16;
 
+#[inline(never)]
+
+#[inline(never)]
 fn check_fused_conv2d_simd_matches_ref() {
     // Buffers carved from the SRAM bench arena — NOT stack locals (see
     // `arena_carve` for the task-18 OOB device finding).
@@ -1248,6 +1265,9 @@ fn check_fused_conv2d_simd_matches_ref() {
 
 // ── Fused elementwise chain (T2.3): add + relu, register-held SIMD ───────────
 
+#[inline(never)]
+
+#[inline(never)]
 fn check_fused_chain_simd_matches_ref() {
     // Buffers carved from the SRAM bench arena — NOT stack locals (see
     // `arena_carve` for the task-18 OOB device finding). The chain is
@@ -1321,6 +1341,9 @@ fn check_fused_chain_simd_matches_ref() {
 
 // ── Fused pool-with-fold (T2.4): avg-pool + MUL fold + relu epilogue ─────────
 
+#[inline(never)]
+
+#[inline(never)]
 fn check_fused_pool_fold_simd_matches_ref() {
     // Buffers carved from the SRAM bench arena — NOT stack locals (same as
     // the other fused checks). The fold is IDENTITY-eligible (zero offsets,
@@ -1396,6 +1419,9 @@ fn check_fused_pool_fold_simd_matches_ref() {
     report(&compare("fused_pool_avg_mulfold_relu", got, want));
 }
 
+#[inline(never)]
+
+#[inline(never)]
 fn check_fc_small_simd_matches_ref() {
     let shapes: [((usize, usize, i32), &'static str); 7] = [
         ((1, 1, 0), "fc_small_1x1"),      // sine-family
