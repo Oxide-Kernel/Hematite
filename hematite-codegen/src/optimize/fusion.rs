@@ -9,9 +9,18 @@
 //! merges elementwise/activation epilogues into the kernel that produces
 //! their input.  Output is a [`FusedSchedule`]: one [`FusedGroup`] per
 //! emitted kernel call, in original execution order, with every absorbed
-//! op and eliminated tensor recorded.  The T4.1 emitter wiring task threads
-//! this into `emit_model`; T4.2b (arena) and T4.2c (layout) consume the
-//! same op list.
+//! op and eliminated tensor recorded.
+//!
+//! ## Wiring (T1.1 / T1.2 / T4.2 / T4.3 — LANDED)
+//!
+//! `fuse()` is called from `parse_and_emit_impl` (lib.rs) for every
+//! `#[model]`-family entry point; the resulting [`FusedSchedule`] is threaded
+//! into `generate::emit_model_fused` / `emit_model_fused_with_policy`, where
+//! the T4.2 selector maps each group's anchor to a composed kernel (or falls
+//! back to per-op emission) and the T4.3 emitter stamps the selected shapes
+//! as const-generic composed calls.  The T1.3 arena (`plan_arena`) sizes
+//! intermediate storage from the same parsed op list; the T4.2 layout pass's
+//! repad precedent feeds the selector's graph-input staging decision.
 //!
 //! ## Pattern priority (per plan T4.2a)
 //!
@@ -50,8 +59,9 @@
 //! ABS/SPLIT_V/UNIQUE in this schema era and must NEVER be treated as
 //! activations.
 //
-// Dead-code warnings are expected at T4.2a — the T4.1 emitter wiring task
-// consumes these descriptors.
+// Every descriptor type in this module is consumed by the fused emission
+// path (generate.rs imports the group IR; selector.rs and profile.rs call
+// `fuse()` directly) — nothing here is pending wiring.
 #![allow(dead_code)]
 
 use crate::flatbuffer::{ParsedModel, ParsedOp, ParsedOptions};
@@ -1046,7 +1056,7 @@ mod opt_fusion {
             }
 
             pub(super) fn align4(&mut self) {
-                while self.bytes.len() % 4 != 0 {
+                while !self.bytes.len().is_multiple_of(4) {
                     self.bytes.push(0);
                 }
             }

@@ -390,20 +390,6 @@ fn shape_product(shape: &[i32; 4]) -> usize {
     shape[0] as usize * shape[1] as usize * shape[2] as usize * shape[3] as usize
 }
 
-/// Derived vertical pad (same formula as hematite-ref conv.rs).
-#[inline]
-pub(crate) fn conv_pad_h(params: &Conv2DParams<'_>) -> i32 {
-    let dilated_h = (params.filter_shape[1] - 1) * params.dilation_height_factor + 1;
-    ((params.output_shape[1] - 1) * params.stride_height + dilated_h - params.input_shape[1]) / 2
-}
-
-/// Derived horizontal pad (same formula as hematite-ref conv.rs).
-#[inline]
-pub(crate) fn conv_pad_w(params: &Conv2DParams<'_>) -> i32 {
-    let dilated_w = (params.filter_shape[2] - 1) * params.dilation_width_factor + 1;
-    ((params.output_shape[2] - 1) * params.stride_width + dilated_w - params.input_shape[2]) / 2
-}
-
 /// Conv2D general kernel — scalar path (host-compilable, bit-exact vs per-channel golden).
 ///
 /// This kernel is structurally identical to the 1×1 conv kernel — the bias-init

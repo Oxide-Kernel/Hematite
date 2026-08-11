@@ -26,19 +26,24 @@
 //! [`OFFSET_NONE`] in `offsets`.  The T4.1 emitter can declare a second
 //! PSRAM region from that description.
 //!
-//! # T4.1 wiring
+//! # Wiring (T1.3 — LANDED)
 //!
-//! [`plan_arena`] is the seam the T4.1 emitter consumes: `ArenaPlan.offsets`
-//! maps tensor id → arena byte offset (const-usable — plain `[usize; 64]`
-//! entries) and `ArenaPlan.peak_arena_bytes` sizes
-//! `static mut ARENA: [u8; …]`.  Model inputs/outputs and constant tensors
-//! are excluded by the planner (caller-owned / flash-resident memory), never
-//! by this module.
+//! `generate::emit_model_with` calls [`plan_arena`] for every fused model:
+//! on success the per-tensor stack arrays collapse into ONE stack-local
+//! `#[repr(C, align(16))] struct Arena { data: [i8; ARENA_LEN] }` sized to
+//! `ArenaPlan.peak_arena_bytes`, indexed at compile-time offsets from
+//! `ArenaPlan.offsets` (const-usable — plain `[usize; MAX_TENSORS]`, i.e.
+//! 255 entries since T1.3), with disjoint op slices borrowed via
+//! nested `split_at_mut` (safe, no `unsafe` in generated code).  Models the
+//! planner rejects — [`LayoutError::Oversized`] for a single tensor over
+//! the 512 KiB budget, e.g. mobilenet_v2's 224×224×32 activation — fall
+//! back to per-tensor stack emission (`ARENA_LEN = 0`), bit-exact, just
+//! larger (evidence: `local-notes/evidence/composed-kernels/t13-arena.md`).
+//! Model inputs/outputs and constant tensors are excluded by the planner
+//! (caller-owned / flash-resident memory), never by this module.
 //!
-//! This module is not yet wired into `optimize/mod.rs` — the orchestrator's
-//! wiring task declares `pub(crate) mod arena;` after all T4.2 passes land.
-//! Dead-code warnings are expected until then (same convention as
-//! `flatbuffer.rs` / `layout.rs`).
+//! This module is declared `pub(crate) mod arena;` in `optimize/mod.rs` and
+//! consumed by the emitter — nothing here is pending wiring.
 #![allow(dead_code)]
 
 use std::fmt;

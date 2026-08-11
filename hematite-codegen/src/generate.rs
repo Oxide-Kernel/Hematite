@@ -4,6 +4,21 @@
 //! T4.1 — straight-line code emitter: [`ParsedModel`] → typed `KernelBackend`
 //! call sequence + `Model<B>` wrapper.
 //!
+//! ## Pipeline (T1.2 / T4.2 / T4.3 — WIRED)
+//!
+//! Every `#[model]`-family entry point routes through
+//! `parse_and_emit_impl` (lib.rs), which precomputes the fusion schedule
+//! (`optimize::fusion::fuse`) and hands it to the emission seam below:
+//! `emit_model_fused[_with_policy]` → `emit_model_with` → the per-group
+//! `FusedKernelBackend` composed calls.  The T4.2 selector
+//! (`optimize::selector::select_kernel`) maps each fused group's anchor to a
+//! composed kernel when the structural + mirror-eligibility gates pass; the
+//! T4.3 emitter stamps the selected shapes as const-generic composed calls.
+//! There is no longer a "future wiring task" seam — the schedule is threaded
+//! through on every fused build (`#[model]`, `#[model_stack]`,
+//! `#[model_unstaged]`, `#[model_force_t2]`); only `#[model_unfused]` emits
+//! the raw per-op sequence.
+//!
 //! The emitter runs at **compile time of the consumer crate** (host-side,
 //! inside the proc-macro).  All device-side math is precomputed here and
 //! emitted as integer consts — the generated code contains no `f32`/`f64`
@@ -161,10 +176,7 @@ fn emit_model_with_options(
         return Err("model subgraph[0] has no tensors".into());
     }
     let ops = model.ops();
-    let plan = match schedule {
-        Some(s) => Some(fused_plan(model, s, ops.len(), tensors.len(), force_t2)),
-        None => None,
-    };
+    let plan = schedule.map(|s| fused_plan(model, s, ops.len(), tensors.len(), force_t2));
     let inputs = model.inputs();
     let outputs = model.outputs();
     if inputs.is_empty() {
