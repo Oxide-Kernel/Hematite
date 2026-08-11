@@ -331,6 +331,21 @@ fn emit_model_with_options(
     // receiver); models without composed groups keep the `&self` receiver so
     // existing call sites (non-`mut` bindings) compile unchanged.
     let composed = plan.as_ref().is_some_and(|p| p.anchor_group.iter().any(|g| g.is_some()));
+
+    // T4.3 — the `fused-groups` header doc (a `#[doc = ...]` attribute — the
+    // only comment form a proc-macro TokenStream can carry; plain `//` text
+    // is stripped at tokenization).  Gated on `composed`: a zero-composed
+    // model's fused emission must stay byte-identical to the per-op
+    // emission, so no header is emitted for it.
+    let fused_groups_attr: Option<TokenStream> = if composed {
+        let plan = plan.as_ref().expect("composed implies a plan");
+        let schedule = schedule.expect("composed implies a schedule");
+        let doc = fused_groups_summary(plan, schedule);
+        Some(quote!(#[doc = #doc]))
+    } else {
+        None
+    };
+
     let receiver = if composed { quote!(&mut self) } else { quote!(&self) };
     let backend_bind = if calls.is_empty() {
         quote! { let _ = &self.backend; }
@@ -347,6 +362,7 @@ fn emit_model_with_options(
         /// implementation (which extends [`::hematite_core::KernelBackend`]);
         /// the straight-line op sequence dispatches through it, with fused
         /// groups going through the composed `fused_*` entry points.
+        #fused_groups_attr
         pub struct Model<B> {
             backend: B,
         }
@@ -457,6 +473,32 @@ fn single_op_group(index: usize, op: &ParsedOp<'_>) -> FusedGroup {
 // `selector::select_kernel`), so a composed call is never emitted when its
 // composed SIMD path cannot engage.
 
+// T4.3 — dispatch model (compile-time rule tier; autotuning OUT of scope).
+//
+// The emitted composed calls are **shape-typed by construction**: the
+// selector verdict knows every tensor shape at macro time, so each
+// `fused_*` call site carries its shapes as a named per-group const (the
+// `*_SHAPES_*` consts in the `emit_fused_*` fns below) routed into the
+// params struct.  This mirrors the spec.rs `Prepared*` precedent
+// (bench-only today): `PreparedConv1x1` & co. carry the shapes in the
+// `&'static Conv2DParams` consts a shape-specialized dispatch keys off —
+// the composed calls keep the same contract, minus the runtime handle
+// (the trait signatures are T2.1 and stay untouched).
+//
+// The selection model mirrors the TFLM pointwise-vs-std-style split:
+// TFLM picks between the shape-specialized pointwise kernels and the
+// general std-dispatch path with per-call runtime checks; here the same
+// split is resolved statically — `selector::select_kernel` runs ONCE at
+// macro expansion and the emitted code contains exactly the selected
+// tier (a composed call is emitted only when the compile-time mirror
+// `crate::eligibility` says the composed SIMD path engages).  The design
+// is JAX/XLA-informed in that it is **rule-tier only**: XLA-style
+// autotuning (empirical per-shape kernel selection driven by a benchmark
+// database) is explicitly OUT of scope and recorded as a follow-up — the
+// rule tier is the deterministic, bit-exact prerequisite an autotuner
+// would later ride on, and nothing in the generated code depends on
+// runtime measurement.
+
 /// Per-op / per-tensor decisions derived from the schedule once per model.
 struct FusedPlan {
     /// Op index → group index in `FusedSchedule::groups` (composed groups
@@ -499,6 +541,82 @@ fn fused_plan(
         }
     }
     FusedPlan { anchor_group, absorbed, eliminated, selections }
+}
+
+/// T4.3 — the `fused-groups` header doc text for the emitted model wrapper.
+///
+/// Summarizes the T4.2 rule-tier selector verdict per group: which groups
+/// fuse into ONE composed `fused_*` call, which fell back to per-op and why
+/// (the mirror-gate reasons `select_kernel` already computed).  The header
+/// line carries the W0-profile numbers (SIMD-eligible counts) so the
+/// emitted code is directly checkable against
+/// `local-notes/evidence/composed-kernels/fused-profile.md`; per-group lines cover
+/// every composed group plus every composed-candidate group the mirror left
+/// per-op (the interesting fallbacks), and the remaining plain per-op
+/// groups collapse to one aggregate line.  Emitted ONLY when the model has
+/// ≥1 composed group — a zero-composed model's fused emission must stay
+/// byte-identical to the per-op emission, so the header is gated on
+/// `composed` by the caller.
+fn fused_groups_summary(plan: &FusedPlan, schedule: &FusedSchedule) -> String {
+    let selections = &plan.selections;
+    let total = schedule.groups.len();
+    let composed = selections
+        .iter()
+        .filter(|s| s.kernel != GroupSelection::PerOp)
+        .count();
+    let simd = selections
+        .iter()
+        .filter(|s| s.simd == selector::SimdEst::Simd)
+        .count();
+    let per_op = total - composed;
+
+    // Composed-kind tally for the header line ("10 fused_conv2d", or a
+    // "3 fused_conv2d, 2 fused_elementwise_chain" mix).
+    let mut kind_counts: Vec<(&'static str, usize)> = Vec::new();
+    for sel in selections.iter().filter(|s| s.kernel != GroupSelection::PerOp) {
+        let label = match sel.kernel {
+            GroupSelection::Composed(ComposedKind::Conv) => "fused_conv2d",
+            GroupSelection::Composed(ComposedKind::Chain) => "fused_elementwise_chain",
+            GroupSelection::Composed(ComposedKind::PoolFold) => "fused_pool_with_fold",
+            GroupSelection::PerOp => unreachable!("filtered above"),
+        };
+        match kind_counts.iter_mut().find(|(l, _)| *l == label) {
+            Some((_, n)) => *n += 1,
+            None => kind_counts.push((label, 1)),
+        }
+    }
+    let kinds = kind_counts
+        .iter()
+        .map(|(l, n)| format!("{n} {l}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut lines = vec![format!(
+        "fused-groups (T4.3 rule-tier dispatch): {total} groups - {composed} composed ({kinds}), {per_op} per-op; SIMD-eligible {simd}/{total} (W0 profile)"
+    )];
+    let mut plain_per_op = 0usize;
+    for (gi, (g, sel)) in schedule.groups.iter().zip(selections.iter()).enumerate() {
+        let tier = match sel.kernel {
+            GroupSelection::Composed(ComposedKind::Conv) => "fused_conv2d",
+            GroupSelection::Composed(ComposedKind::Chain) => "fused_elementwise_chain",
+            GroupSelection::Composed(ComposedKind::PoolFold) => "fused_pool_with_fold",
+            GroupSelection::PerOp => "per-op",
+        };
+        if sel.kernel != GroupSelection::PerOp || selector::has_composed_candidate(g) {
+            lines.push(format!(
+                "g{gi} (anchor op {}) {tier} - {}",
+                g.anchor_op_index, sel.reason
+            ));
+        } else {
+            plain_per_op += 1;
+        }
+    }
+    if plain_per_op > 0 {
+        lines.push(format!(
+            "remaining {plain_per_op} groups: plain per-op (no composed pattern) - per-group table: local-notes/evidence/composed-kernels/selector-output.md"
+        ));
+    }
+    lines.join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -2274,10 +2392,31 @@ fn emit_fused_conv(
     let conv_shift = &conv.shift;
     let conv_weight = &conv.weight;
     let conv_bias = &conv.bias;
+    // T4.3 — shape-typed composed call: the selector verdict knows the
+    // shapes at macro time, so they are emitted as a named tuple const and
+    // routed into the params via struct-update on the anchor's per-op const
+    // (mirrors the spec.rs `Prepared*` precedent of carrying the shapes a
+    // shape-specialized dispatch keys off; the per-op const stays untouched).
+    let shapes_name =
+        Ident::new(&format!("FUSED_CONV_SHAPES_{i}"), proc_macro2::Span::call_site());
+    let in_lit = arr4(input_raw);
+    let filter_lit = arr4(filter_raw);
+    let out_lit = arr4(output_raw);
+    let shapes_c = quote! {
+        /// T4.3 — composed `fused_conv2d` shape consts `(input, filter,
+        /// output)` (NHWC / OHWI) for the group at op #{i}.
+        const #shapes_name: ([i32; 4], [i32; 4], [i32; 4]) =
+            (#in_lit, #filter_lit, #out_lit);
+    };
     let p = Ident::new(&format!("FUSED_CONV_PARAMS_{i}"), proc_macro2::Span::call_site());
     let call = quote! {
         let #p = ::hematite_core::op_params::FusedConvParams {
-            conv: #conv_params,
+            conv: ::hematite_core::op_params::Conv2DParams {
+                input_shape: #shapes_name.0,
+                filter_shape: #shapes_name.1,
+                output_shape: #shapes_name.2,
+                ..#conv_params
+            },
             output_scale: #out_scale,
             output_zero_point: #out_zp,
             output_multiplier_per_channel: &#conv_mult,
@@ -2295,8 +2434,10 @@ fn emit_fused_conv(
         };
         backend.fused_conv2d(#src, &#conv_weight.0, &#conv_bias, &#p, #dst, scratch)?;
     };
+    let mut consts = conv.em.consts;
+    consts.push(shapes_c);
     Ok(OpEmission {
-        consts: conv.em.consts,
+        consts,
         call,
         scratch: fused_conv2d_scratch_need_codegen(
             filter_raw[1],
@@ -2455,10 +2596,25 @@ fn emit_fused_chain(
     }
     let src = src_expr(ctx, storage, in1_t as usize)?;
     let dst = dst_expr(ctx, storage, group.output_tensor as usize)?;
+    // T4.3 — shape-typed composed call: chain shapes + flat element count
+    // as a named tuple const (NHWC-padded per `shape4`), `num_elements`
+    // routed through it at the call site.
+    let shapes_name = Ident::new(&format!("CHAIN_SHAPES_{i}"), proc_macro2::Span::call_site());
+    let in1_lit = arr4(shape4(&input1.shape)?);
+    let in2_lit = arr4(shape4(&input2.shape)?);
+    let out_lit = arr4(shape4(&output.shape)?);
+    let shapes_c = quote! {
+        /// T4.3 — composed `fused_elementwise_chain` shape consts
+        /// `(input1, input2, output, num_elements)` (NHWC-padded) for the
+        /// group at op #{i}.
+        const #shapes_name: ([i32; 4], [i32; 4], [i32; 4], i32) =
+            (#in1_lit, #in2_lit, #out_lit, #num_elements);
+    };
+    consts.push(shapes_c);
     let p = Ident::new(&format!("CHAIN_PARAMS_{i}"), proc_macro2::Span::call_site());
     let call = quote! {
         let #p = ::hematite_core::op_params::ElementwiseChainParams {
-            num_elements: #num_elements,
+            num_elements: #shapes_name.3,
             steps: &[ #(#steps),* ],
         };
         backend.fused_elementwise_chain(#src, &#p, #dst)?;
@@ -2564,6 +2720,21 @@ fn emit_fused_pool_fold(
 
     let src = src_expr(ctx, storage, fold.folded_input_tensor as usize)?;
     let dst = dst_expr(ctx, storage, group.output_tensor as usize)?;
+    // T4.3 — shape-typed composed call: fold input + pool output shapes and
+    // the fold's flat element count as a named tuple const; `num_elements`
+    // routed through it at the call site.
+    let pool_out_t = tensor_at(model.tensors(), group.output_tensor)?;
+    let shapes_name =
+        Ident::new(&format!("POOL_FOLD_SHAPES_{i}"), proc_macro2::Span::call_site());
+    let fold_in_lit = arr4(shape4(&in1.shape)?);
+    let pool_out_lit = arr4(shape4(&pool_out_t.shape)?);
+    let shapes_c = quote! {
+        /// T4.3 — composed `fused_pool_with_fold` shape consts
+        /// `(fold input, pool output, num_elements)` (NHWC) for the group
+        /// at op #{i}.
+        const #shapes_name: ([i32; 4], [i32; 4], i32) =
+            (#fold_in_lit, #pool_out_lit, #num_elements);
+    };
     let p = Ident::new(&format!("FUSED_POOL_PARAMS_{i}"), proc_macro2::Span::call_site());
     let call = quote! {
         let #p = ::hematite_core::op_params::FoldedPoolParams {
@@ -2583,7 +2754,7 @@ fn emit_fused_pool_fold(
                 input1_shift: #q_i1s,
                 input2_multiplier: #q_i2m,
                 input2_shift: #q_i2s,
-                num_elements: #num_elements,
+                num_elements: #shapes_name.2,
             }),
             activation: ::hematite_core::op_params::ActivationEpilogueParams {
                 kind: ::hematite_core::op_params::ComposedActivation::None,
@@ -2599,6 +2770,7 @@ fn emit_fused_pool_fold(
     };
     let mut consts = pool.consts;
     consts.extend(operand_consts);
+    consts.push(shapes_c);
     Ok(OpEmission {
         consts,
         call,
@@ -3050,6 +3222,71 @@ mod tests {
         assert!(!unfused_s.contains("backend.fused_conv2d("));
         assert!(!fused_s.contains("unsafe"), "generated code must be unsafe-free");
         assert!(!unfused_s.contains("unsafe"), "generated code must be unsafe-free");
+    }
+
+    /// T4.3 — the emitted mv2 fused wrapper carries the `fused-groups`
+    /// header matching the W0 profile (74 groups, 10 composed fused_conv2d,
+    /// 64 per-op, 53/74 SIMD-eligible) and the composed calls are
+    /// shape-typed: one `FUSED_CONV_SHAPES_*` const per composed group,
+    /// routed into the `FusedConvParams` conv via struct-update on the
+    /// anchor's per-op const.
+    #[test]
+    fn fused_groups_header_matches_w0_profile() {
+        let model = flatbuffer::parse(MOBILENET_V2_TFLITE).expect("mv2 parses");
+        let schedule = crate::optimize::fusion::fuse(&model);
+        let fused = emit_model_fused(&model, &schedule, true).expect("mv2 fused emits");
+        let s = fused.to_string();
+        // The header lives inside ONE #[doc = "..."] string literal — the
+        // literal content is verbatim in to_string() (only inter-token
+        // spacing is inserted), so assert on the un-stripped form.
+        assert!(
+            s.contains(
+                "fused-groups (T4.3 rule-tier dispatch): 74 groups - 10 composed (10 fused_conv2d), 64 per-op; SIMD-eligible 53/74 (W0 profile)"
+            ),
+            "fused-groups header must match the W0 profile: {s}"
+        );
+        // Per-group verdict lines: 10 composed groups, each with the
+        // selector's why.
+        assert_eq!(
+            s.matches("fused_conv2d - ").count(),
+            10,
+            "one verdict line per composed group: {s}"
+        );
+        assert!(
+            s.contains("remaining 64 groups: plain per-op (no composed pattern)"),
+            "aggregate per-op line missing: {s}"
+        );
+        // Shape-typed composed calls: 10 shape consts, each referenced
+        // through the FusedConvParams conv struct-update.
+        let flat: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(flat.matches("constFUSED_CONV_SHAPES_").count(), 10);
+        assert_eq!(flat.matches("FUSED_CONV_SHAPES_").count(), 40, "10 decls + 30 refs");
+        assert_eq!(flat.matches("..CONV2D_PARAMS_").count(), 10, "conv struct-update per group");
+    }
+
+    /// T4.3 — models with zero composed groups gain NO fused-groups header:
+    /// their fused emission is byte-identical to per-op (the
+    /// `fused_emission_byte_identical_when_no_composed_groups` gate covers
+    /// that end-to-end); this asserts the doc marker itself is absent.
+    #[test]
+    fn no_fused_groups_header_when_zero_composed() {
+        for (name, bytes) in [
+            ("sine", SINE_TFLITE),
+            ("hello_world", HELLO_WORLD_TFLITE),
+            ("kws", KWS_TFLITE),
+            ("anomaly_detect", ANOMALY_TFLITE),
+            ("person_detect", PERSON_DETECT_TFLITE),
+        ] {
+            let model = flatbuffer::parse(bytes).unwrap_or_else(|e| panic!("{name}: parse: {e}"));
+            let schedule = crate::optimize::fusion::fuse(&model);
+            let fused = emit_model_fused(&model, &schedule, true)
+                .unwrap_or_else(|e| panic!("{name}: fused emit: {e}"))
+                .to_string();
+            assert!(
+                !fused.contains("fused-groups"),
+                "{name}: zero-composed model must not gain the fused-groups header"
+            );
+        }
     }
 
     #[test]
