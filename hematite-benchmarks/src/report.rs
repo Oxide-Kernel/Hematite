@@ -35,11 +35,10 @@ pub type SpeedupX100 = u64;
 /// `baseline_cycles` is the comparison basis (our scalar ref, or a competitor
 /// cycle count); `measured_cycles` is the s3 kernel / model.  Integer math.
 pub fn speedup_x100(baseline_cycles: u64, measured_cycles: u64) -> SpeedupX100 {
-    if measured_cycles == 0 {
-        0
-    } else {
-        baseline_cycles.saturating_mul(100) / measured_cycles
-    }
+    baseline_cycles
+        .saturating_mul(100)
+        .checked_div(measured_cycles)
+        .unwrap_or(0)
 }
 
 /// One speedup column of a report row.

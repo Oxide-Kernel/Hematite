@@ -124,6 +124,56 @@ fn hard_swish_golden() {
     assert_bit_exact(&output, &hard_swish_fixture::EXPECTED_OUTPUT, "hard_swish_golden");
 }
 
+// ── Wave 2 (simd-zoo-hardening todo 6, Metis F14): relu6 vs hematite-ref ────
+
+/// Deterministic LCG-based `i8` pattern (same constants as the benchmark
+/// suite's `make_pattern`) — full int8 range, no std, reproducible.
+const fn lcg_i8<const N: usize>(seed: u32) -> [i8; N] {
+    let mut out = [0i8; N];
+    let mut x = seed;
+    let mut i = 0;
+    while i < N {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        out[i] = (x >> 16) as i8;
+        i += 1;
+    }
+    out
+}
+
+/// Runs relu6 through the PUBLIC s3 activation path and asserts bit-equality
+/// against the independent `hematite-ref` kernel on an LCG input buffer.
+///
+/// Host run exercises the scalar fallback path; on the device the same public
+/// entry point dispatches SIMD when the input is 16-byte aligned (the
+/// on-device SIMD leg is exercised by the simd_validation suite).
+#[test]
+fn relu6_golden_simd() {
+    const N: usize = 256;
+    let input = lcg_i8::<N>(0xCAFE_BEEF);
+    let params = activation_params_from_fixture!(relu6_fixture);
+    let mut s3_out = [0i8; N];
+    let mut ref_out = [0i8; N];
+
+    activations::relu6(
+        &input,
+        &params,
+        &mut s3_out,
+        &mut [],
+        relu6_fixture::QUANTIZED_SIX,
+    )
+    .expect("s3 relu6 kernel returned Err");
+    hematite_ref::activation::relu6(
+        &input,
+        &params,
+        &mut ref_out,
+        &mut [],
+        relu6_fixture::QUANTIZED_SIX,
+    )
+    .expect("ref relu6 kernel returned Err");
+
+    assert_bit_exact(&s3_out, &ref_out, "relu6_golden_simd");
+}
+
 // ── Leg (a) + (c): Device-only SIMD tests (cfg-gated) ───────────────────────
 
 #[cfg(target_arch = "xtensa")]
@@ -131,8 +181,4 @@ mod simd_tests {
     #[test]
     #[ignore = "Phase 5 (T5.3): requires real device"]
     fn relu_golden_simd() {}
-
-    #[test]
-    #[ignore = "Phase 5 (T5.3): requires real device"]
-    fn relu6_golden_simd() {}
 }

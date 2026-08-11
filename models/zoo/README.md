@@ -30,17 +30,22 @@ same op families; see `DEFERRED_MODELS.md` for the per-family substitution table
 
 | Zoo family (plan name) | Model dir | `.tflite` | Ops exercised | Bit-exact |
 |---|---|---|---|---|
-| `person_detect_v2` | `person_detect_vww/` | person_detect_int8.tflite (VWW, 96²) | conv, depthwise, avgpool, reshape, fc, softmax | ⚠️ compiled, not bit-exact |
+| `person_detect_v2` | `person_detect_vww/` | person_detect_int8.tflite (VWW, 96²) | conv, depthwise, avgpool, reshape, fc, softmax | ✅ bit-exact (todo 11, fnv1a 0x6962079d) |
 | `keyword_spotting_v1` | `keyword_spotting/` | kws_micro_speech_int8.tflite | reshape, depthwise, fc, softmax | ✅ bit-exact |
-| `imagenet_cls` / `mobilenetv2_cls` | `mobilenetv2_cls/` | mobilenet_v2_1.0_224_int8.tflite | transpose, pad, conv, depthwise, add, mean, reshape, fc, softmax | ⚠️ compiled, not bit-exact |
-| `anomaly_detect_v2` | `anomaly_detect/` | anomaly_detect_int8.tflite (MLPerf AD01 AE) | fc ×10 | ✅ bit-exact |
+| `imagenet_cls` / `mobilenetv2_cls` | `mobilenetv2_cls/` | mobilenet_v2_1.0_224_int8.tflite | transpose, pad, conv, depthwise, add, mean, reshape, fc, softmax | ⚠️ compiled, not bit-exact (PAD fill, 984/1000) |
+| `anomaly_detect_v2` | `anomaly_detect/` | anomaly_detect_int8.tflite (MLPerf AD01 AE) | fc ×10 | ⚠️ compiled, not bit-exact (210/640 ±1) |
 | (sine regression) | `sine_regression/` | hello_world_int8.tflite | fc ×3 | ✅ bit-exact |
 
 Each dir has its own `README.md` with per-file SHA256, source URL, and the
 substitution rationale. **The model goldens in
 `hematite-tests/goldens/models/*.rs` are captured from a real executed
-ai-edge-litert 2.1.6 interpreter** (`tools/generate_goldens/zoo/run_model.py`),
-not from hand computation.
+interpreter, not hand computation**: `person_detect`, `kws_micro_speech`,
+`hello_world` from ai-edge-litert 2.1.6
+(`tools/generate_goldens/zoo/run_model.py`); `mobilenet_v2` and
+`anomaly_detect` regenerated (todo 10) from EXECUTED tflite-micro at the
+pinned SHA `18b9e6f2a8c5a9518e588f59c2ba16ef7ef9d551` (`tools/tflm-goldens`
+host harness); `person_detect`'s golden is hash-identical between the two
+runtimes.
 
 ## ⚠️ Format finding (esp-dl zoo — unchanged)
 
@@ -55,18 +60,19 @@ substituted the 5 public int8 `.tflite` models above (full accounting in
 ## ⚠️ Bit-exactness status of model-level tests (T5.2)
 
 `cargo test -p hematite-tests -- models` asserts **6 model-level tests**:
-4 models **bit-exact** vs their executed-TFLite golden (sine smoke,
-hello_world, kws_micro_speech, anomaly_detect) + 2 models that **compile and
-execute** through `#[model]` but are **NOT asserted bit-exact**
-(person_detect_vww, mobilenet_v2). The 2 non-bit-exact models diverge at
-rounding boundaries where the hematite kernels (TFLM single-rounding
-`MultiplyByQuantizedMultiplier`) differ ±1 from the host ai-edge-litert
-reference kernels (double-rounding), and at their softmax where the LiteRT int8
-softmax algorithm differs from the TFLM reference on wide-dynamic-range logits.
-These are kernel-semantics differences in `hematite-ref` (owned by the kernel
-workstream), not emitter/parser gaps — the emitter compiles all 6 models and
-matches the interpreter bit-exactly through 14 consecutive conv/depthwise ops
-on person_detect. Fix path documented in `DEFERRED_MODELS.md`.
+4 models **bit-exact** vs their executed goldens (sine smoke, hello_world,
+kws_micro_speech, person_detect — fnv1a 0x6962079d, upgraded by todo 11) + 2
+models that **compile and execute** through `#[model]` but are **NOT asserted
+bit-exact** (anomaly_detect, mobilenet_v2). The residuals are fully
+characterized against the EXECUTED-TFLM goldens (todo 10 regeneration + todo
+11 re-verification): anomaly_detect differs on 210/640 elements by exactly ±1
+(gemmlowp double-rounding vs hematite single-rounding
+`MultiplyByQuantizedMultiplier`); mobilenet_v2 differs on 984/1000 elements,
+dominated by the PAD zero-fill vs TFLM zero-point-fill deviation (890
+elements, §7 of DEFERRED_MODELS.md) plus the same rounding class (94
+elements). These are kernel-semantics/params differences in
+`hematite-ref`/`PadParams` (owned by the kernel workstream), not
+emitter/parser gaps. Fix paths documented in `DEFERRED_MODELS.md`.
 
 ## Regenerating this directory
 

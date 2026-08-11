@@ -54,8 +54,16 @@
 //! consumer's expected weight rank; lossy or layout-changing permutations are
 //! never folded.
 //
-// Dead-code warnings are expected at T4.2c — the T4.1 emitter wiring task
-// consumes these descriptors.
+// ## Wiring status (T4.2 — partial)
+//
+// The pass itself is still NOT threaded into emission: `generate.rs` never
+// calls it and `plan_arena` plans from the parsed op list directly.  What
+// landed is the repad precedent — `selector::input_staging_decision`
+// (T4.2) applies this module's repad logic (`::220-229`) to stage the
+// model's graph INPUT into a 16B-aligned intermediate when the first
+// emitted kernel is SIMD-eligible.  The descriptors below are exercised by
+// this module's unit tests; the seam for full pad16/transpose-fold
+// integration into the emitter remains open (plan T4.2c).
 #![allow(dead_code)]
 
 use crate::flatbuffer::{ParsedModel, ParsedOp, ParsedOptions, ParsedTensor};
@@ -438,7 +446,7 @@ mod tests {
             }
 
             pub(super) fn align4(&mut self) {
-                while self.bytes.len() % 4 != 0 {
+                while !self.bytes.len().is_multiple_of(4) {
                     self.bytes.push(0);
                 }
             }

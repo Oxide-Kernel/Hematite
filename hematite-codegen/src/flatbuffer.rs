@@ -46,7 +46,7 @@ use std::fmt;
 
 /// A parsed TFLite model, borrowing from the original flatbuffer bytes.
 #[derive(Clone, Debug)]
-pub struct ParsedModel<'a> {
+pub(crate) struct ParsedModel<'a> {
     bytes: &'a [u8],
     subgraph_count: u32,
     inputs: Vec<u32>,
@@ -58,43 +58,43 @@ pub struct ParsedModel<'a> {
 
 impl<'a> ParsedModel<'a> {
     /// Number of subgraphs (subgraph[0] is parsed).
-    pub fn subgraph_count(&self) -> u32 {
+    pub(crate) fn subgraph_count(&self) -> u32 {
         self.subgraph_count
     }
 
     /// Tensor indices fed into subgraph[0] (its `inputs` vector).
-    pub fn inputs(&self) -> &[u32] {
+    pub(crate) fn inputs(&self) -> &[u32] {
         &self.inputs
     }
 
     /// Tensor indices produced by subgraph[0] (its `outputs` vector).
-    pub fn outputs(&self) -> &[u32] {
+    pub(crate) fn outputs(&self) -> &[u32] {
         &self.outputs
     }
 
     /// All tensors of subgraph[0].
-    pub fn tensors(&self) -> &[ParsedTensor<'a>] {
+    pub(crate) fn tensors(&self) -> &[ParsedTensor<'a>] {
         &self.tensors
     }
 
     /// All operators of subgraph[0], in execution order.
-    pub fn ops(&self) -> &[ParsedOp<'a>] {
+    pub(crate) fn ops(&self) -> &[ParsedOp<'a>] {
         &self.ops
     }
 
     /// All model buffers (index 0 is the empty sentinel).
-    pub fn buffers(&self) -> &[ParsedBuffer<'a>] {
+    pub(crate) fn buffers(&self) -> &[ParsedBuffer<'a>] {
         &self.buffers
     }
 
     /// Look up a tensor by index; `None` if out of range.
-    pub fn tensor_by_index(&self, index: usize) -> Option<&ParsedTensor<'a>> {
+    pub(crate) fn tensor_by_index(&self, index: usize) -> Option<&ParsedTensor<'a>> {
         self.tensors.get(index)
     }
 
     /// Raw bytes backing `tensor`'s buffer; `None` for empty buffers
     /// (including the buffer-0 sentinel used by intermediates).
-    pub fn buffer_data(&self, tensor: &ParsedTensor<'a>) -> Option<&'a [u8]> {
+    pub(crate) fn buffer_data(&self, tensor: &ParsedTensor<'a>) -> Option<&'a [u8]> {
         self.buffers
             .get(tensor.buffer_index as usize)
             .and_then(|b| if b.data.is_empty() { None } else { Some(b.data) })
@@ -103,22 +103,22 @@ impl<'a> ParsedModel<'a> {
 
 /// A single operator in subgraph[0], in execution order.
 #[derive(Clone, Debug)]
-pub struct ParsedOp<'a> {
+pub(crate) struct ParsedOp<'a> {
     /// Index into the model's `operator_codes` table.
-    pub opcode_index: u32,
+    pub(crate) opcode_index: u32,
     /// Resolved `BuiltinOperator` code (via `operator_codes`); `-1` for
     /// custom operators whose code could not be resolved.  Extended codes
     /// (≥ 127) come from the `OperatorCode.builtin_code` int32 field.
-    pub builtin_code: i32,
+    pub(crate) builtin_code: i32,
     /// Input tensor indices (optional inputs are `u32::MAX`).
-    pub inputs: Vec<u32>,
+    pub(crate) inputs: Vec<u32>,
     /// Output tensor indices.
-    pub outputs: Vec<u32>,
+    pub(crate) outputs: Vec<u32>,
     /// Decoded `BuiltinOptions` union value; `None` when the union
     /// discriminator is `NONE` and no variant is synthesized from the code.
-    pub options: Option<ParsedOptions>,
+    pub(crate) options: Option<ParsedOptions>,
     /// Raw `custom_options` byte vector (preserved verbatim, zero-copy).
-    pub custom_options: &'a [u8],
+    pub(crate) custom_options: &'a [u8],
 }
 
 /// Operator-specific options decoded from the `BuiltinOptions` union.
@@ -127,7 +127,7 @@ pub struct ParsedOp<'a> {
 /// across schema revisions); the union discriminator only gates whether an
 /// options table is present.
 #[derive(Clone, Debug)]
-pub enum ParsedOptions {
+pub(crate) enum ParsedOptions {
     /// `Conv2DOptions` — `padding`, `stride_w/h`, `dilation_w/h_factor`,
     /// `fused_activation_function`.
     Conv2D {
@@ -199,17 +199,17 @@ pub enum ParsedOptions {
 
 /// A tensor of subgraph[0].
 #[derive(Clone, Debug)]
-pub struct ParsedTensor<'a> {
-    pub name: &'a str,
-    pub shape: Vec<i32>,
-    pub tensor_type: TensorType,
-    pub quant: Option<QuantInfo>,
-    pub buffer_index: u32,
+pub(crate) struct ParsedTensor<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) shape: Vec<i32>,
+    pub(crate) tensor_type: TensorType,
+    pub(crate) quant: Option<QuantInfo>,
+    pub(crate) buffer_index: u32,
 }
 
 /// TFLite `TensorType` enum values (v23.1-era numbering — `INT8 = 9`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TensorType {
+pub(crate) enum TensorType {
     Float32,
     Float16,
     Int32,
@@ -233,7 +233,7 @@ pub enum TensorType {
 }
 
 impl TensorType {
-    pub fn from_byte(b: i8) -> Self {
+    pub(crate) fn from_byte(b: i8) -> Self {
         match b {
             0 => Self::Float32,
             1 => Self::Float16,
@@ -260,32 +260,32 @@ impl TensorType {
 
 /// Per-tensor or per-channel quantization of a [`ParsedTensor`].
 #[derive(Clone, Debug)]
-pub struct QuantInfo {
+pub(crate) struct QuantInfo {
     /// First scale (per-tensor scale, or channel-0 scale for per-channel).
-    pub scale: f32,
+    pub(crate) scale: f32,
     /// First zero point.
-    pub zero_point: i64,
+    pub(crate) zero_point: i64,
     /// Present when the `scale`/`zero_point` vectors have length > 1.
-    pub per_channel: Option<PerChannel>,
+    pub(crate) per_channel: Option<PerChannel>,
 }
 
 /// Per-channel quantization parameters.
 #[derive(Clone, Debug)]
-pub struct PerChannel {
-    pub scales: Vec<f32>,
-    pub zero_points: Vec<i64>,
-    pub quantized_dimension: usize,
+pub(crate) struct PerChannel {
+    pub(crate) scales: Vec<f32>,
+    pub(crate) zero_points: Vec<i64>,
+    pub(crate) quantized_dimension: usize,
 }
 
 /// A model buffer containing raw byte data (index 0 is the empty sentinel).
 #[derive(Clone, Debug)]
-pub struct ParsedBuffer<'a> {
-    pub data: &'a [u8],
+pub(crate) struct ParsedBuffer<'a> {
+    pub(crate) data: &'a [u8],
 }
 
 /// Error returned by [`parse`].
 #[derive(Clone, Debug)]
-pub enum ParseError {
+pub(crate) enum ParseError {
     TooShort,
     BadIdentifier,
     BadField { context: String },
@@ -342,7 +342,7 @@ fn i64_at(buf: &[u8], pos: usize) -> Option<i64> {
 
 /// Absolute position of `field_idx` within the table at `table_pos`, or
 /// `None` when the vtable is missing/truncated or the field slot is 0.
-pub fn table_field(buf: &[u8], table_pos: usize, field_idx: usize) -> Option<usize> {
+pub(crate) fn table_field(buf: &[u8], table_pos: usize, field_idx: usize) -> Option<usize> {
     let vtable_soff = i32_at(buf, table_pos)? as usize;
     let vtable_pos = table_pos.wrapping_sub(vtable_soff);
     let vt_len = u16_at(buf, vtable_pos)? as usize;
@@ -424,7 +424,7 @@ fn read_i64_vector(buf: &[u8], pos: usize) -> Option<Vec<i64>> {
 
 /// Parse a TFLite Model flatbuffer.  Zero-copy: buffer data are `&[u8]`
 /// views into the original `bytes` slice.
-pub fn parse(bytes: &[u8]) -> Result<ParsedModel<'_>, ParseError> {
+pub(crate) fn parse(bytes: &[u8]) -> Result<ParsedModel<'_>, ParseError> {
     if bytes.len() < 12 {
         return Err(ParseError::TooShort);
     }
@@ -612,8 +612,8 @@ fn parse_operators<'a>(
     Ok(out)
 }
 
-/// `pub` for test access.
-pub fn parse_buffers(
+/// `pub(crate)` for test access.
+pub(crate) fn parse_buffers(
     bytes: &[u8],
     buffers_off: usize,
 ) -> Result<Vec<ParsedBuffer<'_>>, ParseError> {
@@ -643,20 +643,20 @@ fn parse_buffers_inner<'a>(
 }
 
 /// Resolve a `quantization` union-adjacent field to a [`QuantInfo`].
-/// `pub` for test access.
-pub fn parse_quantization(bytes: &[u8], field_pos: usize) -> Option<QuantInfo> {
+/// `pub(crate)` for test access.
+pub(crate) fn parse_quantization(bytes: &[u8], field_pos: usize) -> Option<QuantInfo> {
     let q_pos = uoffset_at(bytes, field_pos)?;
     parse_quantization_table(bytes, q_pos)
 }
 
 /// Parse a `QuantizationParameters` table at the resolved table position.
-/// `pub` for test access.
+/// `pub(crate)` for test access.
 ///
 /// Vtable slot layout (schema.fbs `QuantizationParameters`):
 /// 0 min, 1 max, 2 scale, 3 zero_point, 4 details_type (union discriminator,
 /// auto-generated by the flatbuffers compiler), 5 details value, 6
 /// quantized_dimension.
-pub fn parse_quantization_table(bytes: &[u8], q_pos: usize) -> Option<QuantInfo> {
+pub(crate) fn parse_quantization_table(bytes: &[u8], q_pos: usize) -> Option<QuantInfo> {
     let scales = table_field(bytes, q_pos, 2).and_then(|p| read_f32_vector(bytes, p));
     let zero_points = table_field(bytes, q_pos, 3).and_then(|p| read_i64_vector(bytes, p));
     let quant_dim = table_field(bytes, q_pos, 6)
@@ -779,8 +779,8 @@ fn raw_table_bytes(bytes: &[u8], table_pos: usize) -> Vec<u8> {
     }
 }
 
-/// Decode a `Conv2DOptions` table at `table_pos`.  `pub` for tests.
-pub fn parse_conv2d_options(bytes: &[u8], t: usize) -> ParsedOptions {
+/// Decode a `Conv2DOptions` table at `table_pos`.  `pub(crate)` for tests.
+pub(crate) fn parse_conv2d_options(bytes: &[u8], t: usize) -> ParsedOptions {
     ParsedOptions::Conv2D {
         padding: table_field(bytes, t, 0).and_then(|p| i8_at(bytes, p)).unwrap_or(0),
         stride_w: table_field(bytes, t, 1).and_then(|p| i32_at(bytes, p)).unwrap_or(1),

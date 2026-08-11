@@ -13,6 +13,8 @@ drops (plan T5.2, B5 resolution).
 | `speaker_verification` | **Deferred (plan-specified)** | P4/S31-only, no S3 build (plan T5.2, recorded here for completeness) |
 | `pp_ocr_v6` (det/rec_s8/rec_s16) | **Deferred (plan-specified)** | P4-only (plan T5.2, recorded here for completeness) |
 | `motion_detect`, `color_detect` | **Out of scope by definition** | Algorithmic (no `.espdl`/`.tflite` artifact) — noted not tested (plan T5.2) |
+| `anomaly_ae` (substitution) | **⚠️ compile+execute, documented ±1 class** | 210/640 elements differ by exactly ±1 — gemmlowp double-rounding vs hematite single-rounding (§6). Reproduced identically on real silicon (run 1, 2026-08-11: `FAIL at idx 1: got=41 want=42`, s3==ref, fnv 0xf2a76cd6) |
+| `mobilenet_v2` (substitution) | **⚠️ compile+execute, PAD-fill class** | 984/1000 elements differ (890 PAD-fill, 94 rounding) — `PadParams` carries no pad-value/zero-point. **Phase 19 T5.3 decision: DEFER the plumbing** (T10 follow-up, pad-decision.md) (§7) |
 
 ## 1. ESP-DL models — format barrier (`.espdl`, not `.tflite`)
 
@@ -99,49 +101,56 @@ families table** (plan model → substitution → ops exercised → status):
 
 | Plan family (T5.2) | Substitution | Source | Ops | Status |
 |---|---|---|---|---|
-| `person_detect_v2` | `vww_96_int8.tflite` (VWW person detector) | mlcommons/tiny | conv, depthwise, avgpool, reshape, fc, softmax | compiled; not bit-exact |
+| `person_detect_v2` | `vww_96_int8.tflite` (VWW person detector) | mlcommons/tiny | conv, depthwise, avgpool, reshape, fc, softmax | ✅ **bit-exact** vs executed-TFLM golden (todo 11; fnv1a 0x6962079d) |
 | `keyword_spotting_v1` | `micro_speech_quantized.tflite` | tflite-micro @ pin | reshape, depthwise, fc, softmax | ✅ bit-exact |
-| `imagenet_cls` / `mobilenetv2_cls` | `mobilenet_v2_quantized_1x3x224x224.tflite` | tflite-micro @ pin (xtensa) | transpose, pad, conv, depthwise, add, mean, reshape, fc, softmax | compiled; not bit-exact |
-| `anomaly_detect_v2` | `ad01_int8.tflite` (MLPerf AD01 AE) | mlcommons/tiny | fc ×10 | ✅ bit-exact |
+| `imagenet_cls` / `mobilenetv2_cls` | `mobilenet_v2_quantized_1x3x224x224.tflite` | tflite-micro @ pin (xtensa) | transpose, pad, conv, depthwise, add, mean, reshape, fc, softmax | ⚠️ compiled, not bit-exact (PAD fill; 984/1000 deltas — §7) |
+| `anomaly_detect_v2` | `ad01_int8.tflite` (MLPerf AD01 AE) | mlcommons/tiny | fc ×10 | ⚠️ compiled, not bit-exact (210/640 ±1 double-rounding — §6) |
 | (sine regression) | `hello_world_int8.tflite` | tflite-micro @ pin | fc ×3 | ✅ bit-exact |
 
 All 5 have per-directory SHA256 provenance READMEs under `models/zoo/`.
-Goldens captured via the executed ai-edge-litert 2.1.6 interpreter
-(`tools/generate_goldens/zoo/run_model.py`).
+Goldens captured from executed interpreters: ai-edge-litert 2.1.6
+(`tools/generate_goldens/zoo/run_model.py`) for person_detect / kws /
+hello_world; regenerated (todo 10) from EXECUTED tflite-micro at the pinned
+SHA (`tools/tflm-goldens` harness) for mobilenet_v2 / anomaly_detect.
 
-## 6. Why two substitutions compile but are NOT bit-exact (T5.2 finding)
+## 6. Residual bit-exactness vs the EXECUTED-TFLM goldens (todo 10 regeneration + todo 11 re-verification)
 
-`person_detect_vww` and `mobilenet_v2` compile through `#[model]` and execute,
-but their outputs diverge from the executed-TFLite golden at kernel level.
-Root-caused (per-op chained comparison of every intermediate tensor against
-the interpreter at `BUILTIN_REF` — matches bit-exactly through 14 consecutive
-conv/depthwise ops on person_detect, then diverges):
+All five substitution models were re-verified (todo 11, host) against the
+goldens regenerated (todo 10) from EXECUTED tflite-micro at the pinned SHA
+`18b9e6f2a8c5a9518e588f59c2ba16ef7ef9d551` (`tools/tflm-goldens` host harness,
+reference kernels). Post-regeneration per-model status:
+
+| Model | Verdict | Evidence |
+|---|---|---|
+| `person_detect_vww` | ✅ **bit-exact** (upgraded from compile+execute) | output `[120, -120]` element-for-element == executed-TFLM golden; fnv1a `0x6962079d` == executed-TFLM harness checksum |
+| `anomaly_ae` | ⚠️ compile+execute (converted by todo 10) | 210/640 elements differ by exactly ±1 |
+| `mobilenet_v2` | ⚠️ compile+execute | 984/1000 elements differ (890 by \|d\|≥3, PAD-fill driven; 94 by ±1/±2, rounding) — §7 |
+| `kws_micro_v2`, `hello_world`, `sine` | ✅ bit-exact (unchanged) | — |
+
+The original T5.2 root-cause record (kept for history):
 
 1. **Requantization rounding**: the hematite kernels implement TFLM
    single-rounding `MultiplyByQuantizedMultiplier` (the 64-bit
-   `(x*mult + round) >> shift` form, `TFLITE_SINGLE_ROUNDING` path). The host
-   ai-edge-litert reference kernels use the **double-rounding** form
-   (`SaturatingRoundingDoublingHighMul` + `RoundingDivideByPOT`,
-   gemmlowp path). The two agree except at exact rounding boundaries, where
-   they differ by ±1 (observed: depthwise op15 on person_detect −95 vs −96;
-   FC 115 vs 114 on identical input).
-2. **Softmax**: the TFLM reference int8 softmax saturates wide-dynamic-range
-   logits to −128 (verified: TFLM semantics on person_detect's [115,−122]
-   logits give [127,−128] — exactly what hematite produces). The LiteRT
-   (ai-edge-litert) int8 softmax uses a different scaling and produces
-   [120,−120]. Algorithmic kernel difference, not a params/emitter gap.
+   `(x*mult + round) >> shift` form, `TFLITE_SINGLE_ROUNDING` path). The
+   executed-TFLM build at the pinned SHA uses the **double-rounding** form
+   (`SaturatingRoundingDoublingHighMul` + `RoundingDivideByPOT`, gemmlowp
+   path; `TFLITE_SINGLE_ROUNDING` is undefined in the micro build). The two
+   agree except at exact rounding boundaries, where they differ by ±1. This
+   is now the ONLY residual for `anomaly_detect` (210/640 elements, exactly
+   ±1) and the small (94/1000) rounding class of `mobilenet_v2`.
+2. **Softmax**: the T5.2 investigation found the TFLM reference int8 softmax
+   saturates wide-dynamic-range logits to −128 while LiteRT produces
+   [120,−120]. **Resolved by regeneration**: the EXECUTED TFLM at the pinned
+   SHA produces [120,−120] on person_detect's logits — matching both the
+   hematite kernels AND the LiteRT golden (hash-identical golden, fnv
+   0x6962079d) — so this divergence does NOT manifest and person_detect is
+   bit-exact (verified todo 11).
 
-**Why not fixed here**: both differences live in `hematite-ref` kernels
-(`MultiplyByQuantizedMultiplier` rounding + softmax), which are owned by the
-kernel workstream and explicitly out of scope for T5.2 (see `local-notes/plans/hematite-nn.md`
-MUST-NOT). The emitter/parser produced bit-exact parameter streams (verified
-op-by-op).
-
-**Fix path (kernel workstream)**: adopt the `TFLITE_SINGLE_ROUNDING`-consistent
-gemmlowp double-rounding `MultiplyByQuantizedMultiplier` to match host TFLite,
-OR build tflite-micro at the pinned SHA and capture model goldens from a real
-TFLM binary (the T5.0 remediation path in `tools/generate_goldens/README.md`).
-With either fix, all 6 models should assert bit-exact.
+**Why the two ⚠️ models are not fixed here**: the rounding difference lives in
+`hematite-ref` kernels (`MultiplyByQuantizedMultiplier`), owned by the kernel
+workstream and out of scope for this task (MUST-NOT: no kernel changes). The
+PAD-fill difference is a param-struct limitation (§7). The emitter/parser
+produced bit-exact parameter streams (verified op-by-op).
 
 ## 7. Emitter/parser gaps closed by T5.2 (for the record)
 
@@ -159,5 +168,58 @@ tested (`cargo test -p hematite-codegen` → 55 tests):
   the output shape when the options carry 0/−1 dims.
 
 **Note**: the mobilenet_v2 model's 18 PAD ops additionally expose a PAD
-kernel-semantics difference (LiteRT pads with the input zero point, the
-`pad_op` kernel fills raw 0) — kernel-owned, same fix path as section 6.
+kernel-semantics difference, now the DOMINANT residual vs the regenerated
+executed-TFLM golden (measured todo 11, element-wise on the final output):
+**984/1000** elements differ — 890 by |d| ≥ 3 (max 60), 94 by ±1/±2. Root
+cause: TFLM `pad.cc` @ pinned SHA fills `output_zero_point` (−14) ONLY when
+`constant_values == nullptr` (true for all 18 mv2 PADs); Hematite's
+`PadParams` carries no zero point and the trait `pad(src, params, dst)` has
+no pad-value arg, so ref + s3 fill raw 0. The zero-fill propagates through
+the conv chain and dominates the output; the ±1/±2 class is the §6 rounding
+divergence. The zero-fill was never a unilateral kernel choice — fixing it
+requires **param plumbing**: a pad-value / zero-point field on `PadParams`
+(hematite-core) + codegen emission, which is a documented follow-up (recorded
+in `hematite-s3/src/data_movement.rs` module doc + todo 25 evidence; NOT
+attempted in todo 11 — kernel/param code is out of scope). Both backends
+share the identical raw-0 fill, so the relative s3 == ref gate holds exactly.
+(An earlier 861/1000 estimate from todo 25 is superseded by this direct
+measurement.)
+
+## 8. Phase 19 (composed-kernels T5.3) — PAD plumbing decision + real-silicon confirmation
+
+### 8.1 PAD zero-point plumbing — DECISION: DEFER (T5.3, pad-decision.md)
+
+The pad-value/zero-point plumbing (`PadParams` field + codegen emission +
+both backends) is **deferred** and recorded as an explicit follow-up
+(**T10**, kernel workstream) — it is NOT implemented in this plan. Rationale
+(recorded in full in `local-notes/evidence/composed-kernels/pad-decision.md`):
+
+1. **PAD never fuses** (no fusion pattern covers it) — the composed-kernels
+   workstream neither emits nor transforms any PAD call, so the fused path
+   is orthogonal to the fill semantics.
+2. **A substitute gate already covers mv2's claim:** the T5.1 host harness
+   asserts fused==unfused element-equal + identical FNV-1a for mv2 (both
+   arms share the same raw-0 fill), which verifies the composed-param
+   derivation — the only thing this plan changes.
+3. **Deferral preserves the s3==ref identical-fill gate** — plumbing a zero
+   point through one backend only would break it; the full change must land
+   atomically with golden regeneration (T10).
+
+**Consequences (honest):** mv2 stays ⚠️ compiled-not-bit-exact vs the
+executed-TFLM golden (984/1000 deltas; 890 PAD-fill class, |d|≥3, max 60;
+94 rounding class) until T10 lands. "Bit-exact vs TFLM" must not be claimed
+for PAD-heavy models; only the relative ref↔s3, fused↔unfused claims hold.
+
+### 8.2 Real-silicon confirmation (run 1, 2026-08-11 17:34)
+
+The two ⚠️ models' divergences were re-confirmed on real silicon through the
+fused `Model::<S3Backend>` path (log `local-notes/evidence/composed-kernels/
+device-silicon-run1.log`):
+
+| Model | device run-1 result | consistent with |
+|---|---|---|
+| `anomaly_detect_int8` | `FAIL at idx 1: got=41 want=42` (fnv 0xf2a76cd6), **s3==ref (`ref_match=true`, golden_match=false)** | §6 documented ±1 double-rounding class — identical on device, QEMU and host; not a new divergence |
+| `mobilenet_v2_1.0_224_int8` | `SKIP reason=no-psram` (board probe `PSRAM: 0 bytes` re-confirmed) | §7 — model cannot run without PSRAM; host-side fused==unfused substitute gate holds (T5.1) |
+
+Both rows are recorded, never masked, and the relative gates (s3==ref /
+fused==unfused) are asserted and green.

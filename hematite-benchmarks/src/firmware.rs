@@ -113,9 +113,27 @@ macro_rules! firmware_log {
     }};
 }
 
-// Re-export so sibling device modules (e.g. model_validation) can log through
-// the same path (qemu→UART0, hardware→defmt).
-pub(crate) use firmware_log;
+/// Log one report line: UART0 ONLY (no defmt/RTT).
+///
+/// The validation sections (model_validation, simd_validation) use this
+/// instead of [`firmware_log`]: defmt-rtt's global logger is NOT reentrant
+/// across exceptions — an exception landing inside a defmt write window makes
+/// the exception handler's `defmt::panic!` hit `defmt logger taken
+/// reentrantly` (defmt-rtt-0.4.2 lib.rs:139) and mask the real root cause
+/// (task-5 evidence: the SIMD-correctness section died exactly that way on
+/// its first line).  UART0 direct-register writes are interrupt/exception
+/// safe, and RTT is unreadable on this board anyway (no JTAG probe — the
+/// USB-UART is the only evidence transport), so dropping defmt here loses
+/// nothing while eliminating the panic class.
+macro_rules! uart0_log {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        let _ = writeln!(crate::firmware::uart0::Uart0, $($arg)*);
+    }};
+}
+
+// Re-export so sibling device modules can log through the same path.
+pub(crate) use uart0_log;
 
 /// Display/Format adapter for `Option<u64>` so the same report row renders
 /// through both `core::fmt` (qemu UART path) and `defmt` (hardware RTT path).
@@ -219,7 +237,10 @@ pub struct EspAppDesc {
 use crate::guardrails::{verify_boot_profile, watchdog_disabled_policy, BootProfile, StackCanary};
 #[cfg(not(feature = "qemu"))]
 use crate::guardrails::assert_ccount_calibration;
-use crate::model_bench::{model_bench_specs, ModelBenchSpec};
+use crate::model_bench::{
+    carve_model_bufs, fill_input_pattern, model_bench_specs, passes_reference_bar,
+    run_model_bench, ModelBenchSpec,
+};
 use crate::report::{row_from_summary, ReportRow};
 use crate::spec::{
     carve_into, fill_pattern, kernel_specs, layout, run_kernel, run_ref_kernel, KernelSpec,
@@ -255,10 +276,119 @@ pub fn read_wall_ns_impl() -> u64 {
     0
 }
 
-/// Device panic handler — logs (defmt or UART-under-qemu) and halts.
+/// Exception-handler wrapper (activated by linking with
+/// `-Wl,--wrap=__user_exception`): receives (EXCCAUSE, save-frame pointer)
+/// from xtensa-lx-rt's vector trampoline and panics with the raw cause +
+/// registers, so the REAL exception lands on UART0 via the panic handler.
+/// esp-hal's own `__user_exception` is compiled with the defmt feature and
+/// writes the exception info to RTT only (invisible on this board), and its
+/// defmt write double-faults when the trap-frame pointer is corrupt —
+/// masking the original cause as "defmt logger taken reentrantly" (task-8
+/// finding). `#[no_mangle]` with no normal reference: inert without --wrap.
+#[cfg(target_arch = "xtensa")]
+#[unsafe(no_mangle)]
+unsafe extern "C" fn __wrap___user_exception(cause: u32, frame: *const u32) {
+    use core::fmt::Write;
+    let _ = writeln!(
+        crate::firmware::uart0::Uart0,
+        "EXCEPTION cause=0x{:08x} (EXCCAUSE {}):",
+        cause,
+        cause
+    );
+    // xtensa-lx-rt Context layout (no float-save-restore): [0] PC, [1] PS,
+    // [2] A0, [3] A1(SP), [4..19] A2..A15, [20] SAR, [21] EXCCAUSE,
+    // [22] EXCVADDR, [23] LBEG, [24] LEND, [25] LCOUNT.
+    // SAFETY: the vector passed a valid save-frame pointer (sp-based);
+    // reading 26 u32s is within the saved context.
+    for i in 0..26 {
+        let v = unsafe { frame.add(i).read() };
+        match i {
+            0 => writeln!(crate::firmware::uart0::Uart0, "  PC=0x{:08x}", v),
+            1 => writeln!(crate::firmware::uart0::Uart0, "  PS=0x{:08x}", v),
+            3 => writeln!(crate::firmware::uart0::Uart0, "  SP=0x{:08x}", v),
+            22 => writeln!(crate::firmware::uart0::Uart0, "  EXCVADDR=0x{:08x}", v),
+            2 | 21 | 23 | 24 | 25 => writeln!(crate::firmware::uart0::Uart0, "  r{:02}=0x{:08x}", i, v),
+            _ => write!(crate::firmware::uart0::Uart0, "  r{:02}=0x{:08x}", i, v),
+        }
+        .ok();
+        if i % 4 == 3 {
+            let _ = writeln!(crate::firmware::uart0::Uart0);
+        }
+    }
+    let _ = writeln!(crate::firmware::uart0::Uart0);
+    panic!("exception");
+}
+
+/// Device panic handler — logs (UART0 only, so a defmt encoder failure can
+/// never eat the panic info) and halts.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    firmware_log!("PANIC: {}", info);
+    use core::fmt::Write;
+    let _ = writeln!(crate::firmware::uart0::Uart0, "PANIC: {}", info);
+    // Mirror the defmt-RTT up-channel buffer to UART0: esp-hal's exception
+    // handler (compiled with the defmt feature) writes the exception frame
+    // (cause + trap frame, RZCOBS-encoded) to RTT before calling
+    // `__defmt_default_panic`, and RTT is unreadable on this board (no JTAG
+    // probe) — without the dump the real exception cause stays invisible
+    // behind the "explicit panic" tail (task-8 finding). The bytes decode
+    // offline: RZCOBS → varint format tag → args.
+    #[cfg(not(feature = "qemu"))]
+    {
+        #[repr(C)]
+        struct RttChannel {
+            name: *const u8,
+            buffer: *mut u8,
+            size: usize,
+            write: usize,
+            read: usize,
+            flags: usize,
+        }
+        #[repr(C)]
+        struct RttHeader {
+            id: [u8; 16],
+            max_up_channels: usize,
+            max_down_channels: usize,
+            up_channel: RttChannel,
+        }
+        // SAFETY: defmt-rtt's `_SEGGER_RTT` is a no_mangle static with this
+        // exact repr(C) layout (defmt-rtt-0.4.2 src/lib.rs + channel.rs);
+        // the panic path is single-threaded and the device is halted anyway.
+        unsafe {
+            extern "C" {
+                #[link_name = "_SEGGER_RTT"]
+                static SEGGER_RTT: RttHeader;
+            }
+            // The defmt RttEncoder.taken flag sits at SRAM_ARENA end + 4
+            // (linker layout; task-8 finding: an out-of-bounds write past the
+            // arena — e.g. the conv3x3 check's SIMD path — clobbers it to 1,
+            // which makes the next defmt acquire panic "taken reentrantly").
+            let arena_ptr = core::ptr::addr_of!(SRAM_ARENA) as usize;
+            let enc_taken = core::ptr::read_volatile((arena_ptr + 256 * 1024 + 4) as *const u8);
+            let _ = writeln!(
+                crate::firmware::uart0::Uart0,
+                "defmt RTT_ENCODER.taken = {} (arena end 0x{:08x})",
+                enc_taken,
+                arena_ptr + 256 * 1024
+            );
+            let ch = &SEGGER_RTT.up_channel;
+            let write = ch.write;
+            let size = ch.size.min(1024);
+            let n = write.min(size);
+            if !ch.buffer.is_null() && n > 0 {
+                let bytes = core::slice::from_raw_parts(ch.buffer, n);
+                let _ = write!(crate::firmware::uart0::Uart0, "RTT dump ({} bytes):", n);
+                for (i, b) in bytes.iter().enumerate() {
+                    if i % 16 == 0 {
+                        let _ = write!(crate::firmware::uart0::Uart0, "\n{:04x}: ", i);
+                    }
+                    let _ = write!(crate::firmware::uart0::Uart0, "{:02x} ", b);
+                }
+                let _ = writeln!(crate::firmware::uart0::Uart0);
+            } else {
+                let _ = writeln!(crate::firmware::uart0::Uart0, "RTT buffer empty");
+            }
+        }
+    }
     loop {}
 }
 
@@ -267,10 +397,59 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 /// 16-byte aligned so the TIE728 SIMD path's `input` pointer (the arena base,
 /// carve offset 0) satisfies the kernels' alignment gate — `[u8; N]` alone
 /// has alignment 1, which silently drops the bench rows to the scalar path.
+///
+/// `pub(crate)`: the validation sections (simd_validation) carve their big
+/// buffers from this arena while it is unused (the kernel benches carve it
+/// later) — a static hoist of those buffers would grow `.bss` and shrink the
+/// 65 KB device stack (task-8 finding).
 #[repr(align(16))]
-struct AlignedArena([u8; 256 * 1024]);
+pub(crate) struct AlignedArena(pub(crate) [u8; 256 * 1024]);
 
-static mut SRAM_ARENA: AlignedArena = AlignedArena([0u8; 256 * 1024]);
+pub(crate) static mut SRAM_ARENA: AlignedArena = AlignedArena([0u8; 256 * 1024]);
+
+/// Run `f` on a dedicated 256 KB stack carved from the SRAM bench arena.
+///
+/// The generated person_detect `Model::predict_with_scratch` allocas ~232 KB
+/// of intermediates on the stack (`sub a1, a1, 0x38ac0` in the ELF) — far
+/// more than the ~65 KB main-stack region — so it must run on this larger
+/// stack. SAFETY contract: the arena must be unused by the caller (true
+/// during model validation — the kernel benches that carve it run later) and
+/// SP is restored before returning. 256 KB recorded in task-5 evidence.
+///
+/// QEMU-only: on real silicon the first windowed return after the SP switch
+/// faults (window-underflow, excvaddr=0, epc1=retw in core::fmt::write) —
+/// the device path SKIPs person_detect (reason=stack) instead of using this.
+pub fn run_on_arena_stack<R>(f: impl FnOnce() -> R) -> R {
+    unsafe {
+        let arena = &mut *core::ptr::addr_of_mut!(SRAM_ARENA);
+        let base = arena.0.as_mut_ptr();
+        let top = (base as usize + arena.0.len()) & !15;
+        let old_sp = read_sp();
+        set_sp(top);
+        let r = f();
+        set_sp(old_sp);
+        r
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
+#[inline(never)]
+unsafe fn read_sp() -> usize {
+    let sp: usize;
+    core::arch::asm!("mov {0}, a1", out(reg) sp, options(nostack));
+    sp
+}
+
+#[cfg(target_arch = "xtensa")]
+#[inline(never)]
+unsafe fn set_sp(sp: usize) {
+    // movsp (not mov): window-aware SP switch — relocates the register save
+    // area to the new stack so window-overflow handling (device ROM handler)
+    // stays consistent. A plain `mov a1, x` left the window base pointing at
+    // the old stack and faulted on real silicon (QEMU's emulation was
+    // lenient). The generated alloca uses the same instruction.
+    core::arch::asm!("movsp a1, {0}", in(reg) sp, options(nostack));
+}
 
 /// PSRAM bench arena (large MobileNetV2-style rows) — runtime-mapped.
 ///
@@ -282,51 +461,6 @@ static mut SRAM_ARENA: AlignedArena = AlignedArena([0u8; 256 * 1024]);
 /// PSRAM-tier benchmarks panic with "arena too small" — an honest runtime
 /// failure, never a fabricated measurement.
 static mut PSRAM_ARENA: &'static mut [u8] = &mut [];
-
-/// Total SRAM arena bytes (the `AlignedArena` size).
-pub(crate) const SRAM_ARENA_BYTES: usize = 256 * 1024;
-
-/// Whether a PSRAM arena was mapped at runtime (i.e. the board has PSRAM).
-/// Boards without PSRAM leave `PSRAM_ARENA` empty; callers that would need it
-/// must skip honestly instead of panicking in [`arena_for`].
-pub(crate) fn psram_available() -> bool {
-    let p = core::ptr::addr_of_mut!(PSRAM_ARENA);
-    unsafe { !(&(*p)).is_empty() }
-}
-
-/// Carve a 16-aligned region of `need` bytes from SRAM when it fits, else
-/// PSRAM. Trims the base forward to a 16-byte boundary so SIMD kernels
-/// (which gate on `% 16 == 0` pointers) always engage.
-///
-/// Panics with an honest message if neither arena can hold the request —
-/// never fabricates a measurement.
-pub(crate) fn arena_for(need: usize) -> &'static mut [u8] {
-    if need <= SRAM_ARENA_BYTES {
-        let region: &'static mut [u8] = unsafe { &mut SRAM_ARENA.0[..] };
-        return align_trim(region, need);
-    }
-    let psram: &'static mut [u8] = unsafe { &mut **core::ptr::addr_of_mut!(PSRAM_ARENA) };
-    if psram.len() < need {
-        panic!(
-            "arena_for: need {need} bytes but PSRAM arena has {}",
-            psram.len(),
-        );
-    }
-    align_trim(psram, need)
-}
-
-/// Trim `region` to a 16-aligned base and require `need` bytes.
-fn align_trim(region: &'static mut [u8], need: usize) -> &'static mut [u8] {
-    if region.len() < need {
-        panic!("arena_for: need {need} bytes but arena has {}", region.len());
-    }
-    let base = region.as_mut_ptr() as usize;
-    let skip = (16 - (base % 16)) % 16;
-    if region.len() - skip < need {
-        panic!("arena_for: 16-aligning {base:#x} leaves < {need} bytes");
-    }
-    unsafe { core::slice::from_raw_parts_mut((base + skip) as *mut u8, region.len() - skip) }
-}
 
 /// Stack-canary slot.  BRING-UP: extend the linker script so this section is
 /// placed at the top of the stack region for true overflow detection; without
@@ -550,7 +684,7 @@ fn bench_kernel(spec: &KernelSpec, clock: &mut RealClock, canary: &mut StackCana
 /// FNV-1a 32-bit checksum over raw output bytes (seed 2166136261, prime
 /// 16777619) — mirrors the C baseline's `out_checksum` so the Rust s3 kernel
 /// output can be matched bit-exactly against the C-SIMD harness.
-pub(crate) fn fnv1a(data: &[i8]) -> u32 {
+ fn fnv1a(data: &[i8]) -> u32 {
      let mut h: u32 = 2_166_136_261;
      for &b in data {
          h ^= b as u32;
@@ -836,6 +970,186 @@ fn bench_mv2real_model(clock: &mut RealClock, canary: &mut StackCanary) {
         panic!("mv2real model: {}", e.describe());
     }
 }
+
+/// Profile Model C (mv2real) per-layer s3 CCOUNT deltas (todo-21).
+///
+/// One untimed full s3 run populates every layer's input buffer; each layer
+/// is then timed alone via `run_repeated` (N>=10, min/median).
+fn profile_mv2real_s3_layers(canary: &mut StackCanary) {
+    let arena = unsafe { &mut SRAM_ARENA.0[..] };
+    let mut bufs = match crate::model_mv2real::carve_mv2real_into(arena) {
+        Ok(b) => b,
+        Err(_) => panic!("arena too small for MV2REAL layer profile"),
+    };
+    #[repr(align(16))]
+    struct AlignedScratch([u8; 16384]);
+    let mut scratch = AlignedScratch([0u8; 16384]);
+    crate::model_mv2real::fill_pattern_mv2real(
+        bufs.input, bufs.l1w, bufs.l1b, bufs.l2w, bufs.l2b, bufs.l3w, bufs.l3b, bufs.l4w, bufs.l4b,
+        bufs.l5w, bufs.l5b, bufs.l6w, bufs.l6b,
+    );
+    let _ = crate::model_mv2real::run_mv2real_s3(&mut bufs, &mut scratch.0[..]);
+    let cfg = BenchmarkConfig::default();
+    let mut clock = RealClock;
+
+    let mut rows: [(&str, u64); 6] = [("", 0); 6];
+
+    let log = run_repeated(
+        &mut clock,
+        &mut || {
+            let _ = hematite_s3::conv3x3::conv2d_3x3(bufs.input, bufs.l1w, bufs.l1b, &crate::model_mv2real::C1_PARAMS, bufs.l1out, &mut scratch.0[..]);
+        },
+        &cfg,
+    );
+    rows[0] = ("L1 conv3x3 s2", summarize(&log).map(|s| s.min_cycles).unwrap_or(0));
+
+    let log = run_repeated(
+        &mut clock,
+        &mut || {
+            let _ = hematite_s3::depthwise::depthwise_conv2d(bufs.l1out, bufs.l2w, bufs.l2b, &crate::model_mv2real::C2_PARAMS, bufs.l2out, &mut scratch.0[..]);
+        },
+        &cfg,
+    );
+    rows[1] = ("L2 depthwise s1", summarize(&log).map(|s| s.min_cycles).unwrap_or(0));
+
+    let log = run_repeated(
+        &mut clock,
+        &mut || {
+            let _ = hematite_s3::conv1x1::conv2d_1x1(bufs.l2out, bufs.l3w, bufs.l3b, &crate::model_mv2real::C3_PARAMS, bufs.l3out, &mut scratch.0[..]);
+        },
+        &cfg,
+    );
+    rows[2] = ("L3 conv1x1", summarize(&log).map(|s| s.min_cycles).unwrap_or(0));
+
+    let log = run_repeated(
+        &mut clock,
+        &mut || {
+            let _ = hematite_s3::depthwise::depthwise_conv2d(bufs.l3out, bufs.l4w, bufs.l4b, &crate::model_mv2real::C4_PARAMS, bufs.l4out, &mut scratch.0[..]);
+        },
+        &cfg,
+    );
+    rows[3] = ("L4 depthwise s2", summarize(&log).map(|s| s.min_cycles).unwrap_or(0));
+
+    let log = run_repeated(
+        &mut clock,
+        &mut || {
+            let _ = hematite_s3::conv1x1::conv2d_1x1(bufs.l4out, bufs.l5w, bufs.l5b, &crate::model_mv2real::C5_PARAMS, bufs.l5out, &mut scratch.0[..]);
+        },
+        &cfg,
+    );
+    rows[4] = ("L5 conv1x1", summarize(&log).map(|s| s.min_cycles).unwrap_or(0));
+
+    let log = run_repeated(
+        &mut clock,
+        &mut || {
+            let _ = hematite_s3::gemm::fully_connected(bufs.l5out, bufs.l6w, bufs.l6b, &crate::model_mv2real::C6_PARAMS, bufs.out, &mut scratch.0[..]);
+        },
+        &cfg,
+    );
+    rows[5] = ("L6 fc", summarize(&log).map(|s| s.min_cycles).unwrap_or(0));
+
+    firmware_log!("mv2real per-layer s3 (min cyc):");
+    for (name, cyc) in rows {
+        firmware_log!("  {} {}", name, cyc);
+    }
+
+    // Raw-kernel floor probes (todo-21): time the bare asm kernel calls with
+    // NO Rust per-pixel dispatch / requantize, to split kernel floor vs
+    // dispatcher overhead for Model C's shapes.
+    #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+    {
+        let mut ccount = crate::timing::read_ccount;
+        // L1 shape: conv3x3 fast16, out_c=32, row_delta=(17-3)*16=224.
+        let n = 64u32;
+        let t0 = ccount();
+        let mut sink: u32 = 0;
+        for _ in 0..n {
+            unsafe {
+                hematite_s3::accx::accx_conv3x3(
+                    bufs.input.as_ptr(),
+                    bufs.l1w.as_ptr(),
+                    bufs.l1b.as_ptr() as *const i32 as *mut i32,
+                    16,
+                    32,
+                    224,
+                );
+            }
+            sink = sink.wrapping_add(1);
+        }
+        let t1 = ccount();
+        firmware_log!(
+            "probe accx_conv3x3 L1 shape: {} cyc/call (n={})",
+            (t1 - t0) / n,
+            n
+        );
+        // L3 shape: conv1x1 in_c=32, out_c=64.
+        let t0 = ccount();
+        for _ in 0..n {
+            unsafe {
+                hematite_s3::accx::accx_conv1x1(
+                    bufs.input.as_ptr(),
+                    bufs.l1w.as_ptr(),
+                    bufs.l1b.as_ptr() as *const i32 as *mut i32,
+                    32,
+                    64,
+                );
+            }
+            sink = sink.wrapping_add(1);
+        }
+        let t1 = ccount();
+        firmware_log!(
+            "probe accx_conv1x1 L3 shape: {} cyc/call (n={})",
+            (t1 - t0) / n,
+            n
+        );
+        // L5 shape: conv1x1 in_c=64, out_c=128.
+        let t0 = ccount();
+        for _ in 0..n {
+            unsafe {
+                hematite_s3::accx::accx_conv1x1(
+                    bufs.input.as_ptr(),
+                    bufs.l1w.as_ptr(),
+                    bufs.l1b.as_ptr() as *const i32 as *mut i32,
+                    64,
+                    128,
+                );
+            }
+            sink = sink.wrapping_add(1);
+        }
+        let t1 = ccount();
+        firmware_log!(
+            "probe accx_conv1x1 L5 shape: {} cyc/call (n={})",
+            (t1 - t0) / n,
+            n
+        );
+        // L2 depthwise shape: in_c=32, out_c=32, row_delta=(8-3)*32=160.
+        let t0 = ccount();
+        for _ in 0..n {
+            unsafe {
+                hematite_s3::accx::accx_depthwise(
+                    bufs.input.as_ptr(),
+                    bufs.l1w.as_ptr(),
+                    bufs.l1b.as_ptr() as *const i32 as *mut i32,
+                    32,
+                    32,
+                    160,
+                );
+            }
+            sink = sink.wrapping_add(1);
+        }
+        let t1 = ccount();
+        firmware_log!(
+            "probe accx_depthwise L2 shape: {} cyc/call (n={})",
+            (t1 - t0) / n,
+            n
+        );
+        let _ = sink;
+    }
+
+    if let Err(e) = canary.verify() {
+        panic!("mv2real layer profile: {}", e.describe());
+    }
+}
  
 /// Emit a report row (defmt/RTT on hardware, UART0 under `qemu`).
 ///
@@ -845,7 +1159,7 @@ fn bench_mv2real_model(clock: &mut RealClock, canary: &mut StackCanary) {
 /// `ref_fnv` / `s3_fnv` are FNV-1a checksums over the final output of the
 /// scalar-ref and s3 (SIMD where eligible) runs respectively; the s3 one is
 /// matched against the C-SIMD harness output checksum.
-pub(crate) fn emit_row(row: &ReportRow, ref_fnv: u32, s3_fnv: u32) {
+fn emit_row(row: &ReportRow, ref_fnv: u32, s3_fnv: u32) {
     firmware_log!(
         "| {} | {} | {}/{} | {}/{} | {}/{} | col1={} | col2={} | col3={} | out_fnv(ref/s3)=0x{:08x}/0x{:08x} |",
         row.label,
@@ -864,20 +1178,206 @@ pub(crate) fn emit_row(row: &ReportRow, ref_fnv: u32, s3_fnv: u32) {
     );
 }
 
-/// Emit the model-level registry.  Rows whose runner is not yet wired (no
-/// `.tflite` until T5.2) are listed with their documented reference bar and a
-/// NOT-WIRED marker — no fabricated measurements.
+/// Emit the model-level registry row when no runner is compiled in this
+/// build (no `model-validation` feature): the spec + its documented bar only,
+/// never a fabricated measurement.
 fn emit_model_row(spec: &ModelBenchSpec) {
     let bar_tenths = spec.reference_ms_tenths.unwrap_or(0);
     let bar_ms = (bar_tenths / 10, bar_tenths % 10);
     firmware_log!(
-        "| {} | {} | NOT-WIRED (T5.2) | bar={}.{} ms | {}",
+        "| {} | {} | bar-only (no runner; build with --features model-validation) | bar={}.{} ms | {}",
         spec.name,
         spec.tier.label(),
         bar_ms.0,
         bar_ms.1,
         spec.source,
     );
+}
+
+/// Benchmark one real zoo model end-to-end via `Model::<S3Backend>` (plan
+/// simd-zoo-hardening todo 19): warm-up + N ≥ 10 timed inferences with
+/// buffers carved from the bench arena, one timed row (cycles + wall ms) with
+/// the reference-bar verdict.
+///
+/// SKIP records (Metis F10 format) are emitted instead of timings where the
+/// model cannot run on this board — never a fabricated measurement:
+///
+/// * person_detect — the generated `predict` allocas ~232 KB of stack
+///   intermediates vs the ~65 KB device stack; the arena-stack SP switch
+///   faults on real silicon (todo-5 finding). SKIP reason=stack.
+/// * mobilenet_v2 — PSRAM tier; this board has no PSRAM (`PSRAM: 0 bytes`).
+///   SKIP reason=no-psram when the PSRAM arena is empty (the carve check
+///   catches a present-but-too-small arena the same way).
+#[cfg(feature = "model-validation")]
+fn bench_zoo_model(spec: &ModelBenchSpec, clock: &mut RealClock, canary: &mut StackCanary) {
+    use crate::model_bench::zoo_runners::zoo_runner_for;
+
+    // person_detect: proven hardware-fault on this board — never attempted.
+    if spec.path == "models/zoo/person_detect_vww/person_detect_int8.tflite" {
+        crate::firmware::uart0_log!(
+            "model person_detect_int8 [bench]: SKIP reason=stack rerun_condition=codegen-intermediates-off-stack"
+        );
+        firmware_log!(
+            "| {} | {} | SKIP | reason=stack rerun_condition=codegen-intermediates-off-stack |",
+            spec.name,
+            spec.tier.label(),
+        );
+        return;
+    }
+
+    // SAFETY: carve_model_bufs returns the only live borrow of the arena for
+    // the duration of this benchmark; the arena is re-carved per spec (same
+    // pattern as bench_kernel).
+    let arena = unsafe {
+        match spec.tier {
+            crate::spec::MemoryTier::Sram => &mut SRAM_ARENA.0[..],
+            crate::spec::MemoryTier::Psram => &mut **core::ptr::addr_of_mut!(PSRAM_ARENA),
+        }
+    };
+    // mobilenet_v2 PSRAM gate: no PSRAM on this board.
+    if arena.is_empty() {
+        crate::firmware::uart0_log!(
+            "model mobilenet_v2_1.0_224_int8 [bench]: SKIP reason=no-psram rerun_condition=board-with-PSRAM"
+        );
+        firmware_log!(
+            "| {} | {} | SKIP | reason=no-psram rerun_condition=board-with-PSRAM |",
+            spec.name,
+            spec.tier.label(),
+        );
+        return;
+    }
+
+    let mut runner = zoo_runner_for(spec);
+    let mut bufs = match carve_model_bufs(
+        arena,
+        runner.input_len(),
+        runner.output_len(),
+        runner.scratch_len(),
+    ) {
+        Some(b) => b,
+        None => {
+            firmware_log!(
+                "| {} | {} | SKIP | reason=arena-too-small |",
+                spec.name,
+                spec.tier.label(),
+            );
+            return;
+        }
+    };
+    let cfg = BenchmarkConfig::default();
+    fill_input_pattern(bufs.input);
+    bufs.output.fill(0);
+
+    let log = run_model_bench(clock, &mut runner, bufs.input, bufs.output, bufs.scratch, &cfg);
+    let summary = match summarize(&log) {
+        Some(s) => s,
+        None => return, // unreachable: run_repeated floors at 10
+    };
+    let out_fnv = fnv1a(bufs.output);
+
+    match spec.reference_ms_tenths {
+        Some(t) => {
+            let bar_ms = (t / 10, t % 10);
+            let verdict = if passes_reference_bar(&summary, t) { "PASS" } else { "FAIL" };
+            firmware_log!(
+                "| {} | {} | {}/{} | {}/{} | {}/{} | bar={}.{} ms | {} | out_fnv=0x{:08x} | {} |",
+                spec.name,
+                spec.tier.label(),
+                summary.min_cycles,
+                summary.median_cycles,
+                crate::timing::cycles_to_ms(summary.min_cycles, CPU_HZ_240MHZ),
+                crate::timing::cycles_to_ms(summary.median_cycles, CPU_HZ_240MHZ),
+                crate::timing::ns_to_ms(summary.min_wall_ns),
+                crate::timing::ns_to_ms(summary.median_wall_ns),
+                bar_ms.0,
+                bar_ms.1,
+                verdict,
+                out_fnv,
+                spec.source,
+            );
+        }
+        None => {
+            firmware_log!(
+                "| {} | {} | {}/{} | {}/{} | {}/{} | bar=None | no-bar | out_fnv=0x{:08x} | {} |",
+                spec.name,
+                spec.tier.label(),
+                summary.min_cycles,
+                summary.median_cycles,
+                crate::timing::cycles_to_ms(summary.min_cycles, CPU_HZ_240MHZ),
+                crate::timing::cycles_to_ms(summary.median_cycles, CPU_HZ_240MHZ),
+                crate::timing::ns_to_ms(summary.min_wall_ns),
+                crate::timing::ns_to_ms(summary.median_wall_ns),
+                out_fnv,
+                spec.source,
+            );
+        }
+    }
+
+    if let Err(e) = canary.verify() {
+        panic!("model bench '{}': {}", spec.name, e.describe());
+    }
+}
+
+/// Benchmark one real zoo model through the UNFUSED arm (`#[model_unfused]`
+/// per-op sequence, no fusion schedule) — the T6.1 fused-vs-unfused delta
+/// denominator.  Same SKIP guards as the fused arm: person_detect is
+/// stack-gated, mobilenet_v2 is PSRAM-gated (no unfused runner is wired for
+/// either — `zoo_unfused_runner_for` panics on their paths, which the guards
+/// below keep unreachable).
+#[cfg(feature = "model-validation")]
+fn bench_zoo_model_unfused(spec: &ModelBenchSpec, clock: &mut RealClock, canary: &mut StackCanary) {
+    use crate::model_bench::zoo_unfused_runners::zoo_unfused_runner_for;
+
+    if spec.path == "models/zoo/person_detect_vww/person_detect_int8.tflite" {
+        return;
+    }
+    let arena = unsafe {
+        match spec.tier {
+            crate::spec::MemoryTier::Sram => &mut SRAM_ARENA.0[..],
+            crate::spec::MemoryTier::Psram => &mut **core::ptr::addr_of_mut!(PSRAM_ARENA),
+        }
+    };
+    if arena.is_empty() {
+        return;
+    }
+
+    let mut runner = zoo_unfused_runner_for(spec);
+    let mut bufs = match carve_model_bufs(
+        arena,
+        runner.input_len(),
+        runner.output_len(),
+        runner.scratch_len(),
+    ) {
+        Some(b) => b,
+        None => return,
+    };
+    let cfg = BenchmarkConfig::default();
+    fill_input_pattern(bufs.input);
+    bufs.output.fill(0);
+
+    let log = run_model_bench(clock, &mut runner, bufs.input, bufs.output, bufs.scratch, &cfg);
+    let summary = match summarize(&log) {
+        Some(s) => s,
+        None => return,
+    };
+    let out_fnv = fnv1a(bufs.output);
+
+    firmware_log!(
+        "| {} | {} | {}/{} | {}/{} | {}/{} | bar=None | no-bar (unfused arm) | out_fnv=0x{:08x} |",
+        spec.name,
+        spec.tier.label(),
+        summary.min_cycles,
+        summary.median_cycles,
+        crate::timing::cycles_to_ms(summary.min_cycles, CPU_HZ_240MHZ),
+        crate::timing::cycles_to_ms(summary.median_cycles, CPU_HZ_240MHZ),
+        crate::timing::ns_to_ms(summary.min_wall_ns),
+        crate::timing::ns_to_ms(summary.median_wall_ns),
+        out_fnv,
+    );
+
+    if let Err(e) = canary.verify() {
+        panic!("model bench (unfused) '{}': {}", spec.name, e.describe());
+    }
 }
 
 /// Firmware entry point — runs the full benchmark suite and never returns.
@@ -909,6 +1409,11 @@ pub fn run_benchmarks() -> ! {
         unsafe {
             PSRAM_ARENA = core::slice::from_raw_parts_mut(psram_ptr, psram_len);
         }
+        // PSRAM presence probe (plan simd-zoo-hardening todo 1, Metis F4): log
+        // the arena capacity BEFORE `verify_boot_profile` asserts — an empty
+        // slice means the board has no PSRAM, and that fact must be reported
+        // rather than preempted by the boot-profile panic.
+        firmware_log!("PSRAM: {} bytes", psram_len);
     }
     #[cfg(feature = "qemu")]
     {
@@ -943,8 +1448,31 @@ pub fn run_benchmarks() -> ! {
     // 4.5 Model validation (model-validation feature) — runs BEFORE the
     // kernel rows so every PASS/FAIL line prints even if a later row panics
     // (the MobileNetV2 PSRAM row's "arena too small" panic stays last).
+    // validate_all() runs each zoo model via RefBackend; validate_all_s3()
+    // (plan todo 5) re-runs them via Model::<S3Backend> — on the device the
+    // S3 forwarding takes the SIMD paths, so a PASS proves the SIMD kernels
+    // agree with the scalar oracle end-to-end.
     #[cfg(feature = "model-validation")]
     crate::model_validation::validate_all();
+    #[cfg(feature = "model-validation")]
+    crate::model_validation::validate_all_s3();
+
+    // 4.6 TIE728 SIMD correctness (elementwise + pool vs hematite-ref) —
+    // hardware-only: gated `not(feature = "qemu")` because the QEMU fork's
+    // TIE728 compute emulation is broken (VADDS crash, VSUBS silent wrong,
+    // VMULAS/pool hang) — the SIMD suite must never run under qemu. Same
+    // feature + ordering rationale as 4.5. conv1x1/conv3x3/gemm are excluded
+    // (already gated off at the `hematite-s3` dispatch level).
+    #[cfg(all(feature = "model-validation", not(feature = "qemu")))]
+    crate::simd_validation::validate_all();
+
+    // 4.7 person_detect stack-probe (composed-kernels T5.2) — AFTER the SIMD
+    // sweep so a stack overflow here (the honest shortfall signal) can never
+    // mask the sweep results. Runs predict_with_scratch on the real device
+    // stack budget (T1.3 arena peak 55,296 B vs ~65 KB stack); NO static-mut
+    // decision is made — a shortfall is recorded for the owner.
+    #[cfg(all(feature = "model-validation", not(feature = "qemu")))]
+    crate::model_validation::probe_person_detect_stack();
 
     // 5. Per-kernel benchmarks.
     let mut clock = RealClock;
@@ -955,16 +1483,26 @@ pub fn run_benchmarks() -> ! {
     bench_cnn_model(&mut clock, &mut canary);
     bench_mv2_model(&mut clock, &mut canary);
     bench_mv2real_model(&mut clock, &mut canary);
-    // 5a. Real zoo-model benchmarks (real weights + golden inputs). Real
-    // board only: person_detect/mobilenet_v2 carve PSRAM regions.
-    #[cfg(all(feature = "model-validation", not(feature = "qemu")))]
-    crate::zoo_bench::run_zoo_benches(&mut clock, &mut canary);
-    for spec in kernel_specs() {
-        bench_kernel(spec, &mut clock, &mut canary);
+    profile_mv2real_s3_layers(&mut canary);
+
+    // 5.5 Model-level registry — real zoo runners (todo 19). Runs before the
+    // kernel loop for the same reason the A/B/C benches do: the loop ends in
+    // the expected no-PSRAM panic, and the timed model rows must print first.
+    // Without the `model-validation` feature no runners are compiled and the
+    // rows are bar-only (no fabricated timings).
+    #[cfg(feature = "model-validation")]
+    for spec in model_bench_specs() {
+        bench_zoo_model(spec, &mut clock, &mut canary);
+        bench_zoo_model_unfused(spec, &mut clock, &mut canary);
     }
-    // 6. Model-level registry.
+    #[cfg(not(feature = "model-validation"))]
     for spec in model_bench_specs() {
         emit_model_row(spec);
+    }
+
+    // 6. Per-kernel rows.
+    for spec in kernel_specs() {
+        bench_kernel(spec, &mut clock, &mut canary);
     }
 
     firmware_log!("benchmarks complete; reference bars: MobileNetV2 224x224 = 1294.5 ms single-core (never 856 ms dual-core), KWS = 7 ms");

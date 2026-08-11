@@ -4,6 +4,21 @@
 //! T4.1 — straight-line code emitter: [`ParsedModel`] → typed `KernelBackend`
 //! call sequence + `Model<B>` wrapper.
 //!
+//! ## Pipeline (T1.2 / T4.2 / T4.3 — WIRED)
+//!
+//! Every `#[model]`-family entry point routes through
+//! `parse_and_emit_impl` (lib.rs), which precomputes the fusion schedule
+//! (`optimize::fusion::fuse`) and hands it to the emission seam below:
+//! `emit_model_fused[_with_policy]` → `emit_model_with` → the per-group
+//! `FusedKernelBackend` composed calls.  The T4.2 selector
+//! (`optimize::selector::select_kernel`) maps each fused group's anchor to a
+//! composed kernel when the structural + mirror-eligibility gates pass; the
+//! T4.3 emitter stamps the selected shapes as const-generic composed calls.
+//! There is no longer a "future wiring task" seam — the schedule is threaded
+//! through on every fused build (`#[model]`, `#[model_stack]`,
+//! `#[model_unstaged]`, `#[model_force_t2]`); only `#[model_unfused]` emits
+//! the raw per-op sequence.
+//!
 //! The emitter runs at **compile time of the consumer crate** (host-side,
 //! inside the proc-macro).  All device-side math is precomputed here and
 //! emitted as integer consts — the generated code contains no `f32`/`f64`
@@ -23,23 +38,133 @@
 //!   params zero-point, exactly like the golden fixtures (all fixtures use
 //!   zp = 0, so these reduce to 0 there).
 //! * Scratch: a **macro-time** const, `SCRATCH_LEN`, computed as the max over
-//!   ops of the documented per-op scratch need (every `*_scratch_size` in the
-//!   current kernel set defaults to `0` → `SCRATCH_LEN = 0`).  Generated code
+//!   ops of the per-op scratch need recomputed from the parsed op params (the
+//!   S3 backend's `conv1x1_scratch_need` / `conv3x3_scratch_need` /
+//!   `depthwise_scratch_need` / `softmax_scratch_size` formulas, mirrored in
+//!   this file — see the `scratch_need_*` helpers below).  Generated code
 //!   sizes the scratch array with this const — never `[0u8; B::scratch()]`
 //!   inside a `const fn` (unstable const-trait-call trap).
+//!
+//! ## T1.3 — liveness arena
+//!
+//! When `optimize::arena::plan_arena` succeeds for the model (every
+//! intermediate fits `MAX_INTERNAL`), the per-tensor stack arrays collapse
+//! into ONE `#[repr(C, align(16))] struct Arena { data: [i8; ARENA_LEN] }`
+//! local sized to the planner's liveness peak, indexed at compile-time
+//! offsets.  Each op call borrows its disjoint slices via nested
+//! `split_at_mut` (safe, no `unsafe` in generated code); the planner
+//! guarantees a single op's input/output slices never overlap because they
+//! are simultaneously live.  Models the planner rejects (mobilenet_v2: a
+//! single 224×224×32 activation exceeds the 512 KiB budget) keep per-tensor
+//! stack emission — bit-exact, just larger (evidence:
+//! `local-notes/evidence/composed-kernels/t13-arena.md`).
 
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::Ident;
 
 use crate::flatbuffer::{ParsedModel, ParsedOp, ParsedOptions, ParsedTensor, QuantInfo, TensorType};
+use crate::optimize::arena::plan_arena;
+use crate::optimize::fusion::{
+    AbsorbedElementwise, ElementwiseKind as FusedStepKind, FusedActivationKind, FusedGroup,
+    FusedSchedule,
+};
+use crate::optimize::selector::{self, ComposedKind, GroupSelection};
+use hematite_memory::{ArenaPlan, OFFSET_NONE};
 
-/// Emit the full model wrapper for `subgraph[0]` of a parsed model.
+/// Emit the full model wrapper for `subgraph[0]` of a parsed model — the
+/// plain **unfused** per-op straight-line sequence (no fusion schedule).
 ///
-/// The op list is read from `model.ops()` (execution order); a later wiring
-/// task (T4.2a fusion) can pass a preprocessed schedule by refactoring the
-/// single `let ops = model.ops();` line into a parameter.
+/// This is the T4.1 emission, kept reachable as the unfused reference of the
+/// T1.2 fused-vs-unfused equivalence gate (and by `#[model_unfused]`).  The
+/// T4.2 input-staging decision applies here too (single-op first-layer
+/// group), so fused and unfused arms stage identically.
 pub(crate) fn emit_model(model: &ParsedModel) -> Result<TokenStream, String> {
+    emit_model_with(model, None, true, false)
+}
+
+/// Emit the full model wrapper for `subgraph[0]`, honoring a fused schedule
+/// (T1.2 wiring of the T4.2a fusion pass).
+///
+/// Groups whose anchor the T4.2 selector maps to a composed kernel (see
+/// [`selector::select_kernel`]) collapse the anchor + absorbed ops into ONE
+/// `FusedKernelBackend` composed call; the absorbed ops and their eliminated
+/// intermediate tensors vanish from the emitted code.  Everything else —
+/// including every T2 group (`requires_verification == true`) and every
+/// mirror-ineligible composed candidate — emits exactly as the unfused
+/// [`emit_model`], so a model with zero composed groups emits byte-identical
+/// code through both entry points.
+#[cfg(test)]
+pub(crate) fn emit_model_fused(
+    model: &ParsedModel,
+    schedule: &FusedSchedule,
+    stage_input: bool,
+) -> Result<TokenStream, String> {
+    emit_model_fused_with_policy(model, schedule, stage_input, false)
+}
+
+/// T5.1 test arm — the T4.2 fused emission with the T2
+/// `requires_verification` gate optionally forced open: `force_t2: true`
+/// lets T2 groups emit composed whenever the selector's structural + mirror
+/// gates pass (the W5 flip surface), the arm the fused==unfused harness
+/// proves.  The production entry points (`emit_model_fused`,
+/// `emit_model_stack_fused`, `emit_model`) always pass `false` — this policy
+/// is unreachable from normal `#[model]` usage.
+pub(crate) fn emit_model_fused_with_policy(
+    model: &ParsedModel,
+    schedule: &FusedSchedule,
+    stage_input: bool,
+    force_t2: bool,
+) -> Result<TokenStream, String> {
+    emit_model_with(model, Some(schedule), stage_input, force_t2)
+}
+
+/// T1.3 test arm — fused emission with the liveness arena DISABLED
+/// (per-tensor stack arrays, exactly the pre-T1.3 layout): the `stack` arm
+/// of the arena-vs-stack bit-exactness gate (`#[model_stack]`).
+#[cfg(test)]
+pub(crate) fn emit_model_stack_fused(
+    model: &ParsedModel,
+    schedule: &FusedSchedule,
+    stage_input: bool,
+) -> Result<TokenStream, String> {
+    emit_model_stack_fused_with_policy(model, schedule, stage_input, false)
+}
+
+/// T5.1 test arm — [`emit_model_stack_fused`] with the T2 gate optionally
+/// forced open (see [`emit_model_fused_with_policy`]).
+pub(crate) fn emit_model_stack_fused_with_policy(
+    model: &ParsedModel,
+    schedule: &FusedSchedule,
+    stage_input: bool,
+    force_t2: bool,
+) -> Result<TokenStream, String> {
+    emit_model_with_options(model, Some(schedule), false, stage_input, force_t2)
+}
+
+/// Shared emission core: `schedule: None` is the unfused path; `Some` routes
+/// composed groups through the `fused_*` backend calls (T1.2).
+/// `stage_input: true` honors the T4.2 graph-input 16B-staging decision.
+/// `force_t2` is the T5.1 test-only policy (never set by production
+/// entry points).
+fn emit_model_with(
+    model: &ParsedModel,
+    schedule: Option<&FusedSchedule>,
+    stage_input: bool,
+    force_t2: bool,
+) -> Result<TokenStream, String> {
+    emit_model_with_options(model, schedule, true, stage_input, force_t2)
+}
+
+/// `arena_enabled: false` forces per-tensor stack emission even when the
+/// planner succeeds — the `#[model_stack]` test arm.
+fn emit_model_with_options(
+    model: &ParsedModel,
+    schedule: Option<&FusedSchedule>,
+    arena_enabled: bool,
+    stage_input: bool,
+    force_t2: bool,
+) -> Result<TokenStream, String> {
     if model.subgraph_count() != 1 {
         return Err(format!(
             "model has {} subgraphs; only single-subgraph models are supported",
@@ -51,6 +176,7 @@ pub(crate) fn emit_model(model: &ParsedModel) -> Result<TokenStream, String> {
         return Err("model subgraph[0] has no tensors".into());
     }
     let ops = model.ops();
+    let plan = schedule.map(|s| fused_plan(model, s, ops.len(), tensors.len(), force_t2));
     let inputs = model.inputs();
     let outputs = model.outputs();
     if inputs.is_empty() {
@@ -90,106 +216,186 @@ pub(crate) fn emit_model(model: &ParsedModel) -> Result<TokenStream, String> {
         }
     }
 
+    // ── T1.3: liveness arena over the intermediates ────────────────────────
+    // One `#[repr(C, align(16))] struct Arena { data: [i8; ARENA_LEN] }`
+    // local replaces the per-tensor stack arrays whenever the planner
+    // succeeds AND covers every emitted intermediate.  On planner rejection
+    // (mobilenet_v2: a single 224²×32 activation exceeds MAX_INTERNAL) the
+    // emitter falls back to per-tensor stack locals — bit-exact, just
+    // larger (see local-notes/evidence/composed-kernels/t13-arena.md).
+    let arena_plan = if arena_enabled { arena_plan_for(model, &storage) } else { None };
+    let lens: Option<Vec<usize>> = match &arena_plan {
+        Some(_) => Some(
+            tensors
+                .iter()
+                .map(|t| flat_len(&t.shape))
+                .collect::<Result<Vec<usize>, String>>()?,
+        ),
+        None => None,
+    };
+    let arena_peak = arena_plan.as_ref().map(|p| p.peak_arena_bytes).unwrap_or(0);
+
+    // ── T4.2: graph-input 16B-alignment staging decision ───────────────────
+    // The caller's `input` slice alignment is unknowable at codegen and the
+    // s3 conv1x1 SIMD path falls back to scalar on `in_ptr % 16 != 0`
+    // (conv1x1.rs:284-286).  When the FIRST emitted kernel is SIMD-eligible
+    // per the T4.1 mirror, the input region is copied into a
+    // `#[repr(C, align(16))]` local once per predict and every graph-input
+    // read goes through it (same bytes — bit-exact; the staging only
+    // guarantees alignment).  When the first kernel is scalar anyway, no
+    // staging is emitted (recorded in the selector evidence).
+    let staging: Option<selector::StagingDecision> = if stage_input {
+        let first_group = match schedule {
+            Some(s) => s.groups.first().cloned(),
+            None => ops.first().map(|op| single_op_group(0, op)),
+        };
+        first_group.map(|g| selector::input_staging_decision(model, &g))
+    } else {
+        None
+    };
+    let input_staged = staging.as_ref().is_some_and(|d| d.stage);
+    let staged_ty: Option<TokenStream> = if input_staged {
+        let n = input_len;
+        Some(quote! {
+            /// T4.2 — 16B-aligned staging buffer for the graph input region
+            /// (the caller's slice alignment is unknowable at codegen).
+            #[repr(C, align(16))]
+            struct STAGED_INPUT {
+                data: [i8; #n],
+            }
+        })
+    } else {
+        None
+    };
+    let staged_local: Option<TokenStream> = if input_staged {
+        let n = input_len;
+        Some(quote! {
+            let mut staged_input = STAGED_INPUT { data: [0i8; #n] };
+            staged_input.data.copy_from_slice(&input[..]);
+        })
+    } else {
+        None
+    };
+
     // ── Emit per-op consts + calls (straight-line, execution order) ────────
-    // Two passes over the same op list: the stack path (per-tensor struct
-    // arrays) and the arena path (tensors carved from a caller arena at
-    // liveness offsets).  Consts are emitted once (identical for both).
+    // With a schedule, each op is either (a) an anchor of a composed group
+    // → one `fused_*` call, (b) absorbed into a composed group → skipped, or
+    // (c) an ordinary op → its per-op call exactly as the unfused emitter.
     let mut consts: Vec<TokenStream> = Vec::new();
-    let mut stack_calls: Vec<TokenStream> = Vec::new();
-    let mut arena_calls: Vec<TokenStream> = Vec::new();
-    let mut arena_scratch_checks: Vec<TokenStream> = Vec::new();
+    let mut calls: Vec<TokenStream> = Vec::new();
     let mut scratch_max = 0usize;
     for (i, op) in ops.iter().enumerate() {
-        let em_stack = emit_op(model, &storage, i, op, TensorMode::Stack)?;
-        consts.extend(em_stack.consts);
-        stack_calls.push(em_stack.call);
-        let em_arena = emit_op(model, &storage, i, op, TensorMode::Arena)?;
-        arena_calls.push(em_arena.call);
-        arena_scratch_checks.push(em_arena.scratch_check);
-        scratch_max = scratch_max.max(em_stack.scratch.max(em_arena.scratch));
+        if plan.as_ref().is_some_and(|p| p.absorbed[i]) {
+            continue;
+        }
+        let mut actx = ArenaCtx::new(arena_plan.as_ref(), lens.as_deref().unwrap_or(&[]));
+        actx.op = i;
+        actx.input_staged = input_staged;
+        let em = match plan.as_ref().and_then(|p| p.anchor_group[i]) {
+            Some(gi) => {
+                let plan = plan.as_ref().expect("anchor_group implies a plan");
+                let group = &schedule.expect("anchor_group implies a schedule").groups[gi];
+                match plan.selections[gi].kernel {
+                    GroupSelection::Composed(ComposedKind::Conv) => {
+                        emit_fused_conv(model, &storage, &mut actx, i, op, group)?
+                    }
+                    GroupSelection::Composed(ComposedKind::Chain) => {
+                        emit_fused_chain(model, &storage, &mut actx, i, op, group)?
+                    }
+                    GroupSelection::Composed(ComposedKind::PoolFold) => {
+                        emit_fused_pool_fold(model, &storage, &mut actx, i, op, group)?
+                    }
+                    GroupSelection::PerOp => emit_op(model, &storage, &mut actx, i, op)?,
+                }
+            }
+            None => emit_op(model, &storage, &mut actx, i, op)?,
+        };
+        consts.extend(em.consts);
+        calls.push(actx.wrap(em.call));
+        scratch_max = scratch_max.max(em.scratch);
     }
 
-    // ── Intermediate storage: stack types + arena layout ───────────────────
+    // ── Intermediate storage: arena local OR per-tensor stack arrays ───────
+    // Arena mode: every intermediate lives in `Arena.data` at a const
+    // offset (the planner covers all of them — `arena_plan_for` checked).
+    // Fallback mode: per-tensor `#[repr(C, align(16))]` stack locals, as
+    // before T1.3.  Eliminated tensors (absorbed into composed groups) get
+    // no storage in either mode.
     let mut tensor_types: Vec<TokenStream> = Vec::new();
     let mut tensor_locals: Vec<TokenStream> = Vec::new();
-    let mut arena_locals: Vec<TokenStream> = Vec::new();
-    let mut arena_offsets: Vec<usize> = vec![0usize; tensors.len()];
-    let mut arena_len = 0usize;
-    let mut arena_plan_ok = false;
-    for s in &storage {
-        if let Storage::Tensor { idx } = s {
-            let len = flat_len(&tensors[*idx].shape)?;
-            let ty = Ident::new(&format!("TENSOR_{idx}"), proc_macro2::Span::call_site());
-            let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
-            tensor_types.push(quote! {
+    let arena_ty: Option<TokenStream> = match &arena_plan {
+        Some(p) if p.peak_arena_bytes > 0 => {
+            let peak = p.peak_arena_bytes;
+            Some(quote! {
+                /// Intermediate-tensor arena (T1.3): ONE 16-byte-aligned
+                /// array sized to the liveness peak; every intermediate
+                /// indexes it at a compile-time offset.
                 #[repr(C, align(16))]
-                struct #ty {
-                    data: [i8; #len],
+                struct Arena {
+                    data: [i8; #peak],
                 }
-            });
-            tensor_locals.push(quote! {
-                let mut #var = #ty { data: [0i8; #len] };
-            });
+            })
         }
-    }
-    if let Ok(plan) = crate::optimize::arena::plan_arena_internal(model, usize::MAX / 4, None) {
-        let all_slotted = storage.iter().all(|s| match s {
-            Storage::Tensor { idx } => plan.offsets[*idx] != hematite_memory::OFFSET_NONE,
-            _ => true,
-        });
-        if all_slotted {
-            for s in &storage {
-                if let Storage::Tensor { idx } = s {
-                    arena_offsets[*idx] = plan.offsets[*idx];
-                }
-            }
-            arena_len = plan.peak_arena_bytes;
-            arena_plan_ok = true;
+        _ => None,
+    };
+    let arena_local: Option<TokenStream> = match &arena_plan {
+        Some(p) if p.peak_arena_bytes > 0 => {
+            let peak = p.peak_arena_bytes;
+            Some(quote! {
+                let mut arena = Arena { data: [0i8; #peak] };
+            })
         }
-    }
-    if !arena_plan_ok {
-        // Sequential 16-aligned offsets — correct without liveness coalescing
-        // (larger arena, but no shared slots).  Used when the planner rejects
-        // the schedule (e.g. > MAX_TENSORS intermediates) or a tensor has no
-        // arena slot.
-        let mut cursor = 0usize;
+        _ => None,
+    };
+    if arena_plan.is_none() {
         for s in &storage {
             if let Storage::Tensor { idx } = s {
+                if plan.as_ref().is_some_and(|p| p.eliminated[*idx]) {
+                    continue;
+                }
                 let len = flat_len(&tensors[*idx].shape)?;
-                cursor = (cursor + 15) & !15;
-                arena_offsets[*idx] = cursor;
-                cursor += (len + 15) & !15;
+                let ty = Ident::new(&format!("TENSOR_{idx}"), proc_macro2::Span::call_site());
+                let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
+                tensor_types.push(quote! {
+                    #[repr(C, align(16))]
+                    struct #ty {
+                        data: [i8; #len],
+                    }
+                });
+                tensor_locals.push(quote! {
+                    let mut #var = #ty { data: [0i8; #len] };
+                });
             }
-        }
-        arena_len = cursor;
-    }
-    for s in &storage {
-        if let Storage::Tensor { idx } = s {
-            let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
-            let off = arena_offsets[*idx];
-            let len = flat_len(&tensors[*idx].shape)?;
-            arena_locals.push(quote! {
-                // SAFETY: `arena` is a single caller-owned buffer of at least
-                // `ARENA_LEN` bytes; `#off..#off+#len` lies wholly inside it
-                // (offsets are 16-aligned, within the plan's peak footprint).
-                let #var: &mut [i8] = unsafe {
-                    core::slice::from_raw_parts_mut(arena.as_mut_ptr().add(#off), #len)
-                };
-            });
         }
     }
 
     let input_len_ts = input_len;
     let output_len_ts = output_len;
     let scratch_ts = scratch_max;
-    let arena_len_ts = arena_len;
-    let stack_bind = if stack_calls.is_empty() {
-        quote! { let _ = &self.backend; }
+    // Composed `fused_*` calls need `&mut self` (the `FusedKernelBackend`
+    // receiver); models without composed groups keep the `&self` receiver so
+    // existing call sites (non-`mut` bindings) compile unchanged.
+    let composed = plan.as_ref().is_some_and(|p| p.anchor_group.iter().any(|g| g.is_some()));
+
+    // T4.3 — the `fused-groups` header doc (a `#[doc = ...]` attribute — the
+    // only comment form a proc-macro TokenStream can carry; plain `//` text
+    // is stripped at tokenization).  Gated on `composed`: a zero-composed
+    // model's fused emission must stay byte-identical to the per-op
+    // emission, so no header is emitted for it.
+    let fused_groups_attr: Option<TokenStream> = if composed {
+        let plan = plan.as_ref().expect("composed implies a plan");
+        let schedule = schedule.expect("composed implies a schedule");
+        let doc = fused_groups_summary(plan, schedule);
+        Some(quote!(#[doc = #doc]))
     } else {
-        quote! { let backend = &self.backend; }
+        None
     };
-    let arena_bind = if arena_calls.is_empty() {
+
+    let receiver = if composed { quote!(&mut self) } else { quote!(&self) };
+    let backend_bind = if calls.is_empty() {
         quote! { let _ = &self.backend; }
+    } else if composed {
+        quote! { let backend = &mut self.backend; }
     } else {
         quote! { let backend = &self.backend; }
     };
@@ -197,8 +403,11 @@ pub(crate) fn emit_model(model: &ParsedModel) -> Result<TokenStream, String> {
     let wrapper = quote! {
         /// Generated inference model — typed I/O bridge for `subgraph[0]`.
         ///
-        /// `B` is any [`::hematite_core::KernelBackend`] implementation; the
-        /// straight-line op sequence dispatches through it.
+        /// `B` is any [`::hematite_core::FusedKernelBackend`]
+        /// implementation (which extends [`::hematite_core::KernelBackend`]);
+        /// the straight-line op sequence dispatches through it, with fused
+        /// groups going through the composed `fused_*` entry points.
+        #fused_groups_attr
         pub struct Model<B> {
             backend: B,
         }
@@ -220,11 +429,11 @@ pub(crate) fn emit_model(model: &ParsedModel) -> Result<TokenStream, String> {
             }
         }
 
-        impl<B: ::hematite_core::KernelBackend> Model<B> {
+        impl<B: ::hematite_core::FusedKernelBackend> Model<B> {
             /// Run inference with an internally allocated scratch buffer.
             ///
             /// No panic paths: on error the output array is left zeroed.
-            pub fn predict(&self, input: &[i8; INPUT_LEN]) -> [i8; OUTPUT_LEN] {
+            pub fn predict(#receiver, input: &[i8; INPUT_LEN]) -> [i8; OUTPUT_LEN] {
                 let mut output = [0i8; OUTPUT_LEN];
                 let mut scratch = [0u8; SCRATCH_LEN];
                 let _ = self.predict_with_scratch(input, &mut output, &mut scratch);
@@ -238,8 +447,15 @@ pub(crate) fn emit_model(model: &ParsedModel) -> Result<TokenStream, String> {
             /// * [`::hematite_core::KernelError::ScratchTooSmall`] if
             ///   `scratch.len()` is below [`SCRATCH_LEN`] — the macro-time
             ///   max over ops of their documented scratch need.
+            ///
+            /// The intermediate-tensor arena is ALWAYS the internal
+            /// [`ARENA_LEN`]-byte stack local: the caller's `scratch` is
+            /// `&mut [u8]` and the arena is `[i8; ARENA_LEN]`, and reusing
+            /// it would require a byte-type cast that generated code must
+            /// never contain (T1.3 evidence).  `scratch` covers only the
+            /// per-op kernel scratch.
             pub fn predict_with_scratch(
-                &self,
+                #receiver,
                 input: &[i8; INPUT_LEN],
                 output: &mut [i8; OUTPUT_LEN],
                 scratch: &mut [u8],
@@ -247,48 +463,11 @@ pub(crate) fn emit_model(model: &ParsedModel) -> Result<TokenStream, String> {
                 if scratch.len() < SCRATCH_LEN {
                     return Err(::hematite_core::KernelError::ScratchTooSmall);
                 }
+                #arena_local
                 #(#tensor_locals)*
-                #stack_bind
-                #(#stack_calls)*
-                Ok(())
-            }
-
-            /// Run inference with intermediates carved from a caller-provided
-            /// arena.
-            ///
-            /// Unlike [`predict_with_scratch`](Self::predict_with_scratch)
-            /// (per-tensor stack arrays), every intermediate tensor is carved
-            /// from `arena` at liveness-coalesced 16-aligned offsets, so a
-            /// single `ARENA_LEN`-byte buffer (SRAM or PSRAM) replaces
-            /// hundreds of kilobytes of stack.  `arena` must be at least
-            /// [`ARENA_LEN`] bytes and 16-byte aligned.
-            ///
-            /// # Errors
-            ///
-            /// * [`::hematite_core::KernelError::ScratchTooSmall`] if
-            ///   `arena.len() < ARENA_LEN` or `scratch.len() < SCRATCH_LEN`.
-            pub fn predict_with_arena(
-                &self,
-                input: &[i8; INPUT_LEN],
-                output: &mut [i8; OUTPUT_LEN],
-                arena: &mut [i8],
-                scratch: &mut [u8],
-            ) -> Result<(), ::hematite_core::KernelError> {
-                if arena.len() < ARENA_LEN {
-                    return Err(::hematite_core::KernelError::ScratchTooSmall);
-                }
-                // Runtime scratch requirement from the backend's `*_scratch_size`
-                // associated fns (constant params → const-foldable per op).  This
-                // guarantees the backend's SIMD paths get enough scratch or the
-                // call fails loudly instead of silently falling back to scalar.
-                let mut need = 0usize;
-                #(#arena_scratch_checks)*
-                if scratch.len() < need {
-                    return Err(::hematite_core::KernelError::ScratchTooSmall);
-                }
-                #(#arena_locals)*
-                #arena_bind
-                #(#arena_calls)*
+                #staged_local
+                #backend_bind
+                #(#calls)*
                 Ok(())
             }
         }
@@ -298,17 +477,419 @@ pub(crate) fn emit_model(model: &ParsedModel) -> Result<TokenStream, String> {
         pub const INPUT_LEN: usize = #input_len_ts;
         pub const OUTPUT_LEN: usize = #output_len_ts;
         pub const SCRATCH_LEN: usize = #scratch_ts;
-        pub const ARENA_LEN: usize = #arena_len_ts;
-        /// 16-byte-aligned wrapper for weight statics — SIMD kernels gate on
-        /// `weights.as_ptr() % 16 == 0`; bare `const [i8; N]` arrays are only
-        /// 1-byte aligned in flash.
-        #[repr(align(16))]
-        #[allow(dead_code)]
-        struct WeightAlign<const N: usize>([i8; N]);
+        /// Intermediate-tensor arena size in bytes (liveness peak, T1.3);
+        /// 0 when the model fell back to per-tensor stack emission.
+        pub const ARENA_LEN: usize = #arena_peak;
         #(#consts)*
+        #arena_ty
+        #staged_ty
         #(#tensor_types)*
         #wrapper
     })
+}
+
+// ---------------------------------------------------------------------------
+// Fused-schedule wiring (T1.2)
+// ---------------------------------------------------------------------------
+
+/// A single-op group for the UNFUSED emission path — the T4.2 input-staging
+/// decision needs a "first kernel" even without a fusion schedule, so
+/// `op[0]` is wrapped as an anchor-only group (nothing absorbed).
+fn single_op_group(index: usize, op: &ParsedOp<'_>) -> FusedGroup {
+    FusedGroup {
+        anchor_op_index: index,
+        anchor_builtin: op.builtin_code,
+        inputs: op.inputs.clone(),
+        output_tensor: op.outputs.first().copied().unwrap_or(u32::MAX),
+        absorbed_ops: Vec::new(),
+        eliminated_tensors: Vec::new(),
+        activation: None,
+        elementwise_chain: Vec::new(),
+        residual_add: None,
+        input_fold: None,
+        folded_requantize: None,
+        requires_verification: false,
+    }
+}
+
+// `ComposedKind` + the per-group composed-vs-per-op decision moved to
+// `optimize::selector` (T4.2): the rule-tier selector adds the T4.1 mirror
+// eligibility gate on top of the T1.2 structural arms (see
+// `selector::select_kernel`), so a composed call is never emitted when its
+// composed SIMD path cannot engage.
+
+// T4.3 — dispatch model (compile-time rule tier; autotuning OUT of scope).
+//
+// The emitted composed calls are **shape-typed by construction**: the
+// selector verdict knows every tensor shape at macro time, so each
+// `fused_*` call site carries its shapes as a named per-group const (the
+// `*_SHAPES_*` consts in the `emit_fused_*` fns below) routed into the
+// params struct.  This mirrors the spec.rs `Prepared*` precedent
+// (bench-only today): `PreparedConv1x1` & co. carry the shapes in the
+// `&'static Conv2DParams` consts a shape-specialized dispatch keys off —
+// the composed calls keep the same contract, minus the runtime handle
+// (the trait signatures are T2.1 and stay untouched).
+//
+// The selection model mirrors the TFLM pointwise-vs-std-style split:
+// TFLM picks between the shape-specialized pointwise kernels and the
+// general std-dispatch path with per-call runtime checks; here the same
+// split is resolved statically — `selector::select_kernel` runs ONCE at
+// macro expansion and the emitted code contains exactly the selected
+// tier (a composed call is emitted only when the compile-time mirror
+// `crate::eligibility` says the composed SIMD path engages).  The design
+// is JAX/XLA-informed in that it is **rule-tier only**: XLA-style
+// autotuning (empirical per-shape kernel selection driven by a benchmark
+// database) is explicitly OUT of scope and recorded as a follow-up — the
+// rule tier is the deterministic, bit-exact prerequisite an autotuner
+// would later ride on, and nothing in the generated code depends on
+// runtime measurement.
+
+/// Per-op / per-tensor decisions derived from the schedule once per model.
+struct FusedPlan {
+    /// Op index → group index in `FusedSchedule::groups` (composed groups
+    /// only; `None` for ordinary ops and T2 groups).
+    anchor_group: Vec<Option<usize>>,
+    /// Op indices absorbed into composed groups (skip their own emission).
+    absorbed: Vec<bool>,
+    /// Tensor indices eliminated by composed groups (no stack array).
+    eliminated: Vec<bool>,
+    /// The selector verdict per group (index-aligned with the schedule).
+    selections: Vec<selector::Selection>,
+}
+
+fn fused_plan(
+    model: &ParsedModel<'_>,
+    schedule: &FusedSchedule,
+    op_count: usize,
+    tensor_count: usize,
+    force_t2: bool,
+) -> FusedPlan {
+    let mut anchor_group = vec![None; op_count];
+    let mut absorbed = vec![false; op_count];
+    let mut eliminated = vec![false; tensor_count];
+    // T5.1: `force_t2` (test-only, `#[model_force_t2]`) opens the T2
+    // `requires_verification` gate so the selector can emit a T2 group
+    // composed — the W5 flip surface.  Implemented here as a per-group
+    // view tweak (a clone with the flag cleared) so `selector::select_kernel`
+    // itself is untouched: the production path (`force_t2 = false`) is
+    // byte-identical to the T4.2 behavior.
+    let selections: Vec<selector::Selection> = schedule
+        .groups
+        .iter()
+        .map(|g| {
+            if force_t2 && g.requires_verification {
+                let mut view = g.clone();
+                view.requires_verification = false;
+                selector::select_kernel(model, &view)
+            } else {
+                selector::select_kernel(model, g)
+            }
+        })
+        .collect();
+    for (gi, group) in schedule.groups.iter().enumerate() {
+        if selections[gi].kernel == GroupSelection::PerOp {
+            continue;
+        }
+        anchor_group[group.anchor_op_index] = Some(gi);
+        for &a in &group.absorbed_ops {
+            absorbed[a] = true;
+        }
+        for &t in &group.eliminated_tensors {
+            if (t as usize) < tensor_count {
+                eliminated[t as usize] = true;
+            }
+        }
+    }
+    FusedPlan { anchor_group, absorbed, eliminated, selections }
+}
+
+/// T4.3 — the `fused-groups` header doc text for the emitted model wrapper.
+///
+/// Summarizes the T4.2 rule-tier selector verdict per group: which groups
+/// fuse into ONE composed `fused_*` call, which fell back to per-op and why
+/// (the mirror-gate reasons `select_kernel` already computed).  The header
+/// line carries the W0-profile numbers (SIMD-eligible counts) so the
+/// emitted code is directly checkable against
+/// `local-notes/evidence/composed-kernels/fused-profile.md`; per-group lines cover
+/// every composed group plus every composed-candidate group the mirror left
+/// per-op (the interesting fallbacks), and the remaining plain per-op
+/// groups collapse to one aggregate line.  Emitted ONLY when the model has
+/// ≥1 composed group — a zero-composed model's fused emission must stay
+/// byte-identical to the per-op emission, so the header is gated on
+/// `composed` by the caller.
+fn fused_groups_summary(plan: &FusedPlan, schedule: &FusedSchedule) -> String {
+    let selections = &plan.selections;
+    let total = schedule.groups.len();
+    let composed = selections
+        .iter()
+        .filter(|s| s.kernel != GroupSelection::PerOp)
+        .count();
+    let simd = selections
+        .iter()
+        .filter(|s| s.simd == selector::SimdEst::Simd)
+        .count();
+    let per_op = total - composed;
+
+    // Composed-kind tally for the header line ("10 fused_conv2d", or a
+    // "3 fused_conv2d, 2 fused_elementwise_chain" mix).
+    let mut kind_counts: Vec<(&'static str, usize)> = Vec::new();
+    for sel in selections.iter().filter(|s| s.kernel != GroupSelection::PerOp) {
+        let label = match sel.kernel {
+            GroupSelection::Composed(ComposedKind::Conv) => "fused_conv2d",
+            GroupSelection::Composed(ComposedKind::Chain) => "fused_elementwise_chain",
+            GroupSelection::Composed(ComposedKind::PoolFold) => "fused_pool_with_fold",
+            GroupSelection::PerOp => unreachable!("filtered above"),
+        };
+        match kind_counts.iter_mut().find(|(l, _)| *l == label) {
+            Some((_, n)) => *n += 1,
+            None => kind_counts.push((label, 1)),
+        }
+    }
+    let kinds = kind_counts
+        .iter()
+        .map(|(l, n)| format!("{n} {l}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut lines = vec![format!(
+        "fused-groups (T4.3 rule-tier dispatch): {total} groups - {composed} composed ({kinds}), {per_op} per-op; SIMD-eligible {simd}/{total} (W0 profile)"
+    )];
+    let mut plain_per_op = 0usize;
+    for (gi, (g, sel)) in schedule.groups.iter().zip(selections.iter()).enumerate() {
+        let tier = match sel.kernel {
+            GroupSelection::Composed(ComposedKind::Conv) => "fused_conv2d",
+            GroupSelection::Composed(ComposedKind::Chain) => "fused_elementwise_chain",
+            GroupSelection::Composed(ComposedKind::PoolFold) => "fused_pool_with_fold",
+            GroupSelection::PerOp => "per-op",
+        };
+        if sel.kernel != GroupSelection::PerOp || selector::has_composed_candidate(g) {
+            lines.push(format!(
+                "g{gi} (anchor op {}) {tier} - {}",
+                g.anchor_op_index, sel.reason
+            ));
+        } else {
+            plain_per_op += 1;
+        }
+    }
+    if plain_per_op > 0 {
+        lines.push(format!(
+            "remaining {plain_per_op} groups: plain per-op (no composed pattern) - per-group table: local-notes/evidence/composed-kernels/selector-output.md"
+        ));
+    }
+    lines.join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// T1.3 — liveness-arena emission
+// ---------------------------------------------------------------------------
+
+/// Compute the T1.3 arena plan for a model, or fall back to per-tensor
+/// stack emission when the planner rejects it.
+///
+/// Fallback triggers: planner error (mobilenet_v2's single 224²×32
+/// activation exceeds `MAX_INTERNAL`) or incomplete coverage (any
+/// intermediate the emitter will materialize has no arena slot — the
+/// planner keeps zero-size / never-written tensors out).  The fallback
+/// emits exactly the pre-T1.3 per-tensor code, bit-exact.
+fn arena_plan_for(model: &ParsedModel<'_>, storage: &[Storage]) -> Option<ArenaPlan> {
+    let plan = plan_arena(model).ok()?;
+    if plan.peak_arena_bytes == 0 {
+        return None;
+    }
+    for (t, s) in storage.iter().enumerate() {
+        if matches!(s, Storage::Tensor { .. }) && plan.offsets[t] == OFFSET_NONE {
+            return None;
+        }
+    }
+    Some(plan)
+}
+
+/// Per-call arena slice bookkeeping (T1.3).
+///
+/// The arena is ONE `[i8; ARENA_LEN]` local; each op call borrows the
+/// disjoint slices it touches through nested `split_at_mut` (safe, const
+/// offsets).  The planner guarantees a single op's slices never overlap:
+/// its inputs and output are simultaneously live at that op.  [`wrap`]
+/// prefixes the call statement with the borrows.
+struct ArenaCtx<'a> {
+    /// Arena emission active (plan succeeded and covers all intermediates).
+    on: bool,
+    /// Tensor idx → arena byte offset.
+    offsets: &'a [usize],
+    /// Tensor flat lens (byte counts), index-aligned with `offsets`.
+    lens: &'a [usize],
+    /// (slice ident, offset, len) registered for the current call.
+    regions: Vec<(Ident, usize, usize)>,
+    /// Op index — names the slice idents uniquely.
+    op: usize,
+    /// T4.2: graph-input slices come from the 16B-aligned staging buffer.
+    input_staged: bool,
+}
+
+impl<'a> ArenaCtx<'a> {
+    fn new(plan: Option<&'a ArenaPlan>, lens: &'a [usize]) -> Self {
+        let (on, offsets) = match plan {
+            Some(p) => (true, &p.offsets[..]),
+            None => (false, &[][..]),
+        };
+        Self { on, offsets, lens, regions: Vec::new(), op: 0, input_staged: false }
+    }
+
+    /// Arena off: every slice lookup returns `None`, so callers emit the
+    /// per-tensor `tensor_N.data` expressions (fallback mode).
+    fn inactive() -> Self {
+        Self { on: false, offsets: &[], lens: &[], regions: Vec::new(), op: 0, input_staged: false }
+    }
+
+    /// Register the arena slice for tensor `t`, deduped by (offset, len) so
+    /// repeated references to one tensor share a borrow.  `None` when the
+    /// arena is off or the tensor is not arena-backed (caller falls back to
+    /// the per-tensor local).
+    fn slice(&mut self, t: usize) -> Option<(Ident, usize, usize)> {
+        if !self.on {
+            return None;
+        }
+        let off = *self.offsets.get(t)?;
+        if off == OFFSET_NONE {
+            return None;
+        }
+        let len = *self.lens.get(t)?;
+        if let Some(existing) = self.regions.iter().find(|(_, o, l)| *o == off && *l == len) {
+            return Some(existing.clone());
+        }
+        let ident = Ident::new(
+            &format!("arena_slice_{}_{}", self.op, self.regions.len()),
+            proc_macro2::Span::call_site(),
+        );
+        let entry = (ident, off, len);
+        self.regions.push(entry.clone());
+        Some(entry)
+    }
+
+    /// Prefix a call with the nested `split_at_mut` borrows its slices need.
+    ///
+    /// Regions are sorted by offset; each is carved as `(gap, slice)` from
+    /// the remaining tail, so the slice idents are disjoint borrows of
+    /// `arena.data`.  All split indices are compile-time consts within
+    /// `[0, ARENA_LEN)` — no panic paths.
+    fn wrap(&self, call: TokenStream) -> TokenStream {
+        if !self.on || self.regions.is_empty() {
+            return call;
+        }
+        let mut regions = self.regions.clone();
+        regions.sort_by_key(|(_, off, _)| *off);
+        let last = regions.len() - 1;
+        let mut lets: Vec<TokenStream> = Vec::with_capacity(regions.len() * 2);
+        let mut prev_end = 0usize;
+        for (k, (ident, off, len)) in regions.iter().enumerate() {
+            let gap = if k == 0 { *off } else { off - prev_end };
+            if k == 0 {
+                lets.push(quote!(let (_, rest) = arena.data.split_at_mut(#gap);));
+            } else {
+                lets.push(quote!(let (_, rest) = rest.split_at_mut(#gap);));
+            }
+            if k == last {
+                lets.push(quote!(let (#ident, _) = rest.split_at_mut(#len);));
+            } else {
+                lets.push(quote!(let (#ident, rest) = rest.split_at_mut(#len);));
+            }
+            prev_end = off + len;
+        }
+        quote!({ #(#lets)* #call })
+    }
+}
+
+/// `&tensor_N.data` for an intermediate tensor — the composed params'
+/// runtime operand slices (the residual, chain operands) must point at the
+/// generated storage.  Fusion guarantees the residual is a computed
+/// intermediate (never a const / model I/O).
+fn tensor_ref_expr(
+    ctx: &mut ArenaCtx,
+    storage: &[Storage],
+    t: usize,
+) -> Result<TokenStream, String> {
+    match storage.get(t).ok_or_else(|| format!("tensor index {t} out of range"))? {
+        Storage::Tensor { idx } => match ctx.slice(*idx) {
+            Some((ident, _, _)) => Ok(quote!(&#ident[..])),
+            None => {
+                let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
+                Ok(quote!(&#var.data))
+            }
+        },
+        _ => Err(format!(
+            "tensor {t} must be an intermediate stack array for composed params"
+        )),
+    }
+}
+
+/// Runtime operand slice for a composed param struct: an emitted const for
+/// buffer-backed tensors, the arena slice / `&tensor_N.data` for
+/// intermediates, `&input[..]` for model inputs.  (The T4.1 per-op emitter
+/// rejects constant operands — "deferred to T4.2a fusion" — the composed
+/// paths are where they land.)
+fn operand_data(
+    model: &ParsedModel,
+    ctx: &mut ArenaCtx,
+    storage: &[Storage],
+    t: u32,
+    name: &Ident,
+) -> Result<(TokenStream, Vec<TokenStream>), String> {
+    match storage
+        .get(t as usize)
+        .ok_or_else(|| format!("tensor index {t} out of range"))?
+    {
+        Storage::Const => {
+            let c = weight_const(model, t, name)?;
+            Ok((quote!(&#name.0), vec![c]))
+        }
+        Storage::Tensor { idx } => match ctx.slice(*idx) {
+            Some((ident, _, _)) => Ok((quote!(&#ident[..]), Vec::new())),
+            None => {
+                let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
+                Ok((quote!(&#var.data), Vec::new()))
+            }
+        },
+        Storage::Input { start, len } => {
+            let end = start + len;
+            if ctx.input_staged {
+                Ok((quote!(&staged_input.data[#start..#end]), Vec::new()))
+            } else {
+                Ok((quote!(&input[#start..#end]), Vec::new()))
+            }
+        }
+        Storage::Output { .. } => Err(format!(
+            "tensor {t} is a model output used as a composed operand"
+        )),
+    }
+}
+
+/// `FusedActivationKind` → `ComposedActivation` token (the epilogue enum).
+fn composed_activation_enum(kind: FusedActivationKind) -> TokenStream {
+    match kind {
+        FusedActivationKind::Relu => {
+            quote!(::hematite_core::op_params::ComposedActivation::Relu)
+        }
+        FusedActivationKind::Relu6 => {
+            quote!(::hematite_core::op_params::ComposedActivation::Relu6)
+        }
+        FusedActivationKind::HardSwish => {
+            quote!(::hematite_core::op_params::ComposedActivation::HardSwish)
+        }
+    }
+}
+
+/// Fusion `ElementwiseKind` → `op_params::ElementwiseKind` token.
+fn chain_step_kind_enum(kind: FusedStepKind) -> TokenStream {
+    match kind {
+        FusedStepKind::Add => quote!(::hematite_core::op_params::ElementwiseKind::Add),
+        FusedStepKind::Mul => quote!(::hematite_core::op_params::ElementwiseKind::Mul),
+        FusedStepKind::Sub => quote!(::hematite_core::op_params::ElementwiseKind::Sub),
+        FusedStepKind::Relu => quote!(::hematite_core::op_params::ElementwiseKind::Relu),
+        FusedStepKind::Relu6 => quote!(::hematite_core::op_params::ElementwiseKind::Relu6),
+        FusedStepKind::HardSwish => {
+            quote!(::hematite_core::op_params::ElementwiseKind::HardSwish)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -328,30 +909,28 @@ enum Storage {
     Tensor { idx: usize },
 }
 
-/// How intermediate tensors are allocated in the generated code.
-#[derive(Clone, Copy)]
-enum TensorMode {
-    /// Per-tensor `#[repr(C, align(16))]` stack arrays (`tensor_N.data`).
-    Stack,
-    /// Slices carved from a caller-provided `arena: &mut [i8]` at liveness
-    /// offsets (`tensor_N: &mut [i8]`, `&*tensor_N` / `tensor_N`).
-    Arena,
-}
-
 /// Expression naming a tensor as a kernel *input* (immutable `&[i8]`).
-fn src_expr(storage: &[Storage], t: usize, mode: TensorMode) -> Result<TokenStream, String> {
+fn src_expr(
+    ctx: &mut ArenaCtx,
+    storage: &[Storage],
+    t: usize,
+) -> Result<TokenStream, String> {
     match storage.get(t).ok_or_else(|| format!("tensor index {t} out of range"))? {
         Storage::Input { start, len } => {
             let end = start + len;
-            Ok(quote!(&input[#start..#end]))
-        }
-        Storage::Tensor { idx } => {
-            let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
-            match mode {
-                TensorMode::Stack => Ok(quote!(&#var.data)),
-                TensorMode::Arena => Ok(quote!(&*#var)),
+            if ctx.input_staged {
+                Ok(quote!(&staged_input.data[#start..#end]))
+            } else {
+                Ok(quote!(&input[#start..#end]))
             }
         }
+        Storage::Tensor { idx } => match ctx.slice(*idx) {
+            Some((ident, _, _)) => Ok(quote!(&#ident[..])),
+            None => {
+                let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
+                Ok(quote!(&#var.data))
+            }
+        },
         Storage::Const => Err(format!(
             "tensor {t} is a constant (buffer-backed) but is used as a runtime op input; \
              constant data inputs are not supported in T4.1 (deferred to T4.2a fusion)"
@@ -361,19 +940,23 @@ fn src_expr(storage: &[Storage], t: usize, mode: TensorMode) -> Result<TokenStre
 }
 
 /// Expression naming a tensor as a kernel *output* (`&mut [i8]`).
-fn dst_expr(storage: &[Storage], t: usize, mode: TensorMode) -> Result<TokenStream, String> {
+fn dst_expr(
+    ctx: &mut ArenaCtx,
+    storage: &[Storage],
+    t: usize,
+) -> Result<TokenStream, String> {
     match storage.get(t).ok_or_else(|| format!("tensor index {t} out of range"))? {
         Storage::Output { start, len } => {
             let end = start + len;
             Ok(quote!(&mut output[#start..#end]))
         }
-        Storage::Tensor { idx } => {
-            let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
-            match mode {
-                TensorMode::Stack => Ok(quote!(&mut #var.data)),
-                TensorMode::Arena => Ok(quote!(#var)),
+        Storage::Tensor { idx } => match ctx.slice(*idx) {
+            Some((ident, _, _)) => Ok(quote!(&mut #ident[..])),
+            None => {
+                let var = Ident::new(&format!("tensor_{idx}"), proc_macro2::Span::call_site());
+                Ok(quote!(&mut #var.data))
             }
-        }
+        },
         _ => Err(format!("tensor {t} cannot be an op output (model input or const)")),
     }
 }
@@ -577,6 +1160,23 @@ fn i32_le_lit(bytes: &[u8]) -> Result<TokenStream, String> {
     Ok(quote!([ #(#vals),* ]))
 }
 
+/// Emit an int8 weight/alpha const guaranteed 16-byte aligned.
+///
+/// The ACCX/FC SIMD dispatch gates on `(w_ptr as usize) % 16 == 0` — a plain
+/// `const W: [i8; N]` has alignment 1, so zoo-model weights (emitted consts)
+/// silently fell back to scalar while synthetic bench weights (carved into the
+/// 16-aligned arena) engaged SIMD. Wrapping in a `#[repr(C, align(16))]`
+/// struct forces the const data's alignment; call sites reference `&W.0`.
+fn const_i8(name: &Ident, bytes: &[u8], len: usize) -> TokenStream {
+    let vals = i8_lit(bytes);
+    let ty = Ident::new(&format!("{name}Ty"), proc_macro2::Span::call_site());
+    quote! {
+        #[repr(C, align(16))]
+        struct #ty([i8; #len]);
+        const #name: #ty = #ty(#vals);
+    }
+}
+
 fn const_i32(name: &Ident, values: &[i32]) -> TokenStream {
     let vals: Vec<TokenStream> = values.iter().map(|&v| quote!(#v)).collect();
     let n = values.len();
@@ -615,12 +1215,7 @@ fn weight_const(model: &ParsedModel, tensor_idx: u32, name: &Ident) -> Result<To
             bytes.len()
         ));
     }
-    let vals = i8_lit(bytes);
-    // `static` (not `const`) wrapped in a `#[repr(align(16))]` struct so the
-    // symbol is 16-byte aligned in flash: the SIMD kernels gate on
-    // `weights.as_ptr() % 16 == 0`, and a bare `const [i8; N]` array has
-    // alignment 1. `&#name.0` points at field offset 0 → aligned.
-    Ok(quote!(static #name: WeightAlign<#len> = WeightAlign(#vals);))
+    Ok(const_i8(name, bytes, len))
 }
 
 /// Bias const for op `i`: int32 LE buffer, zero-padded when absent/optional.
@@ -660,12 +1255,9 @@ fn bias_const(
 struct OpEmission {
     consts: Vec<TokenStream>,
     call: TokenStream,
-    /// Documented scratch need for this op (kernel `*_scratch_size` default 0).
+    /// Macro-time scratch bytes this op needs (mirrors the S3 backend's
+    /// `*_scratch_size` formulas; 0 when the op never touches scratch).
     scratch: usize,
-    /// Statement advancing a `need` accumulator to the backend's runtime
-    /// scratch requirement for this op's params (only the arena path emits
-    /// these — see [`emit_model`]).
-    scratch_check: TokenStream,
 }
 
 /// Quantization context shared by the conv-family (conv/depthwise/FC).
@@ -710,33 +1302,227 @@ fn conv_quant(
     })
 }
 
+// ── Macro-time scratch-need computation ────────────────────────────────────
+//
+// The `KernelBackend` trait's `*_scratch_size` associated functions cannot be
+// called from this proc-macro (it runs at host compile time against a generic
+// `B`). Instead we recompute the S3 backend's documented scratch formulas
+// (hematite-s3/src/backend.rs, `conv1x1_scratch_need`,
+// `conv3x3_scratch_need`, `depthwise_scratch_need`, `softmax_scratch_size`)
+// directly from the parsed op params, which the macro always has. Backends
+// that ignore scratch (e.g. `RefBackend`) are unaffected — a larger
+// `SCRATCH_LEN` only sizes a stack array they never read. Keep these formulas
+// in sync with backend.rs.
+
+/// Round a channel count up to the TIE728 SIMD group width (16 lanes).
+const fn pad16(c: usize) -> usize {
+    (c + 15) & !15
+}
+
+/// Scratch bytes for a 1×1 conv (`conv1x1_scratch_need`).
+///
+/// T3.3 — when `in_c` is not a multiple of 16 the conv1x1 dispatch stages a
+/// zero-padded input copy (`pixels * pad16(in_c)` bytes — every NHWC pixel
+/// padded to the next multiple of 16) AND a zero-padded weight copy
+/// (`out_c * pad16(in_c)` bytes) in scratch, plus the i32 accumulator buffer
+/// and the optional weight-sum buffer. Keep in sync with
+/// `hematite-s3/src/backend.rs`.
+fn conv1x1_scratch_need_codegen(
+    in_c: usize,
+    out_c: usize,
+    pixels: usize,
+    input_offset: i32,
+) -> usize {
+    let padded_c = pad16(in_c);
+    let wsum = if input_offset != 0 { out_c * 4 } else { 0 };
+    if padded_c != in_c {
+        pixels * padded_c + out_c * padded_c + out_c * 4 + wsum
+    } else {
+        out_c * 4 + wsum
+    }
+}
+
+/// Scratch bytes for the FC/GEMM path (`fc_scratch_need` in backend.rs).
+///
+/// T3.6 — small / non-16 input dims: when `input_dim` is not a multiple of
+/// 16 the FC dispatch stages a zero-padded input copy (`pad16(input_dim)`
+/// bytes) AND a zero-padded weight copy (`output_dim * pad16(input_dim)`
+/// bytes) in scratch, plus the i32 accumulator buffer and the optional
+/// weight-sum buffer. Keep in sync with `hematite-s3/src/backend.rs`.
+fn fc_scratch_need_codegen(input_dim: usize, out_dim: usize, input_offset: i32) -> usize {
+    let padded_dim = pad16(input_dim);
+    let wsum = if input_offset != 0 { out_dim * 4 } else { 0 };
+    if padded_dim != input_dim {
+        padded_dim + out_dim * padded_dim + out_dim * 4 + wsum
+    } else {
+        out_dim * 4 + wsum
+    }
+}
+
+/// Scratch bytes for the general conv path (`conv3x3_scratch_need`).
+#[allow(clippy::too_many_arguments)]
+fn conv3x3_scratch_need_codegen(
+    in_h: usize,
+    in_w: usize,
+    in_c: usize,
+    out_h: usize,
+    out_w: usize,
+    out_c: usize,
+    filter_h: i32,
+    filter_w: i32,
+    stride_h: i32,
+    stride_w: i32,
+    dil_h: i32,
+    dil_w: i32,
+    input_offset: i32,
+) -> usize {
+    let dilated_filter_h = (filter_h - 1) * dil_h + 1;
+    let dilated_filter_w = (filter_w - 1) * dil_w + 1;
+    let pad_total_h =
+        ((out_h as i32 - 1) * stride_h + dilated_filter_h - in_h as i32).max(0) as usize;
+    let pad_total_w =
+        ((out_w as i32 - 1) * stride_w + dilated_filter_w - in_w as i32).max(0) as usize;
+    let padded_c = pad16(in_c);
+    let needs_pad = pad_total_h > 0 || pad_total_w > 0 || padded_c != in_c;
+    let wsum = if input_offset != 0 { out_c * 4 } else { 0 };
+    if needs_pad {
+        let pad_input_len = (in_h + pad_total_h) * (in_w + pad_total_w) * padded_c;
+        let pad_weights_len = out_c * 9 * padded_c;
+        pad_input_len + pad_weights_len + out_c * 4 + wsum
+    } else {
+        out_c * 4 + wsum
+    }
+}
+
+/// Scratch bytes for the depthwise path (`depthwise_scratch_need`).
+///
+/// T3.5 — depth_multiplier > 1: the kernel consumes `out_c`-channel vectors
+/// and the dispatch stages a REPLICATED input, so the padded channel count is
+/// `pad16(out_c)` (== `pad16(in_c)` for dm==1) and dm>1 always forces the
+/// staged path.
+///
+/// T3.5b — arbitrary filter sizes: the padded filter uses `taps = fh*fw`
+/// rows (not 9), and the non-3x3 anytap path needs an extra `pad16(out_c)*4`
+/// partial-accumulator buffer. Keep in sync with `hematite-s3/src/backend.rs`.
+#[allow(clippy::too_many_arguments)]
+pub fn depthwise_scratch_need_codegen(
+    in_h: usize,
+    in_w: usize,
+    in_c: usize,
+    out_h: usize,
+    out_w: usize,
+    out_c: usize,
+    filter_h: i32,
+    filter_w: i32,
+    stride_h: i32,
+    stride_w: i32,
+    dil_h: i32,
+    dil_w: i32,
+    depth_multiplier: i32,
+    input_offset: i32,
+) -> usize {
+    let is_3x3 = filter_h == 3 && filter_w == 3;
+    let taps = (filter_h.max(0) as usize) * (filter_w.max(0) as usize);
+    let dilated_filter_h = (filter_h - 1) * dil_h + 1;
+    let dilated_filter_w = (filter_w - 1) * dil_w + 1;
+    let pad_total_h =
+        ((out_h as i32 - 1) * stride_h + dilated_filter_h - in_h as i32).max(0) as usize;
+    let pad_total_w =
+        ((out_w as i32 - 1) * stride_w + dilated_filter_w - in_w as i32).max(0) as usize;
+    // dm==1: `out_c == in_c`, so pad16(out_c) == pad16(in_c) (historical).
+    let padded_c = pad16(if depth_multiplier > 1 { out_c } else { in_c });
+    let needs_channel_pad = padded_c != out_c;
+    let needs_pad =
+        pad_total_h > 0 || pad_total_w > 0 || needs_channel_pad || depth_multiplier > 1;
+    let wsum = if input_offset != 0 { out_c * 4 } else { 0 };
+    let partials = if is_3x3 { 0 } else { padded_c * 4 };
+    if needs_pad {
+        let pad_input_len = (in_h + pad_total_h) * (in_w + pad_total_w) * padded_c;
+        let pad_filter_len = if needs_channel_pad { taps * padded_c } else { 0 };
+        pad_input_len + pad_filter_len + padded_c * 4 + wsum + partials
+    } else {
+        out_c * 4 + wsum + partials
+    }
+}
+
+/// Scratch bytes for the softmax SIMD path (`S3Backend::softmax_scratch_size`):
+/// one `i32` exp value per row element. Extracted from `emit_softmax` so the
+/// T1.4 parity sweep can test it; keep in sync with backend.rs.
+fn softmax_scratch_need_codegen(row_size: i32) -> usize {
+    (row_size.max(0) as usize) * 4
+}
+
+/// Scratch bytes for a composed CONV_2D group (`fused_conv2d`, T2.2).
+///
+/// EQUALS the anchor conv's own need: the fused kernel stages nothing beyond
+/// the conv's padded-input/weights + accumulator + weight-sum buffers (the
+/// residual tensor is read in place and the conv output is register-held).
+/// Mirrors `hematite_s3::backend::fused_conv2d_scratch_need`. `emit_fused_conv`
+/// reports this value, so a composed group never under-sizes scratch vs the
+/// runtime decomposition (which forwards the same scratch to `conv2d`).
+#[allow(clippy::too_many_arguments)]
+fn fused_conv2d_scratch_need_codegen(
+    filter_h: i32,
+    filter_w: i32,
+    in_h: usize,
+    in_w: usize,
+    in_c: usize,
+    out_h: usize,
+    out_w: usize,
+    out_c: usize,
+    stride_h: i32,
+    stride_w: i32,
+    input_offset: i32,
+) -> usize {
+    if filter_h == 1 && filter_w == 1 {
+        conv1x1_scratch_need_codegen(in_c, out_c, in_h * in_w, input_offset)
+    } else {
+        conv3x3_scratch_need_codegen(
+            in_h, in_w, in_c, out_h, out_w, out_c, filter_h, filter_w,
+            stride_h, stride_w, 1, 1, input_offset,
+        )
+    }
+}
+
+/// Scratch bytes for a composed pool-with-fold group (`fused_pool_with_fold`,
+/// T2.4): the fold staging region — `num_elements` (flat_len of the fold
+/// input = the pool input flat count) padded up to the pool SIMD kernel's
+/// 16-byte multiple. The pool consumes no scratch on either side.
+/// Mirrors `hematite_s3::backend::fused_pool_with_fold_scratch_need`.
+/// `emit_fused_pool_fold` reports this value, so a composed group never
+/// under-sizes scratch vs the runtime decomposition (which materializes the
+/// fold into exactly `num_elements` bytes).
+fn fused_pool_fold_scratch_need_codegen(num_elements: usize) -> usize {
+    pad16(num_elements)
+}
+
 fn emit_op(
     model: &ParsedModel,
     storage: &[Storage],
+    ctx: &mut ArenaCtx,
     i: usize,
     op: &ParsedOp,
-    mode: TensorMode,
 ) -> Result<OpEmission, String> {
     match op.builtin_code {
-        0 => emit_elementwise(model, storage, i, op, quote!(add), ElementwiseKind::AddSub, mode),
-        1 => emit_pool(model, storage, i, op, quote!(average_pool_2d), mode),
-        3 => emit_conv2d(model, storage, i, op, mode),
-        4 => emit_depthwise(model, storage, i, op, mode),
-        9 => emit_fully_connected(model, storage, i, op, mode),
-        17 => emit_pool(model, storage, i, op, quote!(max_pool_2d), mode),
-        18 => emit_elementwise(model, storage, i, op, quote!(mul), ElementwiseKind::Mul, mode),
-        19 => emit_activation(model, storage, i, op, quote!(relu), 1, mode),
-        21 => emit_activation(model, storage, i, op, quote!(relu6), 3, mode),
-        22 => emit_reshape(model, storage, i, op, mode),
-        25 => emit_softmax(model, storage, i, op, mode),
-        34 => emit_pad(model, storage, i, op, mode),
-        39 => emit_transpose(model, storage, i, op, mode),
-        40 => emit_mean(model, storage, i, op, mode),
-        41 => emit_elementwise(model, storage, i, op, quote!(sub), ElementwiseKind::AddSub, mode),
-        54 => emit_prelu(model, storage, i, op, mode),
-        97 => emit_resize(model, storage, i, op, mode),
-        98 => emit_leaky_relu(model, storage, i, op, mode),
-        117 => emit_activation(model, storage, i, op, quote!(hard_swish), 0, mode),
+        0 => emit_elementwise(model, storage, ctx, i, op, quote!(add), ElementwiseKind::AddSub),
+        1 => emit_pool(model, storage, ctx, i, op, quote!(average_pool_2d)),
+        3 => emit_conv2d(model, storage, ctx, i, op).map(|c| c.em),
+        4 => emit_depthwise(model, storage, ctx, i, op),
+        9 => emit_fully_connected(model, storage, ctx, i, op),
+        17 => emit_pool(model, storage, ctx, i, op, quote!(max_pool_2d)),
+        18 => emit_elementwise(model, storage, ctx, i, op, quote!(mul), ElementwiseKind::Mul),
+        19 => emit_activation(model, storage, ctx, i, op, quote!(relu), 1),
+        21 => emit_activation(model, storage, ctx, i, op, quote!(relu6), 3),
+        22 => emit_reshape(model, storage, ctx, i, op),
+        25 => emit_softmax(model, storage, ctx, i, op),
+        34 => emit_pad(model, storage, ctx, i, op),
+        39 => emit_transpose(model, storage, ctx, i, op),
+        40 => emit_mean(model, storage, ctx, i, op),
+        41 => emit_elementwise(model, storage, ctx, i, op, quote!(sub), ElementwiseKind::AddSub),
+        54 => emit_prelu(model, storage, ctx, i, op),
+        97 => emit_resize(model, storage, ctx, i, op),
+        98 => emit_leaky_relu(model, storage, ctx, i, op),
+        117 => emit_activation(model, storage, ctx, i, op, quote!(hard_swish), 0),
         code => Err(format!(
             "unsupported operator (builtin_code={code}) in subgraph[0]; T4.1 dispatches only the \
              in-scope op set (conv2d, depthwise_conv2d, fully_connected, average_pool_2d, \
@@ -747,13 +1533,7 @@ fn emit_op(
     }
 }
 
-fn emit_conv2d(
-    model: &ParsedModel,
-    storage: &[Storage],
-    i: usize,
-    op: &ParsedOp,
-    mode: TensorMode,
-) -> Result<OpEmission, String> {
+fn emit_conv2d(model: &ParsedModel, storage: &[Storage], ctx: &mut ArenaCtx, i: usize, op: &ParsedOp) -> Result<ConvEmission, String> {
     let opts = match op.options.as_ref() {
         Some(ParsedOptions::Conv2D {
             padding,
@@ -773,10 +1553,12 @@ fn emit_conv2d(
     let input = tensor_at(model.tensors(), in_t)?;
     let weights = tensor_at(model.tensors(), w_t)?;
     let output = tensor_at(model.tensors(), out_t)?;
-    let input_shape = arr4(shape4(&input.shape)?);
+    let input_raw = shape4(&input.shape)?;
+    let input_shape = arr4(input_raw);
     let filter_raw = shape4(&weights.shape)?;
     let filter_shape = arr4(filter_raw);
-    let output_shape = arr4(shape4(&output.shape)?);
+    let output_raw = shape4(&output.shape)?;
+    let output_shape = arr4(output_raw);
     let out_channels = filter_raw[0] as usize;
     let q = conv_quant(input, weights, output, out_channels, fused_activation)?;
     let input_offset = q.input_offset;
@@ -816,26 +1598,50 @@ fn emit_conv2d(
                 quantized_activation_max: #act_max,
             };
     };
-    let src = src_expr(storage, in_t as usize, mode)?;
-    let dst = dst_expr(storage, out_t as usize, mode)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
-        backend.conv2d(#src, &(#w_name.0), &#b_name, &#p_name, #dst, scratch)?;
+        backend.conv2d(#src, &#w_name.0, &#b_name, &#p_name, #dst, scratch)?;
     };
-    Ok(OpEmission {
-        consts: vec![weights_c, bias_c, mult_c, shift_c, params_c],
-        call,
-        scratch: 0,
-        scratch_check: quote!(need = need.max(B::conv2d_scratch_size(&#p_name));),
+    let scratch = if filter_raw[1] == 1 && filter_raw[2] == 1 {
+        conv1x1_scratch_need_codegen(
+            input_raw[3].max(0) as usize,
+            out_channels,
+            (input_raw[1].max(0) as usize) * (input_raw[2].max(0) as usize),
+            input_offset,
+        )
+    } else {
+        conv3x3_scratch_need_codegen(
+            input_raw[1].max(0) as usize,
+            input_raw[2].max(0) as usize,
+            input_raw[3].max(0) as usize,
+            output_raw[1].max(0) as usize,
+            output_raw[2].max(0) as usize,
+            output_raw[3].max(0) as usize,
+            filter_raw[1],
+            filter_raw[2],
+            stride_h,
+            stride_w,
+            dilation_h,
+            dilation_w,
+            input_offset,
+        )
+    };
+    Ok(ConvEmission {
+        em: OpEmission {
+            consts: vec![weights_c, bias_c, mult_c, shift_c, params_c],
+            call,
+            scratch,
+        },
+        weight: w_name,
+        bias: b_name,
+        mult: m_name,
+        shift: s_name,
+        params: p_name,
     })
 }
 
-fn emit_depthwise(
-    model: &ParsedModel,
-    storage: &[Storage],
-    i: usize,
-    op: &ParsedOp,
-    mode: TensorMode,
-) -> Result<OpEmission, String> {
+fn emit_depthwise(model: &ParsedModel, storage: &[Storage], ctx: &mut ArenaCtx, i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
     let opts = match op.options.as_ref() {
         Some(ParsedOptions::DepthwiseConv2D {
             padding,
@@ -864,10 +1670,12 @@ fn emit_depthwise(
     let input = tensor_at(model.tensors(), in_t)?;
     let weights = tensor_at(model.tensors(), w_t)?;
     let output = tensor_at(model.tensors(), out_t)?;
-    let input_shape = arr4(shape4(&input.shape)?);
+    let input_raw = shape4(&input.shape)?;
+    let input_shape = arr4(input_raw);
     let filter_raw = shape4(&weights.shape)?;
     let filter_shape = arr4(filter_raw);
-    let output_shape = arr4(shape4(&output.shape)?);
+    let output_raw = shape4(&output.shape)?;
+    let output_shape = arr4(output_raw);
     let out_channels = filter_raw[3] as usize;
     let q = conv_quant(input, weights, output, out_channels, fused_activation)?;
     let input_offset = q.input_offset;
@@ -908,26 +1716,35 @@ fn emit_depthwise(
                 quantized_activation_max: #act_max,
             };
     };
-    let src = src_expr(storage, in_t as usize, mode)?;
-    let dst = dst_expr(storage, out_t as usize, mode)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
-        backend.depthwise_conv2d(#src, &(#w_name.0), &#b_name, &#p_name, #dst, scratch)?;
+        backend.depthwise_conv2d(#src, &#w_name.0, &#b_name, &#p_name, #dst, scratch)?;
     };
+    let scratch = depthwise_scratch_need_codegen(
+        input_raw[1].max(0) as usize,
+        input_raw[2].max(0) as usize,
+        input_raw[3].max(0) as usize,
+        output_raw[1].max(0) as usize,
+        output_raw[2].max(0) as usize,
+        output_raw[3].max(0) as usize,
+        filter_raw[1],
+        filter_raw[2],
+        stride_h,
+        stride_w,
+        dilation_h,
+        dilation_w,
+        depth_multiplier,
+        input_offset,
+    );
     Ok(OpEmission {
         consts: vec![weights_c, bias_c, mult_c, shift_c, params_c],
         call,
-        scratch: 0,
-        scratch_check: quote!(need = need.max(B::depthwise_conv2d_scratch_size(&#p_name));),
+        scratch,
     })
 }
 
-fn emit_fully_connected(
-    model: &ParsedModel,
-    storage: &[Storage],
-    i: usize,
-    op: &ParsedOp,
-    mode: TensorMode,
-) -> Result<OpEmission, String> {
+fn emit_fully_connected(model: &ParsedModel, storage: &[Storage], ctx: &mut ArenaCtx, i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
     let opts = match op.options.as_ref() {
         Some(ParsedOptions::FullyConnected {
             fused_activation,
@@ -978,18 +1795,32 @@ fn emit_fully_connected(
                 quantized_activation_max: #act_max,
             };
     };
-    let src = src_expr(storage, in_t as usize, mode)?;
-    let dst = dst_expr(storage, out_t as usize, mode)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
-        backend.fully_connected(#src, &(#w_name.0), &#b_name, &#p_name, #dst, scratch)?;
+        backend.fully_connected(#src, &#w_name.0, &#b_name, &#p_name, #dst, scratch)?;
     };
     let _ = batches;
+    let out_dim = output_dim as usize;
+    let in_dim = input_dim as usize;
+    let fc_scratch = fc_scratch_need_codegen(in_dim, out_dim, input_offset);
     Ok(OpEmission {
         consts: vec![weights_c, bias_c, mult_c, shift_c, params_c],
         call,
-        scratch: 0,
-        scratch_check: TokenStream::new(),
+        scratch: fc_scratch,
     })
+}
+
+/// Per-op CONV_2D emission plus the const names the composed
+/// [`emit_fused_conv`] re-references (`FusedConvParams` embeds the anchor's
+/// `Conv2DParams` and per-channel slices).
+struct ConvEmission {
+    em: OpEmission,
+    weight: Ident,
+    bias: Ident,
+    mult: Ident,
+    shift: Ident,
+    params: Ident,
 }
 
 /// TFLM FC shape math: `input_dim` = flattened non-batch dims (or last dim
@@ -1029,10 +1860,10 @@ fn fc_dimensions(
 fn emit_pool(
     model: &ParsedModel,
     storage: &[Storage],
+    ctx: &mut ArenaCtx,
     i: usize,
     op: &ParsedOp,
     method: TokenStream,
-    mode: TensorMode,
 ) -> Result<OpEmission, String> {
     let opts = match op.options.as_ref() {
         Some(ParsedOptions::Pool2D {
@@ -1074,8 +1905,8 @@ fn emit_pool(
                 quantized_activation_max: #act_max,
             };
     };
-    let src = src_expr(storage, in_t as usize, mode)?;
-    let dst = dst_expr(storage, out_t as usize, mode)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.#method(#src, &#p_name, #dst)?;
     };
@@ -1083,17 +1914,10 @@ fn emit_pool(
         consts: vec![params_c],
         call,
         scratch: 0,
-        scratch_check: TokenStream::new(),
     })
 }
 
-fn emit_softmax(
-    model: &ParsedModel,
-    storage: &[Storage],
-    i: usize,
-    op: &ParsedOp,
-    mode: TensorMode,
-) -> Result<OpEmission, String> {
+fn emit_softmax(model: &ParsedModel, storage: &[Storage], ctx: &mut ArenaCtx, i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
     // TFLM int8 softmax only supports beta = 1.0; a SoftmaxOptions table
     // carrying exactly that (the converter default) is accepted and ignored.
     match op.options.as_ref() {
@@ -1110,7 +1934,7 @@ fn emit_softmax(
     let input = tensor_at(model.tensors(), in_t)?;
     let output = tensor_at(model.tensors(), out_t)?;
     let shape = shape4(&input.shape)?;
-    let row_size = shape[3] as i32;
+    let row_size = shape[3];
     let num_rows = (flat_len(&input.shape)? as i32) / row_size;
     let in_scale = tensor_scale(input)?;
     let in_zp = tensor_zp(input)?;
@@ -1118,6 +1942,16 @@ fn emit_softmax(
     // Q5.26 logit scaling: sadhg(diff, m) << (input_left_shift + 1) must equal
     // round(diff * in_scale * 2^26) → input_left_shift = 25 + s.
     let input_left_shift = 25 + s;
+
+    // TFLM-correct `diff_min` (was hardcoded -128). TFLM softmax_common.cc
+    // @ 18b9e6f2a8c5a9518e588f59c2ba16ef7ef9d551:
+    //   diff_min = -CalculateInputRadius(kScaledDiffIntegerBits=5, left_shift),
+    // with CalculateInputRadius (quantization_util.cc, same SHA)
+    //   = floor((2^5 - 1) * 2^(31 - 5) / 2^left_shift) = floor(31 * 2^26 / 2^ls).
+    // TFLM's shift comes from QuantizeMultiplier(in_scale * 2^26) → `26 + s`,
+    // while we store `25 + s` (the extra +1 lives in the kernel's sadhg doubling
+    // shift), so the radius uses `input_left_shift + 1` to match TFLM exactly:
+    let diff_min = -(((31i64) << 26) >> (input_left_shift + 1)) as i32;
 
     let p_name = Ident::new(&format!("SOFTMAX_PARAMS_{i}"), proc_macro2::Span::call_site());
     let params_c = quote! {
@@ -1127,15 +1961,15 @@ fn emit_softmax(
                 row_size: #row_size,
                 input_multiplier: #m,
                 input_left_shift: #input_left_shift,
-                diff_min: -128,
+                diff_min: #diff_min,
                 input_offset: #in_zp,
                 output_offset: -128,
                 quantized_activation_min: -128,
                 quantized_activation_max: 127,
             };
     };
-    let src = src_expr(storage, in_t as usize, mode)?;
-    let dst = dst_expr(storage, out_t as usize, mode)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.softmax(#src, &#p_name, #dst, scratch)?;
     };
@@ -1143,8 +1977,7 @@ fn emit_softmax(
     Ok(OpEmission {
         consts: vec![params_c],
         call,
-        scratch: 0,
-        scratch_check: quote!(need = need.max(B::softmax_scratch_size(&#p_name));),
+        scratch: softmax_scratch_need_codegen(row_size),
     })
 }
 
@@ -1152,11 +1985,11 @@ fn emit_softmax(
 fn emit_activation(
     model: &ParsedModel,
     storage: &[Storage],
+    ctx: &mut ArenaCtx,
     i: usize,
     op: &ParsedOp,
     method: TokenStream,
     fused: i8,
-    mode: TensorMode,
 ) -> Result<OpEmission, String> {
     let in_t = *op.inputs.first().ok_or("activation missing input tensor")?;
     let out_t = *op.outputs.first().ok_or("activation missing output tensor")?;
@@ -1201,8 +2034,8 @@ fn emit_activation(
                 output_multiplier_exponent: 0,
             };
     };
-    let src = src_expr(storage, in_t as usize, mode)?;
-    let dst = dst_expr(storage, out_t as usize, mode)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.#method(#src, &#p_name, #dst)?;
     };
@@ -1210,16 +2043,15 @@ fn emit_activation(
         consts: vec![params_c],
         call,
         scratch: 0,
-        scratch_check: TokenStream::new(),
     })
 }
 
 fn emit_leaky_relu(
     model: &ParsedModel,
     storage: &[Storage],
+    ctx: &mut ArenaCtx,
     i: usize,
     op: &ParsedOp,
-    mode: TensorMode,
 ) -> Result<OpEmission, String> {
     let alpha = match op.options.as_ref() {
         Some(ParsedOptions::LeakyRelu { alpha }) => f64::from(*alpha),
@@ -1265,8 +2097,8 @@ fn emit_leaky_relu(
                 output_multiplier_exponent: 0,
             };
     };
-    let src = src_expr(storage, in_t as usize, mode)?;
-    let dst = dst_expr(storage, out_t as usize, mode)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.leaky_relu(#src, &#p_name, #dst)?;
     };
@@ -1274,16 +2106,15 @@ fn emit_leaky_relu(
         consts: vec![params_c],
         call,
         scratch: 0,
-        scratch_check: TokenStream::new(),
     })
 }
 
 fn emit_prelu(
     model: &ParsedModel,
     storage: &[Storage],
+    ctx: &mut ArenaCtx,
     i: usize,
     op: &ParsedOp,
-    mode: TensorMode,
 ) -> Result<OpEmission, String> {
     if !matches!(op.options.as_ref(), None | Some(ParsedOptions::Prelu)) {
         return Err(format!("op {i}: unexpected options for prelu"));
@@ -1323,7 +2154,7 @@ fn emit_prelu(
                 output_multiplier_identity: 0,
                 output_shift_identity: 0,
                 alpha_offset: #alpha_zp,
-                alpha_data: &(#a_name.0),
+                alpha_data: &#a_name.0,
                 output_multiplier_1: #m1,
                 output_shift_1: #s1,
                 output_multiplier_2: #m2,
@@ -1334,8 +2165,8 @@ fn emit_prelu(
                 output_multiplier_exponent: 0,
             };
     };
-    let src = src_expr(storage, in_t as usize, mode)?;
-    let dst = dst_expr(storage, out_t as usize, mode)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.prelu(#src, &#p_name, #dst)?;
     };
@@ -1343,7 +2174,6 @@ fn emit_prelu(
         consts: vec![alpha_c, params_c],
         call,
         scratch: 0,
-        scratch_check: TokenStream::new(),
     })
 }
 
@@ -1353,14 +2183,70 @@ enum ElementwiseKind {
     Mul,
 }
 
+/// TFLM int8 elementwise requantize triple (the `ElementwiseParams` quant
+/// fields), shared by the per-op emission and the composed chain / pool-fold
+/// param derivation (T1.2) so both use the identical rounding sequence.
+struct ElementwiseQuant {
+    in1_off: i32,
+    in2_off: i32,
+    out_off: i32,
+    left_shift: i32,
+    input1_multiplier: i32,
+    input1_shift: i32,
+    input2_multiplier: i32,
+    input2_shift: i32,
+    output_multiplier: i32,
+    output_shift: i32,
+}
+
+/// ADD/SUB: twice_max scaling with `left_shift = 20` (add_common.cc); MUL:
+/// single output ratio.  Offsets follow the per-op emission convention
+/// (`-zp` inputs, `+zp` output).
+fn elementwise_quant(
+    input1: &ParsedTensor,
+    input2: &ParsedTensor,
+    output: &ParsedTensor,
+    kind: ElementwiseKind,
+) -> Result<ElementwiseQuant, String> {
+    let in1_scale = tensor_scale(input1)?;
+    let in2_scale = tensor_scale(input2)?;
+    let out_scale = tensor_scale(output)?;
+    let (left_shift, i1m, i1s, i2m, i2s, om, os) = match kind {
+        ElementwiseKind::AddSub => {
+            let twice_max = 2.0 * in1_scale.max(in2_scale);
+            let ls = 20i32;
+            let (a, b) = quantize_multiplier(in1_scale / twice_max);
+            let (c, d) = quantize_multiplier(in2_scale / twice_max);
+            let (e, f) = quantize_multiplier(twice_max / ((1i32 << ls) as f64 * out_scale));
+            (ls, a, b, c, d, e, f)
+        }
+        ElementwiseKind::Mul => {
+            let (e, f) = quantize_multiplier(in1_scale * in2_scale / out_scale);
+            (0, 0, 0, 0, 0, e, f)
+        }
+    };
+    Ok(ElementwiseQuant {
+        in1_off: -tensor_zp(input1)?,
+        in2_off: -tensor_zp(input2)?,
+        out_off: tensor_zp(output)?,
+        left_shift,
+        input1_multiplier: i1m,
+        input1_shift: i1s,
+        input2_multiplier: i2m,
+        input2_shift: i2s,
+        output_multiplier: om,
+        output_shift: os,
+    })
+}
+
 fn emit_elementwise(
     model: &ParsedModel,
     storage: &[Storage],
+    ctx: &mut ArenaCtx,
     i: usize,
     op: &ParsedOp,
     method: TokenStream,
     kind: ElementwiseKind,
-    mode: TensorMode,
 ) -> Result<OpEmission, String> {
     let fused_activation = match op.options.as_ref() {
         Some(ParsedOptions::Add { fused_activation, .. })
@@ -1381,53 +2267,43 @@ fn emit_elementwise(
             "op {i}: elementwise input1/input2/output element counts must match"
         ));
     }
-    let in1_scale = tensor_scale(input1)?;
-    let in2_scale = tensor_scale(input2)?;
+    let q = elementwise_quant(input1, input2, output, kind)?;
     let out_scale = tensor_scale(output)?;
-    let in1_off = -tensor_zp(input1)?;
-    let in2_off = -tensor_zp(input2)?;
     let out_off = tensor_zp(output)?;
     let (act_min, act_max) = act_range(fused_activation, out_scale, out_off);
-
-    let (left_shift, i1m, i1s, i2m, i2s, om, os) = match kind {
-        ElementwiseKind::AddSub => {
-            // TFLM int8 Add/Sub (add_common.cc): twice_max scaling with
-            // left_shift = 20; output ratio carries 2^left_shift.
-            let twice_max = 2.0 * in1_scale.max(in2_scale);
-            let ls = 20i32;
-            let (a, b) = quantize_multiplier(in1_scale / twice_max);
-            let (c, d) = quantize_multiplier(in2_scale / twice_max);
-            let (e, f) = quantize_multiplier(twice_max / ((1i32 << ls) as f64 * out_scale));
-            (ls, a, b, c, d, e, f)
-        }
-        ElementwiseKind::Mul => {
-            let (e, f) = quantize_multiplier(in1_scale * in2_scale / out_scale);
-            (0, 0, 0, 0, 0, e, f)
-        }
-    };
+    let q_in1_off = q.in1_off;
+    let q_in2_off = q.in2_off;
+    let q_out_off = q.out_off;
+    let q_left_shift = q.left_shift;
+    let q_i1m = q.input1_multiplier;
+    let q_i1s = q.input1_shift;
+    let q_i2m = q.input2_multiplier;
+    let q_i2s = q.input2_shift;
+    let q_om = q.output_multiplier;
+    let q_os = q.output_shift;
 
     let p_name = Ident::new(&format!("ELEMENTWISE_PARAMS_{i}"), proc_macro2::Span::call_site());
     let params_c = quote! {
         const #p_name: ::hematite_core::op_params::ElementwiseParams =
             ::hematite_core::op_params::ElementwiseParams {
                 num_elements: #num_elements,
-                input1_offset: #in1_off,
-                input2_offset: #in2_off,
-                output_offset: #out_off,
-                output_multiplier: #om,
-                output_shift: #os,
-                left_shift: #left_shift,
-                input1_multiplier: #i1m,
-                input1_shift: #i1s,
-                input2_multiplier: #i2m,
-                input2_shift: #i2s,
+                input1_offset: #q_in1_off,
+                input2_offset: #q_in2_off,
+                output_offset: #q_out_off,
+                output_multiplier: #q_om,
+                output_shift: #q_os,
+                left_shift: #q_left_shift,
+                input1_multiplier: #q_i1m,
+                input1_shift: #q_i1s,
+                input2_multiplier: #q_i2m,
+                input2_shift: #q_i2s,
                 quantized_activation_min: #act_min,
                 quantized_activation_max: #act_max,
             };
     };
-    let src1 = src_expr(storage, in1_t as usize, mode)?;
-    let src2 = src_expr(storage, in2_t as usize, mode)?;
-    let dst = dst_expr(storage, out_t as usize, mode)?;
+    let src1 = src_expr(ctx, storage, in1_t as usize)?;
+    let src2 = src_expr(ctx, storage, in2_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.#method(#src1, #src2, &#p_name, #dst)?;
     };
@@ -1435,17 +2311,538 @@ fn emit_elementwise(
         consts: vec![params_c],
         call,
         scratch: 0,
-        scratch_check: TokenStream::new(),
     })
 }
 
-fn emit_mean(
+// ---------------------------------------------------------------------------
+// Composed-kernel emitters (T1.2 — one `fused_*` call per composed group)
+// ---------------------------------------------------------------------------
+
+/// Emit the composed CONV_2D call for a group with an absorbed residual-ADD
+/// and/or trailing activation (patterns (c) / (a)).
+///
+/// The `FusedConvParams` (T2.1) is built as a runtime `let` inside
+/// `predict_with_scratch`: every value is a macro-time literal except the
+/// anchor's consts (re-referenced) and the residual slice
+/// (`&tensor_N.data` — the residual is a computed intermediate produced
+/// before the conv, per the fusion `HasOneUse` guard).
+fn emit_fused_conv(
     model: &ParsedModel,
     storage: &[Storage],
+    ctx: &mut ArenaCtx,
     i: usize,
     op: &ParsedOp,
-    mode: TensorMode,
+    group: &FusedGroup,
 ) -> Result<OpEmission, String> {
+    // The per-op conv emission inside the composed path registers slices
+    // for the anchor's OWN src/dst — discarded with the call; only its
+    // consts and scratch are reused.  A throwaway ctx keeps those slices
+    // out of the fused call's region list (the fused call re-registers the
+    // slices it actually references).
+    let conv = emit_conv2d(model, storage, &mut ArenaCtx::inactive(), i, op)?;
+    let in_t = *op.inputs.first().ok_or("conv2d missing input tensor")?;
+    let out_t = *op.outputs.first().ok_or("conv2d missing output tensor")?;
+    let output = tensor_at(model.tensors(), out_t)?;
+    let out_scale = tensor_scale(output)? as f32;
+    let out_zp = tensor_zp(output)? as i64;
+
+    // T2.2 — the composed scratch need is the anchor conv's own need (the
+    // fused kernel stages nothing beyond the conv), computed through the
+    // explicit `fused_conv2d_scratch_need_codegen` mirror so the T1.4 parity
+    // test can assert the composed value directly. Derives the same shapes /
+    // stride / input_offset `emit_conv2d` used, so the value equals
+    // `conv.em.scratch` exactly.
+    let opts = match op.options.as_ref() {
+        Some(ParsedOptions::Conv2D {
+            stride_w,
+            stride_h,
+            fused_activation,
+            ..
+        }) => (*stride_w, *stride_h, *fused_activation),
+        other => return Err(format!("op {i}: expected Conv2D options, got {other:?}")),
+    };
+    let (stride_w, stride_h, fused_activation) = opts;
+    let w_t = *op.inputs.get(1).ok_or("conv2d missing weights tensor")?;
+    let input = tensor_at(model.tensors(), in_t)?;
+    let weights = tensor_at(model.tensors(), w_t)?;
+    let input_raw = shape4(&input.shape)?;
+    let filter_raw = shape4(&weights.shape)?;
+    let output_raw = shape4(&output.shape)?;
+    let out_channels = filter_raw[0] as usize;
+    let input_offset = conv_quant(input, weights, output, out_channels, fused_activation)?
+        .input_offset;
+
+    let residual_ts = match &group.residual_add {
+        Some(res) => {
+            let r_t = tensor_at(model.tensors(), res.residual_tensor)?;
+            let r_expr = tensor_ref_expr(ctx, storage, res.residual_tensor as usize)?;
+            let r_scale = tensor_scale(r_t)? as f32;
+            let r_zp = tensor_zp(r_t)? as i64;
+            let r_out_scale = res.output_scale;
+            let r_out_zp = res.output_zero_point;
+            let rq = &res.requantize;
+            let rq_i1m = rq.input1_multiplier;
+            let rq_i1s = rq.input1_shift;
+            let rq_i2m = rq.input2_multiplier;
+            let rq_i2s = rq.input2_shift;
+            let rq_ls = rq.left_shift;
+            let rq_om = rq.output_multiplier;
+            let rq_os = rq.output_shift;
+            quote! {
+                Some(::hematite_core::op_params::ResidualAddParams {
+                    residual_data: #r_expr,
+                    residual_scale: #r_scale,
+                    residual_zero_point: #r_zp,
+                    output_scale: #r_out_scale,
+                    output_zero_point: #r_out_zp,
+                    input1_multiplier: #rq_i1m,
+                    input1_shift: #rq_i1s,
+                    input2_multiplier: #rq_i2m,
+                    input2_shift: #rq_i2s,
+                    left_shift: #rq_ls,
+                    output_multiplier: #rq_om,
+                    output_shift: #rq_os,
+                })
+            }
+        }
+        None => quote!(None),
+    };
+
+    let (act_kind, act_in_off, act_out_off, act_mult, act_shift, act_min, act_max) =
+        match &group.activation {
+            Some(act) => {
+                let act_idx = *group
+                    .absorbed_ops
+                    .last()
+                    .ok_or_else(|| format!("group anchor {i}: activation without absorbed op"))?;
+                let act_op = model
+                    .ops()
+                    .get(act_idx)
+                    .ok_or_else(|| format!("group anchor {i}: absorbed op {act_idx} out of range"))?;
+                let a_in_t = *act_op.inputs.first().ok_or("activation missing input tensor")?;
+                let a_out_t = *act_op.outputs.first().ok_or("activation missing output tensor")?;
+                let a_in = tensor_at(model.tensors(), a_in_t)?;
+                let a_out = tensor_at(model.tensors(), a_out_t)?;
+                let (am, ash) = quantize_multiplier(tensor_scale(a_in)? / tensor_scale(a_out)?);
+                (
+                    composed_activation_enum(act.kind),
+                    -tensor_zp(a_in)?,
+                    tensor_zp(a_out)?,
+                    am,
+                    ash,
+                    act.quantized_min,
+                    act.quantized_max,
+                )
+            }
+            None => (
+                quote!(::hematite_core::op_params::ComposedActivation::None),
+                0i32,
+                0i32,
+                0i32,
+                0i32,
+                -128i32,
+                127i32,
+            ),
+        };
+
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, group.output_tensor as usize)?;
+    let conv_params = &conv.params;
+    let conv_mult = &conv.mult;
+    let conv_shift = &conv.shift;
+    let conv_weight = &conv.weight;
+    let conv_bias = &conv.bias;
+    // T4.3 — shape-typed composed call: the selector verdict knows the
+    // shapes at macro time, so they are emitted as a named tuple const and
+    // routed into the params via struct-update on the anchor's per-op const
+    // (mirrors the spec.rs `Prepared*` precedent of carrying the shapes a
+    // shape-specialized dispatch keys off; the per-op const stays untouched).
+    let shapes_name =
+        Ident::new(&format!("FUSED_CONV_SHAPES_{i}"), proc_macro2::Span::call_site());
+    let in_lit = arr4(input_raw);
+    let filter_lit = arr4(filter_raw);
+    let out_lit = arr4(output_raw);
+    let shapes_c = quote! {
+        /// T4.3 — composed `fused_conv2d` shape consts `(input, filter,
+        /// output)` (NHWC / OHWI) for the group at op #{i}.
+        const #shapes_name: ([i32; 4], [i32; 4], [i32; 4]) =
+            (#in_lit, #filter_lit, #out_lit);
+    };
+    let p = Ident::new(&format!("FUSED_CONV_PARAMS_{i}"), proc_macro2::Span::call_site());
+    let call = quote! {
+        let #p = ::hematite_core::op_params::FusedConvParams {
+            conv: ::hematite_core::op_params::Conv2DParams {
+                input_shape: #shapes_name.0,
+                filter_shape: #shapes_name.1,
+                output_shape: #shapes_name.2,
+                ..#conv_params
+            },
+            output_scale: #out_scale,
+            output_zero_point: #out_zp,
+            output_multiplier_per_channel: &#conv_mult,
+            output_shift_per_channel: &#conv_shift,
+            residual: #residual_ts,
+            activation: ::hematite_core::op_params::ActivationEpilogueParams {
+                kind: #act_kind,
+                input_offset: #act_in_off,
+                output_offset: #act_out_off,
+                output_multiplier: #act_mult,
+                output_shift: #act_shift,
+                quantized_activation_min: #act_min,
+                quantized_activation_max: #act_max,
+            },
+        };
+        backend.fused_conv2d(#src, &#conv_weight.0, &#conv_bias, &#p, #dst, scratch)?;
+    };
+    let mut consts = conv.em.consts;
+    consts.push(shapes_c);
+    Ok(OpEmission {
+        consts,
+        call,
+        scratch: fused_conv2d_scratch_need_codegen(
+            filter_raw[1],
+            filter_raw[2],
+            input_raw[1].max(0) as usize,
+            input_raw[2].max(0) as usize,
+            input_raw[3].max(0) as usize,
+            output_raw[1].max(0) as usize,
+            output_raw[2].max(0) as usize,
+            output_raw[3].max(0) as usize,
+            stride_h,
+            stride_w,
+            input_offset,
+        ),
+    })
+}
+
+/// Emit the composed elementwise-chain call (pattern (b)): step 0 is the
+/// ANCHOR elementwise op itself (quant derived from its own tensors, the
+/// same math the per-op emitter uses), steps 1.. are the absorbed ops
+/// (kind + operand + `StepRequantize` carried by the T1.1 IR).  Steps are
+/// NEVER collapsed.
+fn emit_fused_chain(
+    model: &ParsedModel,
+    storage: &[Storage],
+    ctx: &mut ArenaCtx,
+    i: usize,
+    op: &ParsedOp,
+    group: &FusedGroup,
+) -> Result<OpEmission, String> {
+    let anchor_kind: FusedStepKind = match op.builtin_code {
+        0 => FusedStepKind::Add,
+        18 => FusedStepKind::Mul,
+        41 => FusedStepKind::Sub,
+        code => {
+            return Err(format!(
+                "op {i}: elementwise-chain anchor has unsupported builtin_code {code}"
+            ))
+        }
+    };
+    let fused_activation = match op.options.as_ref() {
+        Some(ParsedOptions::Add { fused_activation, .. })
+        | Some(ParsedOptions::Sub { fused_activation, .. })
+        | Some(ParsedOptions::Mul { fused_activation }) => *fused_activation,
+        None => 0,
+        other => return Err(format!("op {i}: unexpected elementwise options, got {other:?}")),
+    };
+    let in1_t = *op.inputs.first().ok_or("elementwise missing input1 tensor")?;
+    let in2_t = *op.inputs.get(1).ok_or("elementwise missing input2 tensor")?;
+    let out_t = *op.outputs.first().ok_or("elementwise missing output tensor")?;
+    let input1 = tensor_at(model.tensors(), in1_t)?;
+    let input2 = tensor_at(model.tensors(), in2_t)?;
+    let output = tensor_at(model.tensors(), out_t)?;
+    let num_elements = flat_len(&input1.shape)? as i32;
+    if flat_len(&input2.shape)? != num_elements as usize
+        || flat_len(&output.shape)? != num_elements as usize
+    {
+        return Err(format!(
+            "op {i}: elementwise input1/input2/output element counts must match"
+        ));
+    }
+    let local_kind = match anchor_kind {
+        FusedStepKind::Add | FusedStepKind::Sub => ElementwiseKind::AddSub,
+        FusedStepKind::Mul => ElementwiseKind::Mul,
+        _ => unreachable!("anchor is ADD/SUB/MUL"),
+    };
+    let q = elementwise_quant(input1, input2, output, local_kind)?;
+    let out_scale = tensor_scale(output)?;
+    let (act_min, act_max) = act_range(fused_activation, out_scale, q.out_off);
+    let (anchor_operand, anchor_operand_consts) = operand_data(
+        model,
+        ctx,
+        storage,
+        in2_t,
+        &Ident::new(&format!("CHAIN_OPERAND_{i}_0"), proc_macro2::Span::call_site()),
+    )?;
+
+    let mut steps = Vec::with_capacity(group.elementwise_chain.len() + 1);
+    let mut consts = anchor_operand_consts;
+    let anchor_kind_enum = chain_step_kind_enum(anchor_kind);
+    let q_in1_off = q.in1_off;
+    let q_in2_off = q.in2_off;
+    let q_out_off = q.out_off;
+    let q_ls = q.left_shift;
+    let q_i1m = q.input1_multiplier;
+    let q_i1s = q.input1_shift;
+    let q_i2m = q.input2_multiplier;
+    let q_i2s = q.input2_shift;
+    let q_om = q.output_multiplier;
+    let q_os = q.output_shift;
+    steps.push(quote! {
+        ::hematite_core::op_params::ElementwiseChainStep {
+            kind: #anchor_kind_enum,
+            operand: #anchor_operand,
+            input1_offset: #q_in1_off,
+            input2_offset: #q_in2_off,
+            output_offset: #q_out_off,
+            output_multiplier: #q_om,
+            output_shift: #q_os,
+            left_shift: #q_ls,
+            input1_multiplier: #q_i1m,
+            input1_shift: #q_i1s,
+            input2_multiplier: #q_i2m,
+            input2_shift: #q_i2s,
+            quantized_activation_min: #act_min,
+            quantized_activation_max: #act_max,
+        }
+    });
+    for (k, absorbed) in group.elementwise_chain.iter().enumerate() {
+        let k1 = k + 1;
+        let kind = chain_step_kind_enum(absorbed.kind);
+        let (op_expr, op_consts) = match absorbed.operand_tensor {
+            u32::MAX => (quote!(None), Vec::new()),
+            t => {
+                let (e, c) = operand_data(
+        model,
+        ctx,
+        storage,
+                    t,
+                    &Ident::new(&format!("CHAIN_OPERAND_{i}_{k1}"), proc_macro2::Span::call_site()),
+                )?;
+                (quote!(Some(#e)), c)
+            }
+        };
+        consts.extend(op_consts);
+        let rq = &absorbed.requantize;
+        let (amin, amax) = chain_step_act_range(model, absorbed)?;
+        let rq_in1_off = rq.input1_offset;
+        let rq_in2_off = rq.input2_offset;
+        let rq_out_off = rq.output_offset;
+        let rq_ls = rq.left_shift;
+        let rq_i1m = rq.input1_multiplier;
+        let rq_i1s = rq.input1_shift;
+        let rq_i2m = rq.input2_multiplier;
+        let rq_i2s = rq.input2_shift;
+        let rq_om = rq.output_multiplier;
+        let rq_os = rq.output_shift;
+        steps.push(quote! {
+            ::hematite_core::op_params::ElementwiseChainStep {
+                kind: #kind,
+                operand: #op_expr,
+                input1_offset: #rq_in1_off,
+                input2_offset: #rq_in2_off,
+                output_offset: #rq_out_off,
+                output_multiplier: #rq_om,
+                output_shift: #rq_os,
+                left_shift: #rq_ls,
+                input1_multiplier: #rq_i1m,
+                input1_shift: #rq_i1s,
+                input2_multiplier: #rq_i2m,
+                input2_shift: #rq_i2s,
+                quantized_activation_min: #amin,
+                quantized_activation_max: #amax,
+            }
+        });
+    }
+    let src = src_expr(ctx, storage, in1_t as usize)?;
+    let dst = dst_expr(ctx, storage, group.output_tensor as usize)?;
+    // T4.3 — shape-typed composed call: chain shapes + flat element count
+    // as a named tuple const (NHWC-padded per `shape4`), `num_elements`
+    // routed through it at the call site.
+    let shapes_name = Ident::new(&format!("CHAIN_SHAPES_{i}"), proc_macro2::Span::call_site());
+    let in1_lit = arr4(shape4(&input1.shape)?);
+    let in2_lit = arr4(shape4(&input2.shape)?);
+    let out_lit = arr4(shape4(&output.shape)?);
+    let shapes_c = quote! {
+        /// T4.3 — composed `fused_elementwise_chain` shape consts
+        /// `(input1, input2, output, num_elements)` (NHWC-padded) for the
+        /// group at op #{i}.
+        const #shapes_name: ([i32; 4], [i32; 4], [i32; 4], i32) =
+            (#in1_lit, #in2_lit, #out_lit, #num_elements);
+    };
+    consts.push(shapes_c);
+    let p = Ident::new(&format!("CHAIN_PARAMS_{i}"), proc_macro2::Span::call_site());
+    let call = quote! {
+        let #p = ::hematite_core::op_params::ElementwiseChainParams {
+            num_elements: #shapes_name.3,
+            steps: &[ #(#steps),* ],
+        };
+        backend.fused_elementwise_chain(#src, &#p, #dst)?;
+    };
+    Ok(OpEmission {
+        consts,
+        call,
+        scratch: 0,
+    })
+}
+
+/// Clamp range of an absorbed chain step: the step op's own
+/// `fused_activation` field against its output tensor quant (mirrors the
+/// per-op elementwise emission; identity when the field is NONE).
+fn chain_step_act_range(
+    model: &ParsedModel,
+    absorbed: &AbsorbedElementwise,
+) -> Result<(i32, i32), String> {
+    let op = model
+        .ops()
+        .get(absorbed.op_index)
+        .ok_or_else(|| format!("absorbed op {} out of range", absorbed.op_index))?;
+    let fused = match op.options.as_ref() {
+        Some(ParsedOptions::Add { fused_activation, .. })
+        | Some(ParsedOptions::Sub { fused_activation, .. })
+        | Some(ParsedOptions::Mul { fused_activation }) => *fused_activation,
+        _ => 0,
+    };
+    Ok(act_range(
+        fused,
+        f64::from(absorbed.output_scale),
+        absorbed.output_zero_point as i32,
+    ))
+}
+
+/// Emit the composed pool-with-fold call (pattern (d)) for a pool anchor.
+///
+/// Reaches emission only once an input-fold group's fused==unfused
+/// verification passes (T2 groups stay per-op); the composed params embed
+/// the anchor `PoolParams` (re-referencing `emit_pool`'s const) plus the
+/// fold's per-op elementwise quant.
+fn emit_fused_pool_fold(
+    model: &ParsedModel,
+    storage: &[Storage],
+    ctx: &mut ArenaCtx,
+    i: usize,
+    op: &ParsedOp,
+    group: &FusedGroup,
+) -> Result<OpEmission, String> {
+    let fold = group
+        .input_fold
+        .as_ref()
+        .ok_or_else(|| format!("op {i}: pool-fold group without input_fold"))?;
+    let pool_kind = match op.builtin_code {
+        1 => quote!(::hematite_core::op_params::PoolKind::Average),
+        17 => quote!(::hematite_core::op_params::PoolKind::Max),
+        code => {
+            return Err(format!(
+                "op {i}: pool-fold anchor has unsupported builtin_code {code}"
+            ))
+        }
+    };
+    let pool = emit_pool(model, storage, ctx, i, op, quote!(average_pool_2d))?;
+    let p_name = Ident::new(&format!("POOL_PARAMS_{i}"), proc_macro2::Span::call_site());
+
+    let fold_op = model
+        .ops()
+        .get(fold.op_index)
+        .ok_or_else(|| format!("op {i}: fold op {} out of range", fold.op_index))?;
+    let fold_out_t = *fold_op
+        .outputs
+        .first()
+        .ok_or_else(|| format!("op {i}: fold op missing output tensor"))?;
+    let fold_out = tensor_at(model.tensors(), fold_out_t)?;
+    let in1 = tensor_at(model.tensors(), fold.folded_input_tensor)?;
+    let in2 = tensor_at(model.tensors(), fold.operand_tensor)?;
+    let q = elementwise_quant(
+        in1,
+        in2,
+        fold_out,
+        if fold.builtin == 18 { ElementwiseKind::Mul } else { ElementwiseKind::AddSub },
+    )?;
+    let num_elements = flat_len(&in1.shape)? as i32;
+    let (operand, operand_consts) = operand_data(
+        model,
+        ctx,
+        storage,
+        fold.operand_tensor,
+        &Ident::new(&format!("FOLD_OPERAND_{i}"), proc_macro2::Span::call_site()),
+    )?;
+    let op_zp = tensor_zp(in2)? as i64;
+    let in_zp = fold.input_zero_point;
+    let out_zp = tensor_zp(fold_out)? as i64;
+    let folded_scale = fold.folded_scale;
+    let fold_builtin = fold.builtin;
+    let q_ls = q.left_shift;
+    let q_om = q.output_multiplier;
+    let q_os = q.output_shift;
+    let q_i1m = q.input1_multiplier;
+    let q_i1s = q.input1_shift;
+    let q_i2m = q.input2_multiplier;
+    let q_i2s = q.input2_shift;
+
+    let src = src_expr(ctx, storage, fold.folded_input_tensor as usize)?;
+    let dst = dst_expr(ctx, storage, group.output_tensor as usize)?;
+    // T4.3 — shape-typed composed call: fold input + pool output shapes and
+    // the fold's flat element count as a named tuple const; `num_elements`
+    // routed through it at the call site.
+    let pool_out_t = tensor_at(model.tensors(), group.output_tensor)?;
+    let shapes_name =
+        Ident::new(&format!("POOL_FOLD_SHAPES_{i}"), proc_macro2::Span::call_site());
+    let fold_in_lit = arr4(shape4(&in1.shape)?);
+    let pool_out_lit = arr4(shape4(&pool_out_t.shape)?);
+    let shapes_c = quote! {
+        /// T4.3 — composed `fused_pool_with_fold` shape consts
+        /// `(fold input, pool output, num_elements)` (NHWC) for the group
+        /// at op #{i}.
+        const #shapes_name: ([i32; 4], [i32; 4], i32) =
+            (#fold_in_lit, #pool_out_lit, #num_elements);
+    };
+    let p = Ident::new(&format!("FUSED_POOL_PARAMS_{i}"), proc_macro2::Span::call_site());
+    let call = quote! {
+        let #p = ::hematite_core::op_params::FoldedPoolParams {
+            pool: #p_name,
+            pool_kind: #pool_kind,
+            fold: Some(::hematite_core::op_params::PoolInputFold {
+                builtin: #fold_builtin,
+                operand_data: #operand,
+                operand_zero_point: #op_zp,
+                input_zero_point: #in_zp,
+                output_zero_point: #out_zp,
+                folded_scale: #folded_scale,
+                left_shift: #q_ls,
+                output_multiplier: #q_om,
+                output_shift: #q_os,
+                input1_multiplier: #q_i1m,
+                input1_shift: #q_i1s,
+                input2_multiplier: #q_i2m,
+                input2_shift: #q_i2s,
+                num_elements: #shapes_name.2,
+            }),
+            activation: ::hematite_core::op_params::ActivationEpilogueParams {
+                kind: ::hematite_core::op_params::ComposedActivation::None,
+                input_offset: 0,
+                output_offset: 0,
+                output_multiplier: 0,
+                output_shift: 0,
+                quantized_activation_min: -128,
+                quantized_activation_max: 127,
+            },
+        };
+        backend.fused_pool_with_fold(#src, &#p, #dst, scratch)?;
+    };
+    let mut consts = pool.consts;
+    consts.extend(operand_consts);
+    consts.push(shapes_c);
+    Ok(OpEmission {
+        consts,
+        call,
+        // T2.4 — the composed need is the fold staging region padded to the
+        // pool SIMD kernel's 16-byte multiple (the pool itself consumes no
+        // scratch on either side), via the explicit mirror so the T1.4 parity
+        // test can assert the composed value directly.
+        scratch: fused_pool_fold_scratch_need_codegen(num_elements.max(0) as usize),
+    })
+}
+
+fn emit_mean(model: &ParsedModel, storage: &[Storage], ctx: &mut ArenaCtx, i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
     let (axis, keep_dims) = match op.options.as_ref() {
         Some(ParsedOptions::Mean { axis, keep_dims }) => (axis.clone(), *keep_dims),
         other => return Err(format!("op {i}: expected Mean options, got {other:?}")),
@@ -1492,8 +2889,8 @@ fn emit_mean(
                 quantized_activation_max: 127,
             };
     };
-    let src = src_expr(storage, in_t as usize, mode)?;
-    let dst = dst_expr(storage, out_t as usize, mode)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.mean(#src, &#p_name, #dst)?;
     };
@@ -1501,17 +2898,10 @@ fn emit_mean(
         consts: vec![params_c],
         call,
         scratch: 0,
-        scratch_check: TokenStream::new(),
     })
 }
 
-fn emit_reshape(
-    model: &ParsedModel,
-    storage: &[Storage],
-    i: usize,
-    op: &ParsedOp,
-    mode: TensorMode,
-) -> Result<OpEmission, String> {
+fn emit_reshape(model: &ParsedModel, storage: &[Storage], ctx: &mut ArenaCtx, i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
     let out_t = *op.outputs.first().ok_or("reshape missing output tensor")?;
     let in_t = *op.inputs.first().ok_or("reshape missing input tensor")?;
     let output = tensor_at(model.tensors(), out_t)?;
@@ -1547,8 +2937,8 @@ fn emit_reshape(
                 shape_count: #shape_count,
             };
     };
-    let src = src_expr(storage, in_t as usize, mode)?;
-    let dst = dst_expr(storage, out_t as usize, mode)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.reshape(#src, &#p_name, #dst)?;
     };
@@ -1556,19 +2946,12 @@ fn emit_reshape(
         consts: vec![params_c],
         call,
         scratch: 0,
-        scratch_check: TokenStream::new(),
     })
 }
 
 /// PAD — the padding amounts come from a const int32 tensor of shape
 /// `[rank, 2]` (`[before, after]` per dim); the kernel pads with value 0.
-fn emit_pad(
-    model: &ParsedModel,
-    storage: &[Storage],
-    i: usize,
-    op: &ParsedOp,
-    mode: TensorMode,
-) -> Result<OpEmission, String> {
+fn emit_pad(model: &ParsedModel, storage: &[Storage], ctx: &mut ArenaCtx, i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
     let in_t = *op.inputs.first().ok_or("pad missing input tensor")?;
     let pad_t = *op.inputs.get(1).ok_or("pad missing padding tensor")?;
     let out_t = *op.outputs.first().ok_or("pad missing output tensor")?;
@@ -1615,8 +2998,8 @@ fn emit_pad(
                 right_padding_count: #count,
             };
     };
-    let src = src_expr(storage, in_t as usize, mode)?;
-    let dst = dst_expr(storage, out_t as usize, mode)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.pad(#src, &#p_name, #dst)?;
     };
@@ -1624,19 +3007,12 @@ fn emit_pad(
         consts: vec![params_c],
         call,
         scratch: 0,
-        scratch_check: TokenStream::new(),
     })
 }
 
 /// TRANSPOSE — the permutation comes from a const int32 tensor of length
 /// `rank`; the kernel computes the output shape from the permuted input.
-fn emit_transpose(
-    model: &ParsedModel,
-    storage: &[Storage],
-    i: usize,
-    op: &ParsedOp,
-    mode: TensorMode,
-) -> Result<OpEmission, String> {
+fn emit_transpose(model: &ParsedModel, storage: &[Storage], ctx: &mut ArenaCtx, i: usize, op: &ParsedOp) -> Result<OpEmission, String> {
     let in_t = *op.inputs.first().ok_or("transpose missing input tensor")?;
     let perm_t = *op.inputs.get(1).ok_or("transpose missing perm tensor")?;
     let out_t = *op.outputs.first().ok_or("transpose missing output tensor")?;
@@ -1681,8 +3057,8 @@ fn emit_transpose(
                 perm_count: #perm_count,
             };
     };
-    let src = src_expr(storage, in_t as usize, mode)?;
-    let dst = dst_expr(storage, out_t as usize, mode)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.transpose(#src, &#p_name, #dst)?;
     };
@@ -1690,17 +3066,10 @@ fn emit_transpose(
         consts: vec![params_c],
         call,
         scratch: 0,
-        scratch_check: TokenStream::new(),
     })
 }
 
-fn emit_resize(
-    model: &ParsedModel,
-    storage: &[Storage],
-    i: usize,
-    op: &ParsedOp,
-    mode: TensorMode,
-) -> Result<OpEmission, String> {    let (align_corners, half_pixel_centers) = match op.options.as_ref() {
+fn emit_resize(model: &ParsedModel, storage: &[Storage], ctx: &mut ArenaCtx, i: usize, op: &ParsedOp) -> Result<OpEmission, String> {    let (align_corners, half_pixel_centers) = match op.options.as_ref() {
         Some(ParsedOptions::ResizeNearest {
             align_corners,
             half_pixel_centers,
@@ -1724,8 +3093,8 @@ fn emit_resize(
                 half_pixel_centers: #half_pixel_centers as i32,
             };
     };
-    let src = src_expr(storage, in_t as usize, mode)?;
-    let dst = dst_expr(storage, out_t as usize, mode)?;
+    let src = src_expr(ctx, storage, in_t as usize)?;
+    let dst = dst_expr(ctx, storage, out_t as usize)?;
     let call = quote! {
         backend.resize_nearest(#src, &#p_name, #dst)?;
     };
@@ -1733,7 +3102,6 @@ fn emit_resize(
         consts: vec![params_c],
         call,
         scratch: 0,
-        scratch_check: TokenStream::new(),
     })
 }
 
@@ -1752,6 +3120,235 @@ mod tests {
         "/../models/sine.tflite"
     ));
 
+    /// All six zoo models, same paths as the fused-pattern profile
+    /// (optimize/profile.rs) and model_validation.rs.
+    const HELLO_WORLD_TFLITE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/zoo/sine_regression/hello_world_int8.tflite"
+    ));
+    const KWS_TFLITE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/zoo/keyword_spotting/kws_micro_speech_int8.tflite"
+    ));
+    const ANOMALY_TFLITE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/zoo/anomaly_detect/anomaly_detect_int8.tflite"
+    ));
+    const PERSON_DETECT_TFLITE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/zoo/person_detect_vww/person_detect_int8.tflite"
+    ));
+    const MOBILENET_V2_TFLITE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/zoo/mobilenetv2_cls/mobilenet_v2_1.0_224_int8.tflite"
+    ));
+
+    /// T1.3 — the emitted `ARENA_LEN` const must equal the planner's peak
+    /// for every arena-emitting model, the arena must be 16-byte aligned,
+    /// and NO `unsafe` / `static mut` may leak into either emission mode.
+    /// mobilenet_v2 falls back to per-tensor arrays (a single 224²×32
+    /// activation exceeds MAX_INTERNAL) — its ARENA_LEN is 0.
+    #[test]
+    fn emitted_arena_len_matches_plan_peak() {
+        use crate::optimize::arena::plan_arena;
+        let cases: [(&str, &[u8], usize); 6] = [
+            ("sine", SINE_TFLITE, 0), // no intermediates
+            ("hello_world", HELLO_WORLD_TFLITE, 32),
+            ("kws", KWS_TFLITE, 5_968),
+            ("anomaly_detect", ANOMALY_TFLITE, 272),
+            ("person_detect", PERSON_DETECT_TFLITE, 55_296),
+            ("mobilenet_v2", MOBILENET_V2_TFLITE, 0), // fallback: Oversized
+        ];
+        for (name, bytes, expected) in cases {
+            let model = flatbuffer::parse(bytes).unwrap_or_else(|e| panic!("{name}: parse: {e}"));
+            let peak = plan_arena(&model).map(|p| p.peak_arena_bytes).unwrap_or(0);
+            assert_eq!(peak, expected, "{name}: plan peak (t13-arena.md)");
+            let ts = emit_model(&model).unwrap_or_else(|e| panic!("{name}: emit: {e}"));
+            let s: String = ts.to_string().chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                s.contains(&format!("ARENA_LEN:usize={peak}usize")),
+                "{name}: ARENA_LEN const wrong: {s}"
+            );
+            let arena_mode = peak > 0;
+            assert_eq!(
+                s.contains("structArena{data:[i8;"),
+                arena_mode,
+                "{name}: arena struct presence wrong"
+            );
+            assert_eq!(
+                s.contains("split_at_mut"),
+                arena_mode,
+                "{name}: arena borrows presence wrong"
+            );
+            assert!(
+                s.contains("align(16))"),
+                "{name}: 16-byte alignment missing (SIMD gate)"
+            );
+            assert!(!s.contains("unsafe"), "{name}: unsafe leaked into generated code");
+            assert!(!s.contains("staticmut"), "{name}: static mut leaked into generated code");
+            if name == "mobilenet_v2" {
+                assert!(
+                    s.contains("structTENSOR_"),
+                    "mobilenet_v2: fallback must keep per-tensor arrays"
+                );
+            }
+        }
+    }
+
+    /// T1.3 — the stack arm (`emit_model_stack`) must NOT emit the arena for
+    /// a model that arena-emits, and must stay unsafe/static-mut-free.
+    #[test]
+    fn stack_emission_has_no_arena() {
+        let model = flatbuffer::parse(KWS_TFLITE).expect("kws parses");
+        let schedule = crate::optimize::fusion::fuse(&model);
+        let ts = emit_model_stack_fused(&model, &schedule, true).expect("kws stack emits");
+        let s: String = ts.to_string().chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(!s.contains("structArena"), "stack arm must not emit the arena");
+        assert!(s.contains("ARENA_LEN:usize=0usize"), "stack arm: ARENA_LEN must be 0");
+        assert!(s.contains("structTENSOR_"), "stack arm must emit per-tensor arrays");
+        assert!(!s.contains("unsafe"), "stack arm: unsafe leaked");
+        assert!(!s.contains("staticmut"), "stack arm: static mut leaked");
+    }
+
+    /// T1.2 regression: for a model with zero composed groups the fused
+    /// emission must be byte-identical (token-identical) to the unfused
+    /// per-op emission — every one of the 5 non-mv2 zoo models qualifies.
+    #[test]
+    fn fused_emission_byte_identical_when_no_composed_groups() {
+        for (name, bytes) in [
+            ("sine", SINE_TFLITE),
+            ("hello_world", HELLO_WORLD_TFLITE),
+            ("kws", KWS_TFLITE),
+            ("anomaly_detect", ANOMALY_TFLITE),
+            ("person_detect", PERSON_DETECT_TFLITE),
+        ] {
+            let model = flatbuffer::parse(bytes).unwrap_or_else(|e| panic!("{name}: parse: {e}"));
+            let schedule = crate::optimize::fusion::fuse(&model);
+            assert!(
+                schedule
+                    .groups
+                    .iter()
+                    .all(|g| selector::select_kernel(&model, g).kernel == GroupSelection::PerOp),
+                "{name}: expected zero composed groups"
+            );
+            let fused = emit_model_fused(&model, &schedule, true)
+                .unwrap_or_else(|e| panic!("{name}: fused emit: {e}"))
+                .to_string();
+            let unfused = emit_model(&model)
+                .unwrap_or_else(|e| panic!("{name}: unfused emit: {e}"))
+                .to_string();
+            assert_eq!(fused, unfused, "{name}: fused emission diverged from per-op");
+        }
+    }
+
+    /// W0 profile pins (fused-profile.md): mv2 84 ops → 74 groups, 10
+    /// residual-add groups, 10 eliminated tensors — the ONLY composed
+    /// groups in the zoo.  The fused emission collapses each to one
+    /// `fused_conv2d` call and stays unsafe-free.
+    #[test]
+    fn mobilenet_fused_schedule_matches_w0_profile() {
+        let model = flatbuffer::parse(MOBILENET_V2_TFLITE).expect("mv2 parses");
+        let schedule = crate::optimize::fusion::fuse(&model);
+        assert_eq!(schedule.total_ops, 84);
+        assert_eq!(schedule.groups.len(), 74);
+        assert_eq!(schedule.fused_op_count(), 10);
+        let residual_groups = schedule
+            .groups
+            .iter()
+            .filter(|g| g.residual_add.is_some())
+            .count();
+        assert_eq!(residual_groups, 10);
+        let eliminated: usize = schedule.groups.iter().map(|g| g.eliminated_tensors.len()).sum();
+        assert_eq!(eliminated, 10);
+        assert!(
+            schedule.groups.iter().all(|g| !g.requires_verification),
+            "mv2: all groups must be T1 (no verification obligation)"
+        );
+        let composed = schedule
+            .groups
+            .iter()
+            .filter(|g| {
+                selector::select_kernel(&model, g).kernel != GroupSelection::PerOp
+            })
+            .count();
+        assert_eq!(composed, 10);
+
+        let fused = emit_model_fused(&model, &schedule, true).expect("mv2 fused emits");
+        let fused_s: String = fused.to_string().chars().filter(|c| !c.is_whitespace()).collect();
+        let unfused = emit_model(&model).expect("mv2 unfused emits");
+        let unfused_s: String = unfused.to_string().chars().filter(|c| !c.is_whitespace()).collect();
+
+        assert_eq!(fused_s.matches("backend.fused_conv2d(").count(), 10);
+        assert!(!unfused_s.contains("backend.fused_conv2d("));
+        assert!(!fused_s.contains("unsafe"), "generated code must be unsafe-free");
+        assert!(!unfused_s.contains("unsafe"), "generated code must be unsafe-free");
+    }
+
+    /// T4.3 — the emitted mv2 fused wrapper carries the `fused-groups`
+    /// header matching the W0 profile (74 groups, 10 composed fused_conv2d,
+    /// 64 per-op, 53/74 SIMD-eligible) and the composed calls are
+    /// shape-typed: one `FUSED_CONV_SHAPES_*` const per composed group,
+    /// routed into the `FusedConvParams` conv via struct-update on the
+    /// anchor's per-op const.
+    #[test]
+    fn fused_groups_header_matches_w0_profile() {
+        let model = flatbuffer::parse(MOBILENET_V2_TFLITE).expect("mv2 parses");
+        let schedule = crate::optimize::fusion::fuse(&model);
+        let fused = emit_model_fused(&model, &schedule, true).expect("mv2 fused emits");
+        let s = fused.to_string();
+        // The header lives inside ONE #[doc = "..."] string literal — the
+        // literal content is verbatim in to_string() (only inter-token
+        // spacing is inserted), so assert on the un-stripped form.
+        assert!(
+            s.contains(
+                "fused-groups (T4.3 rule-tier dispatch): 74 groups - 10 composed (10 fused_conv2d), 64 per-op; SIMD-eligible 53/74 (W0 profile)"
+            ),
+            "fused-groups header must match the W0 profile: {s}"
+        );
+        // Per-group verdict lines: 10 composed groups, each with the
+        // selector's why.
+        assert_eq!(
+            s.matches("fused_conv2d - ").count(),
+            10,
+            "one verdict line per composed group: {s}"
+        );
+        assert!(
+            s.contains("remaining 64 groups: plain per-op (no composed pattern)"),
+            "aggregate per-op line missing: {s}"
+        );
+        // Shape-typed composed calls: 10 shape consts, each referenced
+        // through the FusedConvParams conv struct-update.
+        let flat: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(flat.matches("constFUSED_CONV_SHAPES_").count(), 10);
+        assert_eq!(flat.matches("FUSED_CONV_SHAPES_").count(), 40, "10 decls + 30 refs");
+        assert_eq!(flat.matches("..CONV2D_PARAMS_").count(), 10, "conv struct-update per group");
+    }
+
+    /// T4.3 — models with zero composed groups gain NO fused-groups header:
+    /// their fused emission is byte-identical to per-op (the
+    /// `fused_emission_byte_identical_when_no_composed_groups` gate covers
+    /// that end-to-end); this asserts the doc marker itself is absent.
+    #[test]
+    fn no_fused_groups_header_when_zero_composed() {
+        for (name, bytes) in [
+            ("sine", SINE_TFLITE),
+            ("hello_world", HELLO_WORLD_TFLITE),
+            ("kws", KWS_TFLITE),
+            ("anomaly_detect", ANOMALY_TFLITE),
+            ("person_detect", PERSON_DETECT_TFLITE),
+        ] {
+            let model = flatbuffer::parse(bytes).unwrap_or_else(|e| panic!("{name}: parse: {e}"));
+            let schedule = crate::optimize::fusion::fuse(&model);
+            let fused = emit_model_fused(&model, &schedule, true)
+                .unwrap_or_else(|e| panic!("{name}: fused emit: {e}"))
+                .to_string();
+            assert!(
+                !fused.contains("fused-groups"),
+                "{name}: zero-composed model must not gain the fused-groups header"
+            );
+        }
+    }
+
     #[test]
     fn sine_model_emits_fc_call_sequence() {
         let model = flatbuffer::parse(SINE_TFLITE).expect("sine parses");
@@ -1762,25 +3359,25 @@ mod tests {
         // Model<I, O> wrapper with the typed I/O bridge.
         assert!(s.contains("structModel<B>"), "Model wrapper missing");
         assert!(s.contains("fnpredict_with_scratch"), "predict_with_scratch missing");
-        assert!(s.contains("fnpredict_with_arena"), "predict_with_arena missing");
         assert!(s.contains("fnpredict("), "predict missing");
         assert!(s.contains("constfnnew("), "new missing");
         assert!(s.contains("constfninput_len"), "input_len missing");
         assert!(s.contains("constfnoutput_len"), "output_len missing");
 
         // I/O sized from tensor shapes (input [1], output [1]).
-        assert!(s.contains("pubconstINPUT_LEN:usize=1usize"));
-        assert!(s.contains("pubconstOUTPUT_LEN:usize=1usize"));
+        assert!(s.contains("INPUT_LEN:usize=1usize"));
+        assert!(s.contains("OUTPUT_LEN:usize=1usize"));
 
-        // Scratch computed at macro time — kernels' *_scratch_size default 0.
-        assert!(s.contains("pubconstSCRATCH_LEN:usize=0usize"));
+        // Scratch computed at macro time — FC 1→1, input_offset 0. T3.6 pad
+        // path: input_dim 1 pads to 16 (padded input 16 + padded weights
+        // 1×16 + accs 1×4 = 36), mirroring `fc_scratch_need` in backend.rs.
+        assert!(s.contains("SCRATCH_LEN:usize=36usize"), "scratch len wrong: {s}");
 
-        // Arena — sine has no intermediates (fc reads I/O + consts directly),
-        // so the arena footprint is 0 and no carve locals are emitted.
-        assert!(s.contains("pubconstARENA_LEN:usize=0usize"));
-
-        // Weight/bias consts from buffer bytes.
-        assert!(s.contains("staticWEIGHTS_0:WeightAlign<1usize>=WeightAlign([51i8])"), "weight const wrong: {s}");
+        // Weight/bias consts from buffer bytes. Weights are wrapped in a
+        // `#[repr(C, align(16))]` struct so the ACCX/FC SIMD `w_ptr % 16 == 0`
+        // alignment gate engages (see `const_i8`).
+        assert!(s.contains("structWEIGHTS_0Ty([i8;1usize])"), "weight wrapper missing: {s}");
+        assert!(s.contains("constWEIGHTS_0:WEIGHTS_0Ty=WEIGHTS_0Ty([51i8])"), "weight const wrong: {s}");
         assert!(s.contains("BIAS_0:[i32;1usize]=[-3i32]"), "bias const wrong: {s}");
 
         // FC params: input_dim=1, output_dim=1, per-channel quant
@@ -1792,7 +3389,14 @@ mod tests {
 
         // Dispatch through KernelBackend, slices into the typed I/O arrays.
         assert!(s.contains("backend.fully_connected("));
-        assert!(s.contains("&input[0usize..1usize]"));
+        // T4.2: sine's first layer is an SIMD-eligible FC, so the graph input
+        // is staged into the 16B-aligned STAGED_INPUT buffer; the first op
+        // reads from it (aligned), never from the caller's misalignment-prone
+        // `input` slice.
+        assert!(s.contains("structSTAGED_INPUT"), "staged input type missing: {s}");
+        assert!(s.contains("staged_input.data.copy_from_slice(&input[..])"), "staged copy missing: {s}");
+        assert!(s.contains("&staged_input.data[0usize..1usize]"), "staged input slice wrong: {s}");
+        assert!(!s.contains("&input[0usize..1usize]"), "unstaged input slice leaked: {s}");
         assert!(s.contains("&mutoutput[0usize..1usize]"));
 
         // No unsafe or heap in the generated code.
@@ -2023,4 +3627,671 @@ mod tests {
         u32v(&mut b, 1);
         b
     }
+
+    /// Cross-crate scratch parity (T3.5 / T3.5b / T1.4 gate): the macro-time
+    /// mirror `depthwise_scratch_need_codegen` must equal the runtime
+    /// `S3Backend::depthwise_conv2d_scratch_size` for the dm>1 fan-out shapes,
+    /// the dm==1 corpus, AND arbitrary filter sizes (3×3, 5×5, 7×7, kws 10×8)
+    /// — the runtime formula is canonical; a mismatch is a mirror bug.
+    #[test]
+    fn depthwise_scratch_mirror_matches_s3_backend() {
+        use hematite_core::op_params::{DepthwiseConv2DParams, Padding};
+        use hematite_core::KernelBackend;
+        use hematite_s3::backend::S3Backend;
+
+        fn params(
+            dm: i32,
+            in_c: i32,
+            spatial: i32,
+            input_offset: i32,
+            fh: i32,
+            fw: i32,
+            stride: i32,
+        ) -> DepthwiseConv2DParams<'static> {
+            let out_c = in_c * dm;
+            DepthwiseConv2DParams {
+                input_shape: [1, spatial, spatial, in_c],
+                filter_shape: [1, fh, fw, out_c],
+                output_shape: [1, spatial, spatial, out_c],
+                padding: Padding::Same,
+                stride_width: stride,
+                stride_height: stride,
+                dilation_width_factor: 1,
+                dilation_height_factor: 1,
+                depth_multiplier: dm,
+                input_offset,
+                weights_offset: 0,
+                output_offset: 0,
+                // The scratch-size formula reads shapes/offsets only — slice
+                // contents (and length) are irrelevant to `depthwise_scratch_need`.
+                output_multiplier_per_channel: &[],
+                output_shift_per_channel: &[],
+                quantized_activation_min: -128,
+                quantized_activation_max: 127,
+            }
+        }
+
+        fn codegen_need(p: &DepthwiseConv2DParams<'_>) -> usize {
+            depthwise_scratch_need_codegen(
+                p.input_shape[1].max(0) as usize,
+                p.input_shape[2].max(0) as usize,
+                p.input_shape[3].max(0) as usize,
+                p.output_shape[1].max(0) as usize,
+                p.output_shape[2].max(0) as usize,
+                p.output_shape[3].max(0) as usize,
+                p.filter_shape[1],
+                p.filter_shape[2],
+                p.stride_height,
+                p.stride_width,
+                p.dilation_height_factor,
+                p.dilation_width_factor,
+                p.depth_multiplier,
+                p.input_offset,
+            )
+        }
+
+        let mut checked = 0;
+        for &dm in &[1, 2, 4, 8] {
+            for &in_c in &[1, 3, 8, 16, 32] {
+                for &spatial in &[8, 12, 14] {
+                    for &offset in &[0, -3] {
+                        let p = params(dm, in_c, spatial, offset, 3, 3, 1);
+                        let mirror = codegen_need(&p);
+                        let runtime = S3Backend::depthwise_conv2d_scratch_size(&p);
+                        assert_eq!(
+                            mirror, runtime,
+                            "depthwise dm={dm} in_c={in_c} spatial={spatial} offset={offset}: \
+                             codegen mirror {mirror} != S3Backend need {runtime}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        // T3.5b — arbitrary filters (5×5, 7×7, kws 10×8) × dm {1,8} ×
+        // strides {1,2}, with and without input_offset.
+        for &(fh, fw) in &[(5, 5), (7, 7), (10, 8)] {
+            for &dm in &[1, 8] {
+                for &in_c in &[1, 8] {
+                    for &stride in &[1, 2] {
+                        for &offset in &[0, 3, 128] {
+                            let p = params(dm, in_c, 14, offset, fh, fw, stride);
+                            let mirror = codegen_need(&p);
+                            let runtime = S3Backend::depthwise_conv2d_scratch_size(&p);
+                            assert_eq!(
+                                mirror, runtime,
+                                "depthwise fh={fh} fw={fw} dm={dm} in_c={in_c} stride={stride} \
+                                 offset={offset}: codegen mirror {mirror} != S3Backend need {runtime}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 192, "parity matrix did not expand ({checked})");
+    }
+
+    /// Cross-crate scratch parity (T3.6): the macro-time mirror
+    /// `fc_scratch_need_codegen` must equal the runtime
+    /// `hematite_s3::backend::fc_scratch_need` for every small / non-16 FC
+    /// shape (pad and no-pad paths). The runtime formula is canonical — a
+    /// mismatch is a mirror bug.
+    #[test]
+    fn fc_scratch_mirror_matches_s3_backend() {
+        use hematite_core::op_params::FullyConnectedParams;
+
+        fn params(
+            input_dim: i32,
+            output_dim: i32,
+            input_offset: i32,
+        ) -> FullyConnectedParams<'static> {
+            FullyConnectedParams {
+                input_dim,
+                output_dim,
+                input_offset,
+                weights_offset: 0,
+                output_offset: 0,
+                // The scratch-size formula reads input/output dims + offset
+                // only — slice contents are irrelevant to `fc_scratch_need`.
+                output_multiplier_per_channel: &[],
+                output_shift_per_channel: &[],
+                quantized_activation_min: -128,
+                quantized_activation_max: 127,
+            }
+        }
+
+        let mut checked = 0;
+        for &input_dim in &[1, 3, 8, 15, 16, 17, 32, 128, 640] {
+            for &output_dim in &[1, 3, 8, 16, 128] {
+                for &offset in &[0, 5, 128] {
+                    let p = params(input_dim, output_dim, offset);
+                    let mirror = fc_scratch_need_codegen(
+                        input_dim.max(0) as usize,
+                        output_dim.max(0) as usize,
+                        p.input_offset,
+                    );
+                    let runtime = hematite_s3::backend::fc_scratch_need(&p);
+                    assert_eq!(
+                        mirror, runtime,
+                        "fc input_dim={input_dim} out_dim={output_dim} offset={offset}: \
+                         codegen mirror {mirror} != S3Backend need {runtime}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 100, "fc parity matrix did not expand");
+    }
+
+    use hematite_core::op_params::{
+        Conv2DParams, DepthwiseConv2DParams, FoldedPoolParams, FusedConvParams,
+        FullyConnectedParams, Padding, SoftmaxParams,
+    };
+    use hematite_benchmarks::spec::KernelParams;
+    use hematite_core::KernelBackend;
+    use hematite_s3::backend::{
+        fc_scratch_need, fused_conv2d_scratch_need, fused_pool_with_fold_scratch_need, S3Backend,
+    };
+
+    // ── T1.4 — scratch parity: codegen mirrors vs S3Backend runtime ──────
+    //
+    // The macro-time `*_scratch_need_codegen` mirrors (the codegen side of
+    // `SCRATCH_LEN`) must equal the runtime `S3Backend::*_scratch_size`
+    // formulas for every spec-corpus shape and every composed group. The
+    // runtime formulas are canonical — a divergence is a mirror bug, and the
+    // fix belongs in the codegen mirror, never in hematite-s3.
+
+    /// TFLite SAME/VALID output dim (used to build representative grid shapes;
+    /// corpus rows carry their own authoritative out shapes).
+    fn tflite_out_dim(in_dim: i32, filter: i32, stride: i32, padding: Padding) -> i32 {
+        match padding {
+            Padding::Same => (in_dim + stride - 1) / stride,
+            Padding::Valid => {
+                if in_dim >= filter {
+                    (in_dim - filter) / stride + 1
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn conv_params(
+        fh: i32,
+        fw: i32,
+        in_c: i32,
+        out_c: i32,
+        in_h: i32,
+        in_w: i32,
+        out_h: i32,
+        out_w: i32,
+        stride: i32,
+        padding: Padding,
+        offset: i32,
+    ) -> Conv2DParams<'static> {
+        Conv2DParams {
+            input_shape: [1, in_h, in_w, in_c],
+            filter_shape: [out_c, fh, fw, in_c],
+            output_shape: [1, out_h, out_w, out_c],
+            padding,
+            stride_width: stride,
+            stride_height: stride,
+            dilation_width_factor: 1,
+            dilation_height_factor: 1,
+            input_offset: offset,
+            weights_offset: 0,
+            output_offset: 0,
+            // The scratch formulas read shapes/offsets only — slice contents
+            // are irrelevant to any `*_scratch_need`.
+            output_multiplier_per_channel: &[],
+            output_shift_per_channel: &[],
+            quantized_activation_min: -128,
+            quantized_activation_max: 127,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn depthwise_params(
+        dm: i32,
+        in_c: i32,
+        fh: i32,
+        fw: i32,
+        in_h: i32,
+        in_w: i32,
+        stride: i32,
+        padding: Padding,
+        offset: i32,
+    ) -> DepthwiseConv2DParams<'static> {
+        let out_c = in_c * dm;
+        DepthwiseConv2DParams {
+            input_shape: [1, in_h, in_w, in_c],
+            filter_shape: [1, fh, fw, out_c],
+            output_shape: [
+                1,
+                tflite_out_dim(in_h, fh, stride, padding),
+                tflite_out_dim(in_w, fw, stride, padding),
+                out_c,
+            ],
+            padding,
+            stride_width: stride,
+            stride_height: stride,
+            dilation_width_factor: 1,
+            dilation_height_factor: 1,
+            depth_multiplier: dm,
+            input_offset: offset,
+            weights_offset: 0,
+            output_offset: 0,
+            output_multiplier_per_channel: &[],
+            output_shift_per_channel: &[],
+            quantized_activation_min: -128,
+            quantized_activation_max: 127,
+        }
+    }
+
+    fn fc_params(input_dim: i32, output_dim: i32, input_offset: i32) -> FullyConnectedParams<'static> {
+        FullyConnectedParams {
+            input_dim,
+            output_dim,
+            input_offset,
+            weights_offset: 0,
+            output_offset: 0,
+            output_multiplier_per_channel: &[],
+            output_shift_per_channel: &[],
+            quantized_activation_min: -128,
+            quantized_activation_max: 127,
+        }
+    }
+
+    fn softmax_params(row_size: i32) -> SoftmaxParams {
+        SoftmaxParams {
+            num_rows: 1,
+            row_size,
+            input_multiplier: 0,
+            input_left_shift: 0,
+            diff_min: 0,
+            input_offset: 0,
+            output_offset: -128,
+            quantized_activation_min: -128,
+            quantized_activation_max: 127,
+        }
+    }
+
+    fn check_conv(p: &Conv2DParams<'_>, checked: &mut usize) {
+        let runtime = S3Backend::conv2d_scratch_size(p);
+        let mirror = if p.filter_shape[1] == 1 && p.filter_shape[2] == 1 {
+            conv1x1_scratch_need_codegen(
+                p.input_shape[3].max(0) as usize,
+                p.output_shape[3].max(0) as usize,
+                (p.input_shape[1].max(0) as usize) * (p.input_shape[2].max(0) as usize),
+                p.input_offset,
+            )
+        } else {
+            conv3x3_scratch_need_codegen(
+                p.input_shape[1].max(0) as usize,
+                p.input_shape[2].max(0) as usize,
+                p.input_shape[3].max(0) as usize,
+                p.output_shape[1].max(0) as usize,
+                p.output_shape[2].max(0) as usize,
+                p.output_shape[3].max(0) as usize,
+                p.filter_shape[1],
+                p.filter_shape[2],
+                p.stride_height,
+                p.stride_width,
+                p.dilation_height_factor,
+                p.dilation_width_factor,
+                p.input_offset,
+            )
+        };
+        assert_eq!(
+            mirror, runtime,
+            "conv in={:?} f={:?} out={:?} pad={:?} stride={} off={}: codegen mirror {mirror} != S3Backend need {runtime}",
+            p.input_shape, p.filter_shape, p.output_shape, p.padding, p.stride_height, p.input_offset
+        );
+        *checked += 1;
+    }
+
+    fn check_depthwise(p: &DepthwiseConv2DParams<'_>, checked: &mut usize) {
+        let runtime = S3Backend::depthwise_conv2d_scratch_size(p);
+        let mirror = depthwise_scratch_need_codegen(
+            p.input_shape[1].max(0) as usize,
+            p.input_shape[2].max(0) as usize,
+            p.input_shape[3].max(0) as usize,
+            p.output_shape[1].max(0) as usize,
+            p.output_shape[2].max(0) as usize,
+            p.output_shape[3].max(0) as usize,
+            p.filter_shape[1],
+            p.filter_shape[2],
+            p.stride_height,
+            p.stride_width,
+            p.dilation_height_factor,
+            p.dilation_width_factor,
+            p.depth_multiplier,
+            p.input_offset,
+        );
+        assert_eq!(
+            mirror, runtime,
+            "depthwise in={:?} f={:?} out={:?} dm={} stride={} off={}: codegen mirror {mirror} != S3Backend need {runtime}",
+            p.input_shape, p.filter_shape, p.output_shape, p.depth_multiplier, p.stride_height, p.input_offset
+        );
+        *checked += 1;
+    }
+
+    fn check_fc(p: &FullyConnectedParams<'_>, checked: &mut usize) {
+        let runtime = fc_scratch_need(p);
+        let mirror = fc_scratch_need_codegen(
+            p.input_dim.max(0) as usize,
+            p.output_dim.max(0) as usize,
+            p.input_offset,
+        );
+        assert_eq!(
+            mirror, runtime,
+            "fc in={} out={} off={}: codegen mirror {mirror} != S3Backend need {runtime}",
+            p.input_dim, p.output_dim, p.input_offset
+        );
+        *checked += 1;
+    }
+
+    fn check_softmax(p: &SoftmaxParams, checked: &mut usize) {
+        let runtime = S3Backend::softmax_scratch_size(p);
+        let mirror = softmax_scratch_need_codegen(p.row_size);
+        assert_eq!(
+            mirror, runtime,
+            "softmax row_size={}: codegen mirror {mirror} != S3Backend need {runtime}",
+            p.row_size
+        );
+        *checked += 1;
+    }
+
+    /// T2.2 — the fused-conv mirror must equal the runtime composed need, and
+    /// that must equal the anchor conv's own `S3Backend::conv2d_scratch_size`
+    /// (the fused kernel stages nothing beyond the conv). This is the same
+    /// equality `composed_scratch_parity` asserts over its 7-anchor grid.
+    fn check_fused_conv(p: &FusedConvParams<'_>, checked: &mut usize) {
+        let runtime = fused_conv2d_scratch_need(p);
+        let mirror = fused_conv2d_scratch_need_codegen(
+            p.conv.filter_shape[1],
+            p.conv.filter_shape[2],
+            p.conv.input_shape[1].max(0) as usize,
+            p.conv.input_shape[2].max(0) as usize,
+            p.conv.input_shape[3].max(0) as usize,
+            p.conv.output_shape[1].max(0) as usize,
+            p.conv.output_shape[2].max(0) as usize,
+            p.conv.output_shape[3].max(0) as usize,
+            p.conv.stride_height,
+            p.conv.stride_width,
+            p.conv.input_offset,
+        );
+        assert_eq!(
+            mirror, runtime,
+            "fused_conv2d in={:?} f={:?} out={:?}: codegen mirror {mirror} != S3Backend fused need {runtime}",
+            p.conv.input_shape, p.conv.filter_shape, p.conv.output_shape
+        );
+        assert_eq!(
+            runtime,
+            S3Backend::conv2d_scratch_size(&p.conv),
+            "fused_conv2d composed need {runtime} != anchor conv need {}",
+            S3Backend::conv2d_scratch_size(&p.conv)
+        );
+        *checked += 1;
+    }
+
+    /// T2.4 — the pool-fold mirror must equal the runtime composed need, and
+    /// that must equal the fold staging bytes (`num_elements`) padded to the
+    /// pool SIMD kernel's 16-byte multiple + the pool's own need (0). This
+    /// is the same equality `composed_scratch_parity` asserts over its grid.
+    fn check_fused_pool(p: &FoldedPoolParams<'_>, checked: &mut usize) {
+        let fold_n = match &p.fold {
+            Some(f) => f.num_elements.max(0) as usize,
+            None => {
+                (p.pool.input_shape[1].max(0) as usize)
+                    * (p.pool.input_shape[2].max(0) as usize)
+                    * (p.pool.input_shape[3].max(0) as usize)
+            }
+        };
+        let runtime = fused_pool_with_fold_scratch_need(p);
+        let mirror = fused_pool_fold_scratch_need_codegen(fold_n);
+        assert_eq!(
+            mirror, runtime,
+            "fused_pool_with_fold in={:?}: codegen mirror {mirror} != S3Backend fused need {runtime}",
+            p.pool.input_shape
+        );
+        assert_eq!(
+            runtime,
+            pad16(fold_n),
+            "fused_pool_with_fold need {runtime} != fold staging pad16({fold_n})"
+        );
+        *checked += 1;
+    }
+
+    /// T1.4 — corpus-wide scratch parity sweep. Every mirror fn is asserted
+    /// equal to the runtime S3Backend formula over (a) every machine-readable
+    /// row of the per-kernel benchmark corpus (`hematite_benchmarks::spec::
+    /// kernel_specs()`, consumed directly — never hand-copied) and (b) the
+    /// widened shape grids below. Activation/elementwise rows have no scratch
+    /// on either side (codegen emits 0, the trait defines no scratch method);
+    /// pool rows are the same (the s3 pool kernels never read scratch) and
+    /// are counted as 0 == 0.
+    #[test]
+    fn scratch_parity_spec_corpus_and_grids() {
+        let mut checked = 0;
+        let mut n_conv = 0;
+        let mut n_dw = 0;
+        let mut n_fc = 0;
+        let mut n_sm = 0;
+        let mut n_pool = 0;
+        let mut n_fused = 0;
+        let mut n_mean = 0;
+        let mut n_scratch_free = 0;
+
+        // (a) spec corpus — every scratch-relevant row.
+        for spec in hematite_benchmarks::spec::kernel_specs() {
+            match &spec.params {
+                KernelParams::Conv(p) => {
+                    check_conv(p, &mut checked);
+                    n_conv += 1;
+                }
+                KernelParams::Depthwise(p) => {
+                    check_depthwise(p, &mut checked);
+                    n_dw += 1;
+                }
+                KernelParams::Fc(p) => {
+                    check_fc(p, &mut checked);
+                    n_fc += 1;
+                }
+                KernelParams::Softmax(p) => {
+                    check_softmax(p, &mut checked);
+                    n_sm += 1;
+                }
+                KernelParams::Pool(_) => {
+                    // Pool has no scratch on either side: the codegen emitter
+                    // reports the literal 0 (emit_pool) and `KernelBackend`
+                    // defines no pool scratch method (runtime default 0; the
+                    // s3 pool kernels ignore scratch entirely).
+                    checked += 1;
+                    n_pool += 1;
+                }
+                KernelParams::Activation(_) | KernelParams::Elementwise(_) | KernelParams::FusedChain(_) => {
+                    // relu/add/mul/sub + the composed elementwise chain: codegen
+                    // emits scratch 0 (emit_fused_chain → `scratch: 0`); the trait
+                    // has no scratch method for them (runtime 0). No mirror exists —
+                    // the T2.3 chain needs zero scratch on both the SIMD path
+                    // (register-held running value) and the decomposition.
+                    n_scratch_free += 1;
+                }
+                KernelParams::Reduce(_) => {
+                    // Mean: scratch-free on both sides — codegen emits 0
+                    // (emit_mean → `scratch: 0`) and the s3 mean kernel takes no
+                    // scratch parameter (the T3.4 looped-accumulation SIMD path
+                    // uses bounded stack locals, not caller scratch). No mirror.
+                    checked += 1;
+                    n_mean += 1;
+                    n_scratch_free += 1;
+                }
+                KernelParams::FusedConv(p) => {
+                    check_fused_conv(p, &mut checked);
+                    n_fused += 1;
+                }
+                KernelParams::FusedPool(p) => {
+                    check_fused_pool(p, &mut checked);
+                    n_fused += 1;
+                }
+            }
+        }
+        assert!(n_conv >= 8 && n_dw >= 13 && n_fc >= 7 && n_sm >= 1 && n_pool >= 3 && n_fused >= 2 && n_mean >= 4,
+            "corpus shrank unexpectedly: conv={n_conv} dw={n_dw} fc={n_fc} softmax={n_sm} pool={n_pool} fused={n_fused} mean={n_mean} scratch-free={n_scratch_free}");
+
+        // (b) widened grids (spec-corpus families + corner cases).
+        // conv1x1: out_c × spatial × in_c × offset. The 1×1 formula reads
+        // in_c (T3.3 pad path), out_c, spatial, and input_offset — the grid
+        // sweeps in_c across the pad (1/3/8/15/17) and no-pad (16/32/64/128)
+        // families so a future formula change cannot hide behind an un-swept
+        // corner.
+        for &out_c in &[16, 32, 64] {
+            for &spatial in &[1, 8, 14, 16, 28, 56, 112] {
+                for &in_c in &[1, 3, 8, 15, 16, 17, 32, 64, 128] {
+                    for &offset in &[0, 5, 128] {
+                        let p = conv_params(1, 1, in_c, out_c, spatial, spatial, spatial, spatial, 1, Padding::Same, offset);
+                        check_conv(&p, &mut checked);
+                    }
+                }
+            }
+        }
+        // conv3x3: in_c × out_c × hw × pad × stride × offset.
+        for &in_c in &[3, 16, 32, 64] {
+            for &out_c in &[16, 32, 64] {
+                for &hw in &[8, 16, 32] {
+                    for &padding in &[Padding::Valid, Padding::Same] {
+                        for &stride in &[1, 2] {
+                            for &offset in &[0, 5, 127] {
+                                let out_h = tflite_out_dim(hw, 3, stride, padding);
+                                let p = conv_params(3, 3, in_c, out_c, hw, hw, out_h, out_h, stride, padding, offset);
+                                check_conv(&p, &mut checked);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // depthwise: dm × in_c × filter(3x3, 5x5, 10x8-anytap) × spatial ×
+        // offset × stride (the 10×8 family covers the T3.5b anytap staging).
+        for &dm in &[1, 2, 4, 8] {
+            for &in_c in &[1, 3, 8, 16, 32] {
+                for &(fh, fw) in &[(3, 3), (5, 5), (10, 8)] {
+                    for &spatial in &[12, 14, 49] {
+                        for &offset in &[0, 3, 128] {
+                            for &stride in &[1, 2] {
+                                let p = depthwise_params(dm, in_c, fh, fw, spatial, spatial, stride, Padding::Same, offset);
+                                check_depthwise(&p, &mut checked);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // fc: input_dim × output_dim × offset (covers the T3.6 pad16 small
+        // shapes and the %16 no-pad path).
+        for &input_dim in &[1, 3, 8, 15, 16, 17, 32, 128, 640] {
+            for &output_dim in &[1, 8, 16, 128] {
+                for &offset in &[0, 5, 128] {
+                    let p = fc_params(input_dim, output_dim, offset);
+                    check_fc(&p, &mut checked);
+                }
+            }
+        }
+        // softmax: row_size × 4 on both sides.
+        for &row_size in &[16, 32, 64, 128, 1960] {
+            let p = softmax_params(row_size);
+            check_softmax(&p, &mut checked);
+        }
+        // pool: avg/max × filter(2x2..7x7) × stride × pad × channels — both
+        // sides are 0 by construction (see the corpus comment above).
+        for &kind in &["avg", "max"] {
+            for &f in &[2, 3, 5, 7] {
+                for &stride in &[1, 2] {
+                    for &padding in &[Padding::Valid, Padding::Same] {
+                        for &ch in &[3, 16, 32, 64] {
+                            let _ = (kind, f, stride, padding, ch);
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(checked >= 2000, "parity sweep did not expand ({checked})");
+    }
+
+    /// T1.4 — composed-group scratch parity. The composed emission reuses
+    /// per-op needs (documented choice: no separate composed mirror fns):
+    ///
+    /// * `fused_conv2d` — `emit_fused_conv` reports `scratch: conv.em.scratch`
+    ///   (the conv mirror), and the runtime decomposition
+    ///   (`RefBackend::fused_conv2d`, hematite-ref/src/fused.rs) forwards the
+    ///   same scratch to `conv2d`, whose need is exactly
+    ///   `S3Backend::conv2d_scratch_size`. The composed need therefore EQUALS
+    ///   the conv parity value (the absorbed add/act contribute 0). The
+    ///   T2.2 SIMD path adds nothing either (residual read in place, conv
+    ///   output register-held) — asserted via the explicit
+    ///   `fused_conv2d_scratch_need_codegen` mirror below.
+    /// * `fused_pool_with_fold` — `emit_fused_pool_fold` reports
+    ///   `scratch: fused_pool_fold_scratch_need_codegen(num_elements)` (the
+    ///   fold staging region, `pad16` of flat_len(fold input));
+    ///   the decomposition (hematite-ref/src/fused.rs) materializes the
+    ///   absorbed fold into exactly `num_elements` scratch bytes and the pool
+    ///   then needs 0 more (s3 pool ignores scratch). Composed need ==
+    ///   fold_need + pool_need, asserted as the task's decomposition-safety
+    ///   bound (>=) with equality verified.
+    #[test]
+    fn composed_scratch_parity() {
+        // fused_conv2d groups (3×3 and 1×1 anchors, with/without offset).
+        for &(fh, fw, in_c, out_c, spatial, stride, off) in &[
+            (3, 3, 16, 16, 16, 1, 0),
+            (3, 3, 32, 64, 16, 1, 128),
+            (3, 3, 3, 16, 8, 2, 0),
+            (3, 3, 64, 32, 28, 1, 5),
+            (3, 3, 12, 32, 12, 2, 0),
+            (1, 1, 16, 64, 16, 1, 0),
+            (1, 1, 32, 128, 14, 1, 128),
+        ] {
+            let out_h = tflite_out_dim(spatial, fh, stride, Padding::Same);
+            let out_w = tflite_out_dim(spatial, fw, stride, Padding::Same);
+            let p = conv_params(fh, fw, in_c, out_c, spatial, spatial, out_h, out_w, stride, Padding::Same, off);
+            let runtime = S3Backend::conv2d_scratch_size(&p);
+            let composed_need = fused_conv2d_scratch_need_codegen(
+                fh, fw,
+                spatial as usize, spatial as usize, in_c as usize,
+                out_h as usize, out_w as usize, out_c as usize,
+                stride, stride, off,
+            );
+            // emit_fused_conv → conv.em.scratch: the composed group's need IS
+            // the conv mirror, and the decomposition needs exactly the conv
+            // need — equality, never under-sized.
+            assert_eq!(
+                composed_need, runtime,
+                "fused_conv2d in_c={in_c} out_c={out_c} f={fh}x{fw} s={stride} off={off}: composed need {composed_need} != runtime conv need {runtime}"
+            );
+        }
+
+        // fused_pool_with_fold: codegen pad16(num_elements) vs decomposition
+        // sum (fold staging pad16 + pool need 0). Every grid shape has
+        // num_elements % 16 == 0, so pad16 is identity here — the assertion
+        // stays meaningful because the mirror is the value `emit_fused_pool_fold`
+        // reports, and the RHS is the decomposition's real consumption.
+        for &(h, w, c) in &[(4, 4, 16), (8, 16, 8), (16, 40, 1), (7, 7, 1280), (12, 12, 12), (32, 32, 3)] {
+            let num_elements = h * w * c; // emit_fused_pool_fold: flat_len(fold input)
+            let composed_need = fused_pool_fold_scratch_need_codegen(num_elements);
+            let fold_need = pad16(num_elements); // decomposition: fold materialization
+            let pool_need = 0; // pool consumes no scratch on either side
+            assert!(
+                composed_need >= fold_need + pool_need,
+                "fused_pool_with_fold {h}x{w}x{c}: composed need {composed_need} < decomposition sum {}",
+                fold_need + pool_need
+            );
+            assert_eq!(composed_need, fold_need + pool_need);
+        }
+    }
+
+
 }

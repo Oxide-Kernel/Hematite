@@ -25,8 +25,7 @@ pub fn generate_relu(w: &mut FixtureWriter) {
         let val = i32::from(x) + input_zero_point;
         let act = val.max(0); // symmetric: 0 = quantized zero
         let scaled = tflm_math::multiply_by_quantized_multiplier(act, output_multiplier, output_shift);
-        let clamped = (scaled + output_zero_point).clamp(-128, 127) as i8;
-        clamped
+        (scaled + output_zero_point).clamp(-128, 127) as i8
     }).collect();
 
     w.write_simple("relu", &input_shape, &output_shape, &input, &output,
@@ -81,7 +80,7 @@ pub fn generate_hard_swish(w: &mut FixtureWriter) {
 
     let output: Vec<i8> = input.iter().map(|&x| {
         let x_i32 = i32::from(x) + input_zero_point;
-        let relu6_arg = (x_i32 + 3).max(0).min(6);
+        let relu6_arg = (x_i32 + 3).clamp(0, 6);
         let product = x_i32 * relu6_arg;
         let result = if product >= 0 {
             (product + 3) / 6

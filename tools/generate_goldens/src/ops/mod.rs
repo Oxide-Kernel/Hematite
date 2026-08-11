@@ -11,3 +11,4 @@ pub mod data_movement;
 pub mod reductions;
 pub mod recurrent;
 pub mod zoo;
+pub mod zoo_tflm;

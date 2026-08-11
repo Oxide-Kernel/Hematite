@@ -10,10 +10,8 @@
 //! ## Crate structure
 //!
 //! * [`model`] — the proc-macro attribute entry point (only public item).
-//! * [`flatbuffer`] — the TFLite flatbuffer parser and IR types, re-exported
-//!   from the shared `hematite-tflite` crate (consumed by T4.1 generate,
-//!   T4.2a fusion, T4.2b arena, T4.2c layout, and by the ESP-NN C codegen
-//!   tool in `tools/`).
+//! * [`flatbuffer`] — hand-rolled TFLite flatbuffer parser and IR types
+//!   (consumed by T4.1 generate, T4.2a fusion, T4.2b arena, T4.2c layout).
 //!
 //! Because this is a proc-macro crate, only the `#[proc_macro_attribute]`
 //! function is publicly exported.  All parser infrastructure lives in
@@ -21,28 +19,92 @@
 
 use proc_macro::TokenStream;
 
-pub(crate) use hematite_tflite as flatbuffer;
+pub(crate) mod flatbuffer;
 pub(crate) mod generate;
 // T4.2a fusion now compiles (see optimize/fusion.rs) — optimize module
 // restored into the shared build per the gating comment below.
 pub(crate) mod optimize;
+// T4.1 — host-side mirror of every s3 SIMD-eligibility gate (the selector
+// and the W0 fused-profile consume it; parity-tested in-crate).
+pub(crate) mod eligibility;
 
 /// Parses the `#[model("path.tflite")]` attribute, reads and validates the
 /// TFLite model at compile time, then emits the typed inference code for
-/// `subgraph[0]` (T4.1: straight-line `KernelBackend` call sequence +
-/// `Model<B>` wrapper) alongside the annotated item.
+/// `subgraph[0]` alongside the annotated item.
+///
+/// The emitted code honors the T4.2a fusion schedule (T1.2): composed
+/// groups collapse to single `FusedKernelBackend` calls; T2 groups and
+/// ordinary ops emit the straight-line per-op sequence.
 #[proc_macro_attribute]
 pub fn model(attr: TokenStream, item: TokenStream) -> TokenStream {
     let proc_item = proc_macro2::TokenStream::from(item);
-    parse_and_emit(attr, proc_item).into()
+    parse_and_emit_impl(attr, proc_item, true, true, true, false).into()
+}
+
+/// Test-support attribute: identical to [`model`], but emits the UNFUSED
+/// per-op straight-line sequence (no fusion schedule) — the unfused arm of
+/// the T1.2 fused-vs-unfused equivalence gate.
+#[proc_macro_attribute]
+pub fn model_unfused(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let proc_item = proc_macro2::TokenStream::from(item);
+    parse_and_emit_impl(attr, proc_item, false, true, true, false).into()
+}
+
+/// Test-support attribute: identical to [`model`] (fused schedule honored)
+/// but with the T1.3 liveness arena DISABLED — intermediates are per-tensor
+/// stack arrays, the `stack` arm of the arena-vs-stack bit-exactness gate.
+#[proc_macro_attribute]
+pub fn model_stack(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let proc_item = proc_macro2::TokenStream::from(item);
+    parse_and_emit_impl(attr, proc_item, true, false, true, false).into()
+}
+
+/// Test-support attribute: identical to [`model`] (fused schedule honored,
+/// arena enabled) but with the T4.2 graph-input 16B staging DISABLED — the
+/// unstaged arm of the staged-vs-unstaged bit-exactness gate
+/// (`tests/staged_input.rs`).
+#[proc_macro_attribute]
+pub fn model_unstaged(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let proc_item = proc_macro2::TokenStream::from(item);
+    parse_and_emit_impl(attr, proc_item, true, true, false, false).into()
+}
+
+/// Test-support attribute: identical to [`model`] (fused schedule honored,
+/// arena enabled, staging honored) but with the T2
+/// `requires_verification` gate FORCED OPEN — T2 groups (input folds,
+/// requantize folds) are emitted composed whenever the T4.2 selector's
+/// structural + mirror gates pass, exactly as the W5 flip would.
+///
+/// T5.1 uses this as the "prove the auto-unfuse path" arm: a T2 group
+/// forced composed must FAIL the fused==unfused equivalence check when its
+/// composed semantics genuinely diverge from per-op, and the harness then
+/// re-emits that model's T2 groups per-op (the default `#[model]` selection
+/// — never silently accepted).  TEST-ONLY: unreachable from plain `#[model]`
+/// usage (which always passes `force_t2 = false`).
+#[proc_macro_attribute]
+pub fn model_force_t2(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let proc_item = proc_macro2::TokenStream::from(item);
+    parse_and_emit_impl(attr, proc_item, true, true, true, true).into()
 }
 
 /// Read + parse the model and route through the emitter, all within one
 /// scope so the parsed model (which borrows the file bytes) stays alive
-/// through emission.
-fn parse_and_emit(
+/// through emission.  `fused: true` precomputes the fusion schedule and
+/// passes it to the emitter (T1.2); `false` emits per-op only.
+/// `arena: true` enables the T1.3 liveness arena for intermediates;
+/// `false` forces per-tensor stack arrays (`#[model_stack]` test arm).
+/// `stage_input: true` honors the T4.2 graph-input 16B-staging decision.
+/// `force_t2: true` (`#[model_force_t2]` test arm, T5.1) opens the T2
+/// `requires_verification` gate so T2 groups may emit composed — the W5
+/// flip surface the fused==unfused harness proves.  Never set by
+/// `#[model]` / `#[model_unfused]` / `#[model_stack]` / `#[model_unstaged]`.
+fn parse_and_emit_impl(
     attr: TokenStream,
     proc_item: proc_macro2::TokenStream,
+    fused: bool,
+    arena: bool,
+    stage_input: bool,
+    force_t2: bool,
 ) -> proc_macro2::TokenStream {
     let path = match model_path_from_attr(&attr) {
         Ok(p) => p,
@@ -67,7 +129,17 @@ fn parse_and_emit(
             );
         }
     };
-    match generate::emit_model(&model) {
+    let emitted = if fused {
+        let schedule = optimize::fusion::fuse(&model);
+        if arena {
+            generate::emit_model_fused_with_policy(&model, &schedule, stage_input, force_t2)
+        } else {
+            generate::emit_model_stack_fused_with_policy(&model, &schedule, stage_input, force_t2)
+        }
+    } else {
+        generate::emit_model(&model)
+    };
+    match emitted {
         Ok(generated) => {
             quote::quote! {
                 #generated

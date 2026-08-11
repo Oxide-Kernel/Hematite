@@ -16,5 +16,6 @@ pub mod data_movement;
 pub mod reductions;
 pub mod recurrent;
 pub mod backend;
+pub mod fused;
 
 pub use backend::RefBackend;

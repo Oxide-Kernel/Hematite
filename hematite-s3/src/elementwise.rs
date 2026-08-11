@@ -12,8 +12,11 @@
 //! | (c) | SIMD vs ref cross-check ≤1 LSB on requantize | Device (Phase 5) |
 //!
 //! On host (stable-aarch64-apple-darwin), only leg (b) executes. The SIMD path
-//! (`#[cfg(target_arch = "xtensa")]`) is NEVER compiled on host — it exists in
-//! the tree for structural review and Phase 5 device verification.
+//! (`#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]`) is NEVER
+//! compiled on host and is additionally compiled out under `feature = "qemu"`
+//! (the Espressif QEMU fork's TIE728 emulation of VADDS/VSUBS/VMULAS is broken
+//! — crashes/silent wrong/hangs) — it exists in the tree for structural review
+//! and Phase 5 device verification.
 //!
 //! # Binary ops (add, mul, sub)
 //!
@@ -23,6 +26,19 @@
 //! * **Add / Sub**: Shifted per-input scaling → sum/diff → output requantize.
 //! * **Mul**: Direct product → single output requantize (no left_shift,
 //!   no per-input multiplier/shift).
+//!
+//! # SIMD dispatch (T3.2)
+//!
+//! Two device paths per op, tried in order: the raw TIE728 kernel
+//! (`dl_tie728_s8_{add,sub,mul}_w1_16_w2_16`) under the **identity**
+//! quant-affine contract (zero offsets, identity `(1<<30, 1)` pairs, full
+//! range, n % 16), then the T3.2 **widened per-lane model** — a
+//! host-compilable 16-wide register-lane loop that reproduces the exact
+//! scalar per-element math (input offsets → left_shift scaling → conditional
+//! per-input requantize → i32 sum/product → output requantize → offset →
+//! clamp → saturating_cast) with a scalar tail for `n % 16`. The widened
+//! model is bit-exact for EVERY param combination (host-tested below) and
+//! engages for any n ≥ 16 with 16-aligned buffers.
 
 use hematite_core::op_params::ElementwiseParams;
 use hematite_core::KernelError;
@@ -52,14 +68,26 @@ pub fn add(
     }
 
     // ── TIE728 SIMD dispatch (device-only; compiled out entirely on host) ──
-    // `add_simd_aligned` computes a raw int8 add with no offset/rescale/
-    // requantize step at all (see the struct doc above — AddSubAlignedArgs
-    // carries only `length`). It is bit-exact vs the scalar path below ONLY
-    // when every quant-affine step degenerates to the identity: zero
-    // offsets, no left_shift scaling, and both the per-input and output
-    // (multiplier, shift) pairs at (1<<30, 1) — the same identity pair the
-    // scalar loop itself already special-cases below.
-    #[cfg(target_arch = "xtensa")]
+    // Two device paths, tried in order:
+    //
+    // (1) Raw TIE728 `add_simd_aligned` (identity contract): computes a raw
+    //     int8 add with no offset/rescale/requantize step at all (see the
+    //     struct doc above — AddSubAlignedArgs carries only `length`). It is
+    //     bit-exact vs the scalar path below ONLY when every quant-affine
+    //     step degenerates to the identity: zero offsets, no left_shift
+    //     scaling, and both the per-input and output (multiplier, shift)
+    //     pairs at (1<<30, 1) — the same identity pair the scalar loop itself
+    //     already special-cases below.
+    //
+    // (2) T3.2 widened lane model (arbitrary offsets/multipliers): the
+    //     16-wide per-lane requantize model (`add_simd_lanes`) reproduces the
+    //     exact scalar per-element math register-held, with a scalar tail for
+    //     n % 16 — bit-exact for EVERY param combination (host-tested).
+    //
+    // Gated `not(feature = "qemu")` — the QEMU TIE728 emulation of VADDS
+    // crashes, so SIMD dispatch must be impossible under `feature = "qemu"`
+    // (scalar-only there).
+    #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
     {
         let identity = |m: i32, s: i32| m == 1 << 30 && s == 1;
         if params.input1_offset == 0
@@ -83,6 +111,24 @@ pub fn add(
                 unsafe {
                     add_simd_aligned(out_ptr, in1_ptr, in2_ptr, n as u32);
                 }
+                let _ = scratch;
+                return Ok(());
+            }
+        }
+        // (2) Widened lane-model path — any offsets/multipliers. The gate is
+        // the params-derived half (always true: the model is bit-exact for
+        // every param combination); n ≥ 16 and 16-aligned pointers are the
+        // per-call half. Misaligned buffers fall through to the scalar
+        // kernel (the established alignment-gate fallback).
+        if simd_eligible_add_sub_widened(params) && n >= 16 {
+            let in1_ptr = input1.as_ptr();
+            let in2_ptr = input2.as_ptr();
+            let out_ptr = output.as_mut_ptr();
+            if (in1_ptr as usize) % 16 == 0
+                && (in2_ptr as usize) % 16 == 0
+                && (out_ptr as usize) % 16 == 0
+            {
+                add_simd_lanes(input1, input2, params, output)?;
                 let _ = scratch;
                 return Ok(());
             }
@@ -156,13 +202,24 @@ pub fn mul(
     }
 
     // ── TIE728 SIMD dispatch (device-only; compiled out entirely on host) ──
-    // `mul_simd_aligned` computes `round((input1[i] * input2[i]) >> mul_shift)`
-    // with no offsets. With output_multiplier fixed at 1<<30,
-    // `multiply_by_quantized_multiplier(product, 1<<30, output_shift)` reduces
-    // to `round(product >> (1 - output_shift))`, so `mul_shift = 1 -
-    // output_shift` reproduces the scalar path exactly; `output_shift <= 1`
-    // is exactly what keeps that `mul_shift` non-negative.
-    #[cfg(target_arch = "xtensa")]
+    // Two device paths, tried in order:
+    //
+    // (1) Raw TIE728 `mul_simd_aligned` (identity contract): computes
+    //     `round((input1[i] * input2[i]) >> mul_shift)` with no offsets.
+    //     With output_multiplier fixed at 1<<30,
+    //     `multiply_by_quantized_multiplier(product, 1<<30, output_shift)`
+    //     reduces to `round(product >> (1 - output_shift))`, so
+    //     `mul_shift = 1 - output_shift` reproduces the scalar path exactly;
+    //     `output_shift <= 1` is exactly what keeps that `mul_shift`
+    //     non-negative.
+    //
+    // (2) T3.2 widened lane model (arbitrary offsets/multipliers): the
+    //     16-wide per-lane requantize model (`mul_simd_lanes`) reproduces the
+    //     exact scalar per-element math register-held, with a scalar tail for
+    //     n % 16 — bit-exact for EVERY param combination (host-tested).
+    //
+    // Gated `not(feature = "qemu")` — the QEMU TIE728 VMULAS emulation hangs.
+    #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
     {
         if params.input1_offset == 0
             && params.input2_offset == 0
@@ -184,6 +241,21 @@ pub fn mul(
                 unsafe {
                     mul_simd_aligned(out_ptr, in1_ptr, in2_ptr, n as u32, mul_shift);
                 }
+                let _ = scratch;
+                return Ok(());
+            }
+        }
+        // (2) Widened lane-model path — any offsets/multipliers (same gate
+        // shape as the add/sub dispatch: params half + per-call n/alignment).
+        if simd_eligible_mul_widened(params) && n >= 16 {
+            let in1_ptr = input1.as_ptr();
+            let in2_ptr = input2.as_ptr();
+            let out_ptr = output.as_mut_ptr();
+            if (in1_ptr as usize) % 16 == 0
+                && (in2_ptr as usize) % 16 == 0
+                && (out_ptr as usize) % 16 == 0
+            {
+                mul_simd_lanes(input1, input2, params, output)?;
                 let _ = scratch;
                 return Ok(());
             }
@@ -234,9 +306,22 @@ pub fn sub(
     }
 
     // ── TIE728 SIMD dispatch (device-only; compiled out entirely on host) ──
-    // Same identity contract as `add`'s dispatch above — `sub_simd_aligned`
-    // computes a raw int8 subtract with no offset/rescale/requantize step.
-    #[cfg(target_arch = "xtensa")]
+    // Two device paths, tried in order:
+    //
+    // (1) Raw TIE728 `sub_simd_aligned` (identity contract): computes a raw
+    //     int8 subtract with no offset/rescale/requantize step — bit-exact
+    //     vs the scalar path below ONLY under the same identity contract as
+    //     `add`'s dispatch (zero offsets, no left_shift scaling, identity
+    //     (1<<30, 1) pairs everywhere, full-range clamp, n % 16).
+    //
+    // (2) T3.2 widened lane model (arbitrary offsets/multipliers): the
+    //     16-wide per-lane requantize model (`sub_simd_lanes`) reproduces the
+    //     exact scalar per-element math register-held, with a scalar tail for
+    //     n % 16 — bit-exact for EVERY param combination (host-tested).
+    //
+    // Gated `not(feature = "qemu")` — the QEMU TIE728 VSUBS emulation is
+    // silently wrong.
+    #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
     {
         let identity = |m: i32, s: i32| m == 1 << 30 && s == 1;
         if params.input1_offset == 0
@@ -260,6 +345,21 @@ pub fn sub(
                 unsafe {
                     sub_simd_aligned(out_ptr, in1_ptr, in2_ptr, n as u32);
                 }
+                let _ = scratch;
+                return Ok(());
+            }
+        }
+        // (2) Widened lane-model path — any offsets/multipliers (same gate
+        // shape as the add dispatch: params half + per-call n/alignment).
+        if simd_eligible_add_sub_widened(params) && n >= 16 {
+            let in1_ptr = input1.as_ptr();
+            let in2_ptr = input2.as_ptr();
+            let out_ptr = output.as_mut_ptr();
+            if (in1_ptr as usize) % 16 == 0
+                && (in2_ptr as usize) % 16 == 0
+                && (out_ptr as usize) % 16 == 0
+            {
+                sub_simd_lanes(input1, input2, params, output)?;
                 let _ = scratch;
                 return Ok(());
             }
@@ -315,8 +415,10 @@ pub fn sub(
 /// TIE728 SIMD backend for elementwise ops.
 ///
 /// This module is **entirely cfg-gated** behind `#[cfg(target_arch = "xtensa")]`
-/// and is NEVER compiled on the host (stable-aarch64-apple-darwin). It exists
-/// in the tree for structural review and Phase 5 device verification (T5.3).
+/// (the dispatch into it is additionally gated `not(feature = "qemu")`, so the
+/// broken QEMU TIE728 emulation is never reached) and is NEVER compiled on the
+/// host (stable-aarch64-apple-darwin). It exists in the tree for structural
+/// review and Phase 5 device verification (T5.3).
 ///
 /// ## Architecture
 ///
@@ -370,11 +472,11 @@ pub fn sub(
 /// preprocessing and postprocessing.
 #[cfg(target_arch = "xtensa")]
 mod elementwise_simd {
-    /// Include the vendored TIE728 shared macros and elementwise entry points.
-    ///
-    /// The shared `dl_tie728_s8.S` provides macros used by all three
-    /// elementwise files (`dl_tie728_s8_unaligned_store0`,
-    /// `tie728_s8_vector_round_result`, etc.).
+    // Include the vendored TIE728 shared macros and elementwise entry points.
+    //
+    // The shared `dl_tie728_s8.S` provides macros used by all three
+    // elementwise files (`dl_tie728_s8_unaligned_store0`,
+    // `tie728_s8_vector_round_result`, etc.).
     core::arch::global_asm!(
         include_str!("../src/asm/dl_tie728_s8.S"),
         include_str!("../src/asm/dl_tie728_s8_add.S"),
@@ -453,31 +555,39 @@ mod elementwise_simd {
     ///
     /// * `num_elements` must be a multiple of 16 (16-wide SIMD lanes).
     /// * All pointers must be 16-byte aligned for EE.VLD.128.IP / EE.VST.128.IP.
+    ///
+    /// # Register-hazard note (device finding, task 8)
+    ///
+    /// The previous `mov a10,{output}` template style is unsafe: LLVM may
+    /// allocate an `in(reg)` operand to a register the template itself
+    /// overwrites first (observed: `input2`→a10 and `args`→a11, so the
+    /// template's own `mov a10`/`mov a11` clobbered them and the kernel
+    /// received `a12=output` / `a13=input1` — it then read the "length" from
+    /// input1+44 (garbage) and wrote 16-byte chunks across DRAM until it hit
+    /// unmapped memory, corrupting the defmt `RTT_ENCODER.taken` flag on the
+    /// way — the task-5 "defmt logger taken reentrantly" panic is a symptom of
+    /// that walk). Same fix as `avg_pool_2d_simd_ctx`: pinned-register
+    /// operands, no `mov` template, plain struct literal, `#[inline(never)]`.
     #[allow(dead_code)]
+    #[inline(never)]
     pub unsafe fn add_simd_aligned(
         output: *mut i8,
         input1: *const i8,
         input2: *const i8,
         num_elements: u32,
     ) {
-        // Only the length field (@44) is read by the asm.
-        let mut args = core::mem::MaybeUninit::<AddSubAlignedArgs>::uninit();
-        args.as_mut_ptr()
-            .cast::<u8>()
-            .add(44)
-            .cast::<u32>()
-            .write(num_elements);
-        let args = unsafe { args.assume_init_ref() };
+        // Plain struct literal — the MaybeUninit pointer-cast build is
+        // miscompiled by the Xtensa LLVM backend (pool.rs precedent).
+        let args = AddSubAlignedArgs {
+            length: num_elements,
+            ..Default::default()
+        };
         core::arch::asm!(
-            "mov a10, {output}",
-            "mov a11, {input1}",
-            "mov a12, {input2}",
-            "mov a13, {args}",
             "call8 dl_tie728_s8_add_w1_16_w2_16",
-            output = in(reg) output,
-            input1 = in(reg) input1,
-            input2 = in(reg) input2,
-            args = in(reg) args,
+            in("a10") output,
+            in("a11") input1,
+            in("a12") input2,
+            in("a13") &args,
             clobber_abi("C"),
         );
     }
@@ -500,7 +610,11 @@ mod elementwise_simd {
     /// * All pointers 16-byte aligned.
     /// * `mul_shift`: right-shift for requantize rounding
     ///   (`tie728_s8_vector_round_result` macro). Set to 0 for no shift.
+    ///
+    /// Pinned-register operands (no `mov` template) + plain struct literal —
+    /// same register-hazard fix as `add_simd_aligned` (task-8 device finding).
     #[allow(dead_code)]
+    #[inline(never)]
     pub unsafe fn mul_simd_aligned(
         output: *mut i8,
         input1: *const i8,
@@ -508,22 +622,17 @@ mod elementwise_simd {
         num_elements: u32,
         mul_shift: i32,
     ) {
-        // Only c_div_x_1 (@64) and mul_shift (@80) are read by the asm.
-        let mut args = core::mem::MaybeUninit::<MulAlignedArgs>::uninit();
-        let p = args.as_mut_ptr();
-        p.cast::<u8>().add(64).cast::<i32>().write((num_elements / 16) as i32 - 1);
-        p.cast::<u8>().add(80).cast::<i32>().write(mul_shift);
-        let args = unsafe { args.assume_init_ref() };
+        let args = MulAlignedArgs {
+            c_div_x_1: (num_elements / 16) as i32 - 1,
+            mul_shift,
+            ..Default::default()
+        };
         core::arch::asm!(
-            "mov a10, {output}",
-            "mov a11, {input1}",
-            "mov a12, {input2}",
-            "mov a13, {args}",
             "call8 dl_tie728_s8_mul_w1_16_w2_16",
-            output = in(reg) output,
-            input1 = in(reg) input1,
-            input2 = in(reg) input2,
-            args = in(reg) args,
+            in("a10") output,
+            in("a11") input1,
+            in("a12") input2,
+            in("a13") &args,
             clobber_abi("C"),
         );
     }
@@ -544,31 +653,27 @@ mod elementwise_simd {
     ///
     /// * `num_elements` must be a multiple of 16.
     /// * All pointers 16-byte aligned.
+    ///
+    /// Pinned-register operands (no `mov` template) + plain struct literal —
+    /// same register-hazard fix as `add_simd_aligned` (task-8 device finding).
     #[allow(dead_code)]
+    #[inline(never)]
     pub unsafe fn sub_simd_aligned(
         output: *mut i8,
         input1: *const i8,
         input2: *const i8,
         num_elements: u32,
     ) {
-        // Only the length field (@44) is read by the asm.
-        let mut args = core::mem::MaybeUninit::<AddSubAlignedArgs>::uninit();
-        args.as_mut_ptr()
-            .cast::<u8>()
-            .add(44)
-            .cast::<u32>()
-            .write(num_elements);
-        let args = unsafe { args.assume_init_ref() };
+        let args = AddSubAlignedArgs {
+            length: num_elements,
+            ..Default::default()
+        };
         core::arch::asm!(
-            "mov a10, {output}",
-            "mov a11, {input1}",
-            "mov a12, {input2}",
-            "mov a13, {args}",
             "call8 dl_tie728_s8_sub_w1_16_w2_16",
-            output = in(reg) output,
-            input1 = in(reg) input1,
-            input2 = in(reg) input2,
-            args = in(reg) args,
+            in("a10") output,
+            in("a11") input1,
+            in("a12") input2,
+            in("a13") &args,
             clobber_abi("C"),
         );
     }
@@ -622,22 +727,204 @@ pub(crate) fn simd_eligible_mul(params: &ElementwiseParams) -> Option<i32> {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// T3.2 — widened per-lane SIMD models (host-compilable lane math)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The raw TIE728 dispatch above is bit-exact only for the identity quant-affine
+// contracts. T3.2 widens elementwise SIMD to ARBITRARY input/output offsets and
+// multipliers via a 16-wide per-lane requantize model: each lane runs the exact
+// scalar per-element math (input offsets → left_shift scaling → conditional
+// per-input `multiply_by_quantized_multiplier` (skipped iff (1<<30, 1)) → i32
+// sum/product → output requantize → output_offset → clamp → saturating_cast)
+// register-held — the same lane sequence `fused::chain_step_apply` applies to
+// chain steps — with a scalar tail for n % 16.
+//
+// The models are host-compilable (`#[cfg(any(all(target_arch = "xtensa",
+// not(feature = "qemu")), test))]` — the fused.rs pattern) so host tests prove
+// them bit-exact vs the scalar kernels; on device the `add`/`mul`/`sub`
+// dispatches above run them under the same QEMU gate. No TIE728 asm is
+// involved — the engagement is the register-held 16-wide lane loop.
+
+/// Widened add/sub SIMD-eligibility gate — host-compilable.
+///
+/// Returns `true` for EVERY param combination: the per-lane model applies the
+/// exact scalar arithmetic, so it is bit-exact by construction regardless of
+/// offsets, multipliers, shifts, left_shift, or activation range. The gate
+/// exists so the `Prepared*` handles can evaluate the params-derived half once
+/// at construction; the per-call half (n ≥ 16, 16-aligned pointers) is
+/// re-checked in `run`.
+pub(crate) fn simd_eligible_add_sub_widened(_params: &ElementwiseParams) -> bool {
+    true
+}
+
+/// Widened mul SIMD-eligibility gate — host-compilable. Same contract as
+/// [`simd_eligible_add_sub_widened`]: every param combination is bit-exact
+/// under the per-lane model.
+pub(crate) fn simd_eligible_mul_widened(_params: &ElementwiseParams) -> bool {
+    true
+}
+
+/// One add/sub lane — the exact scalar per-element math (identical to the
+/// `add`/`sub` scalar loops below, factored per-lane for the 16-wide model).
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+#[inline]
+fn add_sub_lane(input1: i8, input2: i8, params: &ElementwiseParams, is_sub: bool) -> i8 {
+    let mut val1 = i32::from(input1) + params.input1_offset;
+    let mut val2 = i32::from(input2) + params.input2_offset;
+
+    let shift_factor = if params.left_shift >= 0 {
+        1i32 << params.left_shift
+    } else {
+        1i32
+    };
+    val1 *= shift_factor;
+    val2 *= shift_factor;
+
+    if params.input1_multiplier != 1i32 << 30 || params.input1_shift != 1 {
+        val1 = multiply_by_quantized_multiplier(
+            val1, params.input1_multiplier, params.input1_shift);
+    }
+    if params.input2_multiplier != 1i32 << 30 || params.input2_shift != 1 {
+        val2 = multiply_by_quantized_multiplier(
+            val2, params.input2_multiplier, params.input2_shift);
+    }
+
+    let raw = if is_sub { val1 - val2 } else { val1 + val2 };
+    let scaled = multiply_by_quantized_multiplier(
+        raw, params.output_multiplier, params.output_shift);
+    let with_offset = scaled + params.output_offset;
+
+    let clamped = if with_offset > params.quantized_activation_max {
+        params.quantized_activation_max
+    } else if with_offset < params.quantized_activation_min {
+        params.quantized_activation_min
+    } else {
+        with_offset
+    };
+    saturating_cast(clamped)
+}
+
+/// One mul lane — the exact scalar per-element math (identical to the `mul`
+/// scalar loop, factored per-lane for the 16-wide model).
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+#[inline]
+fn mul_lane(input1: i8, input2: i8, params: &ElementwiseParams) -> i8 {
+    let val1 = i32::from(input1) + params.input1_offset;
+    let val2 = i32::from(input2) + params.input2_offset;
+    let product = val1 * val2;
+    let scaled = multiply_by_quantized_multiplier(
+        product, params.output_multiplier, params.output_shift);
+    let with_offset = scaled + params.output_offset;
+
+    let clamped = if with_offset > params.quantized_activation_max {
+        params.quantized_activation_max
+    } else if with_offset < params.quantized_activation_min {
+        params.quantized_activation_min
+    } else {
+        with_offset
+    };
+    saturating_cast(clamped)
+}
+
+/// 16-wide vector main loop + scalar tail — the shared widened-SIMD shape for
+/// all three elementwise models. The vector main loop processes full 16-lane
+/// chunks (the TIE728 lane width) with per-lane register math; the tail covers
+/// `n % 16` elements scalarly.
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+fn lane_loop(
+    input1: &[i8],
+    input2: &[i8],
+    params: &ElementwiseParams,
+    output: &mut [i8],
+    lane: fn(i8, i8, &ElementwiseParams) -> i8,
+) {
+    let n = params.num_elements as usize;
+    let mut i = 0;
+    while i + 16 <= n {
+        for l in 0..16 {
+            output[i + l] = lane(input1[i + l], input2[i + l], params);
+        }
+        i += 16;
+    }
+    for j in i..n {
+        output[j] = lane(input1[j], input2[j], params);
+    }
+}
+
+/// Widened ADD lane model — 16-wide per-lane requantize + scalar tail.
+/// Bit-exact vs the scalar [`add`] kernel for every param combination.
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+pub(crate) fn add_simd_lanes(
+    input1: &[i8],
+    input2: &[i8],
+    params: &ElementwiseParams,
+    output: &mut [i8],
+) -> Result<(), KernelError> {
+    let n = params.num_elements as usize;
+    if input1.len() != n || input2.len() != n || output.len() != n {
+        return Err(KernelError::ShapeMismatch);
+    }
+    lane_loop(input1, input2, params, output, |a, b, p| {
+        add_sub_lane(a, b, p, false)
+    });
+    Ok(())
+}
+
+/// Widened SUB lane model — same contract as [`add_simd_lanes`] with
+/// `val1 - val2`.
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+pub(crate) fn sub_simd_lanes(
+    input1: &[i8],
+    input2: &[i8],
+    params: &ElementwiseParams,
+    output: &mut [i8],
+) -> Result<(), KernelError> {
+    let n = params.num_elements as usize;
+    if input1.len() != n || input2.len() != n || output.len() != n {
+        return Err(KernelError::ShapeMismatch);
+    }
+    lane_loop(input1, input2, params, output, |a, b, p| {
+        add_sub_lane(a, b, p, true)
+    });
+    Ok(())
+}
+
+/// Widened MUL lane model — same contract as [`add_simd_lanes`].
+#[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
+pub(crate) fn mul_simd_lanes(
+    input1: &[i8],
+    input2: &[i8],
+    params: &ElementwiseParams,
+    output: &mut [i8],
+) -> Result<(), KernelError> {
+    let n = params.num_elements as usize;
+    if input1.len() != n || input2.len() != n || output.len() != n {
+        return Err(KernelError::ShapeMismatch);
+    }
+    lane_loop(input1, input2, params, output, |a, b, p| mul_lane(a, b, p));
+    Ok(())
+}
+
 /// Prepared elementwise add — runs the SIMD gate once at construction.
 pub struct PreparedAdd {
     simd: bool,
+    widened: bool,
     params: &'static ElementwiseParams,
 }
 
 impl PreparedAdd {
     /// Run the SIMD gate once; subsequent `run` calls skip it.
     pub fn new(params: &'static ElementwiseParams) -> Result<Self, KernelError> {
-        let simd = simd_eligible_add_sub(params) && cfg!(all(target_arch = "xtensa"));
-        Ok(Self { simd, params })
+        let device = cfg!(all(target_arch = "xtensa", not(feature = "qemu")));
+        let simd = simd_eligible_add_sub(params) && device;
+        let widened = simd_eligible_add_sub_widened(params) && device;
+        Ok(Self { simd, widened, params })
     }
 
     /// Whether the TIE728 SIMD path is active for these params.
     pub fn is_simd(&self) -> bool {
-        self.simd
+        self.simd || self.widened
     }
 
     /// Run elementwise add on `input1` + `input2` → `output`.
@@ -648,9 +935,10 @@ impl PreparedAdd {
         output: &mut [i8],
         scratch: &mut [u8],
     ) -> Result<(), KernelError> {
-        #[cfg(target_arch = "xtensa")]
+        #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
         {
-            let n = self.params.num_elements as usize;            if self.simd && n % 16 == 0 {
+            let n = self.params.num_elements as usize;
+            if self.simd && n % 16 == 0 {
                 let in1_ptr = input1.as_ptr();
                 let in2_ptr = input2.as_ptr();
                 let out_ptr = output.as_mut_ptr();
@@ -665,6 +953,19 @@ impl PreparedAdd {
                     return Ok(());
                 }
             }
+            if self.widened && n >= 16 {
+                let in1_ptr = input1.as_ptr();
+                let in2_ptr = input2.as_ptr();
+                let out_ptr = output.as_mut_ptr();
+                if (in1_ptr as usize) % 16 == 0
+                    && (in2_ptr as usize) % 16 == 0
+                    && (out_ptr as usize) % 16 == 0
+                {
+                    add_simd_lanes(input1, input2, self.params, output)?;
+                    let _ = scratch;
+                    return Ok(());
+                }
+            }
         }
         add(input1, input2, self.params, output, scratch)
     }
@@ -673,20 +974,22 @@ impl PreparedAdd {
 /// Prepared elementwise mul — runs the SIMD gate once at construction.
 pub struct PreparedMul {
     mul_shift: Option<i32>,
+    widened: bool,
     params: &'static ElementwiseParams,
 }
 
 impl PreparedMul {
     /// Run the SIMD gate once; subsequent `run` calls skip it.
     pub fn new(params: &'static ElementwiseParams) -> Result<Self, KernelError> {
-        let mul_shift =
-            simd_eligible_mul(params).filter(|_| cfg!(all(target_arch = "xtensa")));
-        Ok(Self { mul_shift, params })
+        let device = cfg!(all(target_arch = "xtensa", not(feature = "qemu")));
+        let mul_shift = simd_eligible_mul(params).filter(|_| device);
+        let widened = simd_eligible_mul_widened(params) && device;
+        Ok(Self { mul_shift, widened, params })
     }
 
     /// Whether the TIE728 SIMD path is active for these params.
     pub fn is_simd(&self) -> bool {
-        self.mul_shift.is_some()
+        self.mul_shift.is_some() || self.widened
     }
 
     /// Run elementwise mul on `input1` * `input2` → `output`.
@@ -697,9 +1000,10 @@ impl PreparedMul {
         output: &mut [i8],
         scratch: &mut [u8],
     ) -> Result<(), KernelError> {
-        #[cfg(target_arch = "xtensa")]
+        #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
         {
-            let n = self.params.num_elements as usize;            if let Some(mul_shift) = self.mul_shift {
+            let n = self.params.num_elements as usize;
+            if let Some(mul_shift) = self.mul_shift {
                 if n % 16 == 0 {
                     let in1_ptr = input1.as_ptr();
                     let in2_ptr = input2.as_ptr();
@@ -716,6 +1020,19 @@ impl PreparedMul {
                     }
                 }
             }
+            if self.widened && n >= 16 {
+                let in1_ptr = input1.as_ptr();
+                let in2_ptr = input2.as_ptr();
+                let out_ptr = output.as_mut_ptr();
+                if (in1_ptr as usize) % 16 == 0
+                    && (in2_ptr as usize) % 16 == 0
+                    && (out_ptr as usize) % 16 == 0
+                {
+                    mul_simd_lanes(input1, input2, self.params, output)?;
+                    let _ = scratch;
+                    return Ok(());
+                }
+            }
         }
         mul(input1, input2, self.params, output, scratch)
     }
@@ -724,19 +1041,22 @@ impl PreparedMul {
 /// Prepared elementwise sub — runs the SIMD gate once at construction.
 pub struct PreparedSub {
     simd: bool,
+    widened: bool,
     params: &'static ElementwiseParams,
 }
 
 impl PreparedSub {
     /// Run the SIMD gate once; subsequent `run` calls skip it.
     pub fn new(params: &'static ElementwiseParams) -> Result<Self, KernelError> {
-        let simd = simd_eligible_add_sub(params) && cfg!(all(target_arch = "xtensa"));
-        Ok(Self { simd, params })
+        let device = cfg!(all(target_arch = "xtensa", not(feature = "qemu")));
+        let simd = simd_eligible_add_sub(params) && device;
+        let widened = simd_eligible_add_sub_widened(params) && device;
+        Ok(Self { simd, widened, params })
     }
 
     /// Whether the TIE728 SIMD path is active for these params.
     pub fn is_simd(&self) -> bool {
-        self.simd
+        self.simd || self.widened
     }
 
     /// Run elementwise sub on `input1` − `input2` → `output`.
@@ -747,9 +1067,10 @@ impl PreparedSub {
         output: &mut [i8],
         scratch: &mut [u8],
     ) -> Result<(), KernelError> {
-        #[cfg(target_arch = "xtensa")]
+        #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
         {
-            let n = self.params.num_elements as usize;            if self.simd && n % 16 == 0 {
+            let n = self.params.num_elements as usize;
+            if self.simd && n % 16 == 0 {
                 let in1_ptr = input1.as_ptr();
                 let in2_ptr = input2.as_ptr();
                 let out_ptr = output.as_mut_ptr();
@@ -764,7 +1085,213 @@ impl PreparedSub {
                     return Ok(());
                 }
             }
+            if self.widened && n >= 16 {
+                let in1_ptr = input1.as_ptr();
+                let in2_ptr = input2.as_ptr();
+                let out_ptr = output.as_mut_ptr();
+                if (in1_ptr as usize) % 16 == 0
+                    && (in2_ptr as usize) % 16 == 0
+                    && (out_ptr as usize) % 16 == 0
+                {
+                    sub_simd_lanes(input1, input2, self.params, output)?;
+                    let _ = scratch;
+                    return Ok(());
+                }
+            }
         }
         sub(input1, input2, self.params, output, scratch)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Host-compilable widened-SIMD model tests (T3.2)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The lane models are the exact scalar per-element math run in 16-wide chunks
+// (device dispatch + host tests). These tests prove the models bit-exact vs
+// the scalar kernels across a non-identity offset/multiplier sweep — the
+// same-backend oracle the correctness contract demands (NOT hematite-ref for
+// hard_swish; here the scalar kernels ARE the oracle).
+
+#[cfg(test)]
+mod widened_simd_model_tests {
+    extern crate alloc;
+    use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    /// Non-identity elementwise params — the two-stage TFLM Add rounding
+    /// shape (per-input roundings, left_shift 20, output requantize) plus a
+    /// clamped activation range and non-zero zero points.
+    fn non_identity_add_params(n: i32) -> ElementwiseParams {
+        ElementwiseParams {
+            num_elements: n,
+            input1_offset: -5,
+            input2_offset: 3,
+            output_offset: 1,
+            output_multiplier: 1_342_177_280,
+            output_shift: -18,
+            left_shift: 20,
+            input1_multiplier: 1 << 30,
+            input1_shift: 0,
+            input2_multiplier: 1_288_490_189,
+            input2_shift: -1,
+            quantized_activation_min: -32,
+            quantized_activation_max: 96,
+        }
+    }
+
+    /// Non-identity mul params — a real scale change (product requantize).
+    fn non_identity_mul_params(n: i32) -> ElementwiseParams {
+        ElementwiseParams {
+            num_elements: n,
+            input1_offset: 2,
+            input2_offset: -3,
+            output_offset: -7,
+            output_multiplier: 1_717_986_918,
+            output_shift: -3,
+            left_shift: 0,
+            input1_multiplier: 0,
+            input1_shift: 0,
+            input2_multiplier: 0,
+            input2_shift: 0,
+            quantized_activation_min: -16,
+            quantized_activation_max: 111,
+        }
+    }
+
+    /// Deterministic LCG `i8` pattern (full int8 range).
+    fn pattern(seed: u32, n: usize) -> Vec<i8> {
+        let mut out = vec![0i8; n];
+        let mut x = seed;
+        for v in out.iter_mut() {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *v = (x >> 16) as i8;
+        }
+        out
+    }
+
+    /// The non-identity sweep: every model must be bit-exact vs the scalar
+    /// kernel for lengths {16, 24, 32, 48} (24 exercises the n % 16 scalar
+    /// tail) across the param family {identity, non-identity add/sub, mul}.
+    #[test]
+    fn widened_models_match_scalar_kernels_bit_exact() {
+        let mut checked = 0;
+        for &n in &[16usize, 24, 32, 48] {
+            let input1 = pattern(0xAAAA_0001 + n as u32, n);
+            let input2 = pattern(0x5555_0002 + n as u32, n);
+
+            // Identity params — the raw-TIE728 contract (model must match
+            // too, since identity params also pass the widened gate).
+            let id_add = ElementwiseParams {
+                num_elements: n as i32,
+                input1_offset: 0,
+                input2_offset: 0,
+                output_offset: 0,
+                output_multiplier: 1 << 30,
+                output_shift: 1,
+                left_shift: 0,
+                input1_multiplier: 1 << 30,
+                input1_shift: 1,
+                input2_multiplier: 1 << 30,
+                input2_shift: 1,
+                quantized_activation_min: i8::MIN as i32,
+                quantized_activation_max: i8::MAX as i32,
+            };
+            let mut got = vec![0i8; n];
+            let mut want = vec![0i8; n];
+            add_simd_lanes(&input1, &input2, &id_add, &mut got).expect("model add runs");
+            add(&input1, &input2, &id_add, &mut want, &mut []).expect("scalar add runs");
+            assert_eq!(got, want, "identity add n={n}");
+
+            // Non-identity add/sub (two-stage rounding, clamped range).
+            let p = non_identity_add_params(n as i32);
+            let mut got = vec![0i8; n];
+            let mut want = vec![0i8; n];
+            add_simd_lanes(&input1, &input2, &p, &mut got).expect("model add runs");
+            add(&input1, &input2, &p, &mut want, &mut []).expect("scalar add runs");
+            assert_eq!(got, want, "non-identity add n={n}");
+            let mut got = vec![0i8; n];
+            let mut want = vec![0i8; n];
+            sub_simd_lanes(&input1, &input2, &p, &mut got).expect("model sub runs");
+            sub(&input1, &input2, &p, &mut want, &mut []).expect("scalar sub runs");
+            assert_eq!(got, want, "non-identity sub n={n}");
+
+            // Non-identity mul (offsets + product requantize + clamped range).
+            let pm = non_identity_mul_params(n as i32);
+            let mut got = vec![0i8; n];
+            let mut want = vec![0i8; n];
+            mul_simd_lanes(&input1, &input2, &pm, &mut got).expect("model mul runs");
+            mul(&input1, &input2, &pm, &mut want, &mut []).expect("scalar mul runs");
+            assert_eq!(got, want, "non-identity mul n={n}");
+
+            checked += 4;
+        }
+        assert!(checked >= 16, "sweep must cover all n × param families");
+    }
+
+    /// The widened gates accept EVERY param combination (identity and
+    /// non-identity alike) — the model is bit-exact by construction — while
+    /// the identity gates keep their strict contracts (fused.rs depends on
+    /// them).
+    #[test]
+    fn widened_gates_accept_all_params() {
+        let p = non_identity_add_params(256);
+        assert!(simd_eligible_add_sub_widened(&p), "non-identity add must engage");
+        assert!(!simd_eligible_add_sub(&p), "identity gate must still refuse");
+        let pm = non_identity_mul_params(256);
+        assert!(simd_eligible_mul_widened(&pm), "non-identity mul must engage");
+        assert!(simd_eligible_mul(&pm).is_none(), "identity mul gate must still refuse");
+        let id = ElementwiseParams {
+            num_elements: 256,
+            input1_offset: 0,
+            input2_offset: 0,
+            output_offset: 0,
+            output_multiplier: 1 << 30,
+            output_shift: 0,
+            left_shift: 0,
+            input1_multiplier: 1 << 30,
+            input1_shift: 1,
+            input2_multiplier: 1 << 30,
+            input2_shift: 1,
+            quantized_activation_min: i8::MIN as i32,
+            quantized_activation_max: i8::MAX as i32,
+        };
+        assert!(simd_eligible_add_sub_widened(&id) && simd_eligible_mul_widened(&id));
+    }
+
+    /// Saturation path: extreme offsets push `x + offset` beyond i8 range —
+    /// the i32 lane math must match the scalar's i32 arithmetic (no int8
+    /// saturation anywhere in the offset/scale chain).
+    #[test]
+    fn widened_models_match_scalar_with_extreme_offsets() {
+        let n = 48usize;
+        let input1 = pattern(0xDEAD_0011, n);
+        let input2 = pattern(0xBEEF_0022, n);
+        let p = ElementwiseParams {
+            num_elements: n as i32,
+            input1_offset: 127,
+            input2_offset: -127,
+            output_offset: 100,
+            output_multiplier: 1_342_177_280,
+            output_shift: -18,
+            left_shift: 20,
+            input1_multiplier: 1 << 30,
+            input1_shift: 0,
+            input2_multiplier: 1_288_490_189,
+            input2_shift: -1,
+            quantized_activation_min: i8::MIN as i32,
+            quantized_activation_max: i8::MAX as i32,
+        };
+        let mut got = vec![0i8; n];
+        let mut want = vec![0i8; n];
+        add_simd_lanes(&input1, &input2, &p, &mut got).expect("model add runs");
+        add(&input1, &input2, &p, &mut want, &mut []).expect("scalar add runs");
+        assert_eq!(got, want, "extreme-offset add must stay i32-exact");
+        let mut got = vec![0i8; n];
+        let mut want = vec![0i8; n];
+        mul_simd_lanes(&input1, &input2, &p, &mut got).expect("model mul runs");
+        mul(&input1, &input2, &p, &mut want, &mut []).expect("scalar mul runs");
+        assert_eq!(got, want, "extreme-offset mul must stay i32-exact");
     }
 }

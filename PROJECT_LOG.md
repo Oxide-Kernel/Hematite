@@ -659,73 +659,9 @@ Engineering notes:
   then folding `offset·Σw` per channel after the MAC.
 - `EE.VMAX.S8` (softmax find-max) assembles cleanly; `l8si` does not exist in
   the Xtensa toolchain — use `l8ui` + `sext`.
- - The vendored S16 experiment (`dl_tie728_s16.S` / `_conv2d.S`,
-   `probe_s16.S`) was deleted: S16 QACC lanes saturate at 16 bits, so it could
-   never be bit-exact; the ACCX + QACC-depthwise kernels supersede it.
-
-### Phase 18 — Scalar performance: 32-bit requantize + unchecked kernels + gate relaxations
-
-Motivated by the real-model zoo benchmark (Phase 17 follow-up): on models where
-the SIMD gates don't fire (tiny models, `depth_multiplier > 1`, `input_offset`
-outside ±127), Hematite's scalar tier was slower than ESP-NN. The goal: make
-the *scalar* fallback faster than ESP-NN everywhere, not model-specific, while
-keeping the 100% bit-exact contract.
-
-Three change groups, all verified on-device bit-exact (bench58, every row
-`out_fnv(ref/s3)` matches):
-
-1. **S3 — 32-bit requantize (`hematite-int8`)**: `multiply_by_quantized_multiplier`
-   rewritten from software-emulated `i64` to pure 32-bit math: 16-bit limb
-   decomposition of the unsigned 64-bit product, a signed high-word fix-up
-   (`if value < 0 { ph -= b } if multiplier < 0 { ph -= a }` — the unsigned
-   high word differs from the signed product by `-sign(a)·b·2³²`), the
-   `1 << (total_shift-1)` round folded into the correct half, and an
-   arithmetic-shift + i32 saturate tail. Bit-exact vs the old i64
-   formulation, proven by 3 new tests (`multiply_matches_i64_reference_random`
-   1.24M samples, boundary edges, identity/half-round pairs). Removes the
-   i64 emulation cost from every scalar requantize on Xtensa.
-2. **S4/S5 — unchecked + hoisted scalar kernels (`hematite-s3`)**: the four
-   scalar fallback loops (gemm/conv1x1/conv3x3/depthwise) now use
-   `get_unchecked` for all hot slices (`bias`, `input`, `weights`, per-channel
-   `multipliers`/`shifts`) after up-front length validation, and hoist
-   `params.input_offset` out of the inner MAC loop. SAFETY comments document
-   the validated-length invariants. Public API stays 100% bounds-checked;
-   `unsafe` is confined to proven-invariant inner loops.
-3. **Gate relaxations** (unlock SIMD for real TFLite shapes):
-   - `input_offset` guards in conv3x3.rs / depthwise.rs relaxed from
-     `abs > 127` to `input_offset < -127 || input_offset > 128` — the common
-     TFLite `input_zero_point = -128` → `input_offset = 128` now fits the
-     `-input_offset as u8` pad-fill (fits i8). New row
-     `conv3x3_s8 16x16,32x3x3x32 SAME off128 (SIMD)`.
-   - **`depth_multiplier > 1` depthwise** (kws `ch_mult=8`, the biggest zoo
-     gap): `accx_eligible_depthwise` relaxed to `out_c % input_c == 0`; the
-     dispatch now broadcasts each input channel `ic` to the `dm` output slots
-     `[ic·dm,(ic+1)·dm)` in a padded virtual input (staged even when
-     `out_c % 16 == 0`), plus a hard `input_c * dm == out_c` guard and a
-     weight-sum fix (read raw `w_ptr` stride `out_c`, not the padded
-     `k_w_ptr`). New row `depthwise_s8 12x12,1x3x3x8 SAME dm8 (SIMD)`.
-
-Bench58 results (board @240MHz, all rows bit-exact):
-
-| row | cycles (min/med) | vs bench55 |
-|---|---|---|
-| fc_s8 271row,3out (scalar path) | 14600/14627 | 17817 → **1.22x faster** (S3+S4/S5) |
-| conv3x3 SAME off128 (NEW, SIMD) | 1121060/1121087 | 0x9a6f4e45 bit-exact |
-| depthwise dm8 (NEW, SIMD) | 91567/91595 | 0x38c725b4 bit-exact, col1=796 |
-| cnn_model | 1703422 | 0x75eb32f5 unchanged |
-| mv2mini | 769931 | 0x7f23eb05 unchanged |
-| mv2real | 653702 | 0x75eb32f5 unchanged |
-
-The `dm8` row makes kws's `ch_mult=8` depthwise SIMD-eligible (the 20x kws
-zoo gap was entirely that gate); `off128` unblocks essentially every real
-TFLite conv (which uses `input_zero_point = -128`).
-
-Engineering notes:
-- The i64 reference formulation is preserved in `hematite-int8` test module
-  (`ref_i64`) and the two formulations are cross-checked over 1.24M+ samples —
-  the 32-bit path is a drop-in, bit-identical replacement.
-- `depth_multiplier > 1` still scalar when the offset guard rejects
-  `input_offset = -128` (needs `+128` fill); rare in practice.
+- The vendored S16 experiment (`dl_tie728_s16.S` / `_conv2d.S`,
+  `probe_s16.S`) was deleted: S16 QACC lanes saturate at 16 bits, so it could
+  never be bit-exact; the ACCX + QACC-depthwise kernels supersede it.
 
 ---
 
@@ -774,6 +710,288 @@ Engineering notes:
   `area_inv` semantics vs scalar `round_half_away_zero` — C-SIMD and Rust s3
   agree with each other; only the reference differs).
 
+### Phase 18 — S3Backend, first real-silicon SIMD sweep, executed-TFLM goldens, zoo-model acceleration (plan `simd-zoo-hardening`)
+
+Phase 18 (2026-08-10) is the plan `simd-zoo-hardening` execution: prove every
+SIMD kernel on real silicon, wire the accelerated path end-to-end for zoo
+models, and close the public-API speed gap against the C SIMD kernels.
+
+**Hardware facts established on this board (ESP32-S3 rev v0.2, MAC
+64:e8:33:67:e7:44):**
+- **No PSRAM** (`PSRAM: 0 bytes` boot probe) → the PSRAM-tier benchmark rows
+  and `mobilenet_v2` on-device are gated; 8 MB DIO 80 MHz flash.
+- **Flash encryption is PERMANENT** (`SPI_BOOT_CRYPT_CNT=0x7`) and `espflash`
+  has no encrypt support → **all device flashes use `esptool.py write_flash
+  --encrypt`** (on-chip encryption via the ROM op, eFuse key readable). A
+  plaintext flash boots into an `invalid header` loop.
+- `person_detect` on-device is a permanent SKIP (`reason=stack`): generated
+  `predict` allocas ~232 KB vs ~65 KB device stack (SP-switch attempt faults
+  on silicon, window-underflow).
+
+**1. `S3Backend` — the missing KernelBackend impl** (`hematite-s3/src/
+backend.rs`, todo 3): all 36 trait methods forwarded to the s3 free
+functions — 10 SIMD-dispatch (conv2d→1×1/3×3 by filter, depthwise,
+fully_connected, avg/max pool, softmax, relu, add/mul/sub), 3 scalar
+(relu6, hard_swish, mean), honest `Unsupported` for the rest; scratch-size
+overrides for conv2d/depthwise/softmax. A follow-up (todo 25) added the 7
+scalar data-movement kernels (reshape/transpose/pad/slice/concat/split/
+resize_nearest) so `Model::<S3Backend>` can run every zoo model. The
+`KernelBackend` trait itself is untouched (scope guardrail).
+
+**2. First real-silicon SIMD sweep** (todos 6/7/8): the 18-check
+`simd_validation` suite — previously never run on hardware (the Espressif
+QEMU fork cannot execute TIE728 compute) — now runs to completion on the
+board: **17 PASS + 1 documented known-delta** (avg_pool ±1 vs the scalar
+ref, `fnv 0xd0d19a11` — the pool fixed-point contract; C-SIMD agrees).
+Two real bugs were found and fixed on the way:
+- **elementwise asm register scramble** (`mov a10,{output}`-template with
+  `in(reg)` operands; LLVM placed args into the template's own clobbered
+  registers → 16-byte DRAM writes clobbered the defmt `RTT_ENCODER.taken`
+  flag → "defmt logger taken reentrantly" mask). Fixed with pinned-register
+  operands (proven pool pattern).
+- **validation-frame stack overflow**: `validate_all`'s 35 KB inlined frame
+  pushed SP inside the SRAM arena; the depthwise check's buffer straddled the
+  arena end and wrote 256 B into bss. Fixed by carving the check buffers from
+  the unused arena (todo 18).
+- **real QACC SIMD mean** (todo 18): the `mean_simd` no-op stub was replaced
+  with a bespoke `s8_mean_reduce.S` (QACC per-lane accumulation + verified
+  two-pass read-back). A misaligned `EE.VST.128` (stack-allocated `accs`
+  without `#[repr(align(16))]`) silently zeroed the accumulator on device —
+  fixed with `AlignedStage`/`AlignedAccs` wrappers; the final check passes
+  bit-exact on silicon (`mean_hw_2x2x4 PASS fnv 0xc14ca731`).
+- QEMU gating made consistent: all SIMD dispatch is `all(xtensa, not(qemu))`.
+
+**3. Executed-TFLM golden provenance** (todos 9/10/11): built
+`tflite-micro` at the pinned SHA `18b9e6f2a8c5a9518e588f59c2ba16ef7ef9d551`
+(`tools/tflm-goldens/`, Makefile-based) and captured real executed outputs
+for the 6 zoo models + a new hard_swish micro-model. Findings:
+- `kws` reproduces the golden bit-exactly (sanity gate); `sine`/`hello_world`
+  match; `person_detect` is **bit-exact** vs executed TFLM (`fnv
+  0x6962079d`) — the §6.2 wide-logit softmax divergence does not manifest at
+  this SHA; `anomaly_detect` and `mobilenet_v2` goldens were regenerated
+  (the old LiteRT-derived goldens coincided with Hematite's single-rounding
+  by luck — executed TFLM uses gemmlowp **double**-rounding; ±1 on 210/640
+  anomaly elements, documented).
+- `mobilenet_v2` residual (984/1000 vs regenerated golden): TFLM `pad.cc`
+  fills `output_zero_point` (−14) when `constant_values==nullptr`, while
+  `PadParams` carries no zero point and the trait `pad()` has no pad-value
+  arg — `ref`+`s3` fill 0 (documented follow-up; no trait change).
+- softmax `diff_min` hardcode fixed to the TFLM formula
+  `-CalculateInputRadius(5, left_shift)` (todo 13).
+
+**4. Zoo-model acceleration — two root causes found** (todos 19/21):
+`model_bench` now runs the real zoo models through `Model::<S3Backend>` with
+arena-carved buffers. On-device rows: KWS 13.09 M cyc/54 ms, sine 536,
+hello_world 11,329, anomaly 19.67 M/81 ms (person_detect + mobilenet_v2 SKIP).
+Two silent-scalar root causes were found and fixed:
+- **codegen `SCRATCH_LEN` was always 0**: `emit_op` hardcoded `scratch: 0`
+  for every op, so every zoo-model op got an empty scratch slice and the
+  softmax/depthwise/conv SIMD dispatches fell back to scalar. Codegen now
+  computes real per-op scratch needs (conv1x1/conv3x3/depthwise/softmax/fc
+  formulas mirroring `S3Backend`), emits `pub const SCRATCH_LEN`, and the
+  validation path uses `predict_with_scratch` with arena scratch.
+- **unaligned model weights**: zoo-model weights were emitted as plain
+  `[i8; N]` consts (alignment 1), failing the ACCX/FC `w_ptr % 16` gate.
+  Codegen now emits `#[repr(C, align(16))]` wrapper structs.
+- KWS's 54 ms vs the 7 ms ESP-DL bar is **structurally bounded**: its
+  depthwise has `depth_multiplier=8` and the bespoke per-lane depthwise SIMD
+  requires `input_c == output_c` (dm==1) — documented honestly, not
+  weakened.
+
+**5. Public-API speed closure** (todos 15/16/17/18, device-measured):
+normalized per-op workloads (same shapes both stacks) and closed the
+wrapper gap inside the trait call path so `Model::<S3Backend>` benefits:
+conv1x1 4269→**3201**, fc 8344→**7161**, max-pool 33240→**14046**,
+avg-pool 29225→**19913** (prebuilt args + shared whole-op driver); all
+bit-exact vs the scalar ref. Targets below these are **documented as
+physically unreachable** for the bit-exact ACCX contract (the anchors were
+the non-bit-exact vendored QACC kernel; conv3x3's full-image 880 K cyc is
+the TIE memory-bound floor for 2.36 M MACs). Dead vendored TIE728 conv
+modules removed (todo 12, −749 lines); residual warnings fixed (todo 14).
+
+**Final model-vs-ESP-NN head-to-head (device, all bit-exact):**
+Model A 1,686,922 vs ESP-NN 2,630,401 (**1.56×**), Model B 763,105 vs
+994,782 (**1.30×**), Model C 650,773 vs 655,303 (**1.007×** — floor-limited;
+all 6 layers SIMD-engaged, 22× vs the scalar ref 14,489,859). ESP-NN C
+baselines for the zoo models themselves are `—` (no esp-nn tflite-backed
+runners exist; ESP-IDF absent on this host — enumerated in
+`benchmarks/espnn-baseline/README.md`, same-conditions rule).
+
+**Test/CI state:** host `cargo test --workspace` 296 passed / 0 failed;
+clippy has zero new warnings; the 23 Phase-18 commits are all authored
+`Yatendra Singh <singh.0.yatendra@gmail.com>`.
+
+### Phase 19 — composed-kernels: op fusion, composed SIMD kernels, shape-flex widening, selector, verification (plan `composed-kernels`)
+
+Phase 19 (2026-08-10 → 2026-08-11) is the plan `composed-kernels`
+execution. It fuses adjacent ops into composed-kernel calls (conv + requant
++ activation + residual-add in one SIMD pass, register-held elementwise
+chains, pool/softmax input-folds), widens the SIMD shape gates the zoo models
+actually need (dm>1 depthwise, small-shape FC, generic pool, non-identity
+elementwise, extended mean), and adds a shape-driven composed-kernel
+selector — all while preserving the bit-exact invariant. Evidence ledger:
+`local-notes/evidence/composed-kernels/` (head-to-head.md, model-cycles.md,
+device-sweep.md, selector-output.md, fused-equivalence.md, pad-decision.md,
+tree-audit.md, fused-profile.md).
+
+**1. Fusion wiring (W1 — T1.1–T1.4, T2.1):**
+- **T1.1 correctness tiers** (a7a52b5): standalone-activation absorption is
+  gated on scale-AND-zero-point identity (a clamp is exact only when the
+  activation's quant equals the anchor output quant); AbsorbedElementwise /
+  ResidualAdd carry per-step requantize params; input/requant folds are
+  tagged T2 (proof-obligated, opt-in).
+- **T2.1 `FusedKernelBackend` trait** (57a9fce): additive `FusedKernelBackend:
+  KernelBackend` with `fused_conv2d` / `fused_elementwise_chain` /
+  `fused_pool_with_fold` + composed params structs; `RefBackend` defaults
+  decompose to the exact per-op sequence (bit-exact by construction).
+- **T1.2 emitter seam** (c7f28b9): `emit_model` consumes the `FusedSchedule`;
+  T1 groups emit composed calls, everything else per-op; unfused path
+  byte-identical to pre-wiring output.
+- **T1.3 arena** (18858ba): one stack-local `#[repr(C,align(16))]` arena for
+  intermediates (MAX_TENSORS 64→255); peaks sine 0 / hello 32 / kws 5968 /
+  anomaly 272 / person_detect 55296; mv2 → per-tensor fallback
+  (ARENA_LEN=0); no `unsafe`, no static-mut emitted.
+- **T1.4 scratch parity** (0213f1b): cross-crate `SCRATCH_LEN` ==
+  `S3Backend::*_scratch_size` for ~2005 spec shapes + composed groups.
+
+**2. Composed kernels (W2 — T2.2–T2.4, `hematite-s3/src/fused.rs`):**
+- **T2.2 fused conv-family** (fba770e): conv accum + residual + per-step
+  requantize + activation in ONE ACCX pass, register-held intermediates;
+  residual-add reproduces the exact TFLM two-stage rounding; bit-exact vs
+  the RefBackend decomposition on an 8-row golden matrix.
+- **T2.3 fused elementwise chain** (faf0e8b): register-held chain steps with
+  per-step requantize preserved, zero intermediate stores.
+- **T2.4 pool/softmax folds** (fee6385): `fused_pool_with_fold` +
+  folded-requantize epilogue, T2-gated (only shapes where the proof
+  obligation is met; everything else emits per-op).
+
+**3. Shape-flex SIMD widening (W3 — T3.1–T3.6, T3.5b):**
+- **T3.1 generic pool** (a0e069a): avg/max SIMD for arbitrary filter/stride/
+  pad + clamp (vector main loop + scalar tail), accepting the ESTABLISHED
+  s3/C-SIMD pool fixed-point semantics (documented ±1 vs ref
+  `round_half_away_zero`, `espdl-baseline README:82-86` — not "fixed").
+- **T3.2 elementwise + activations** (2dede3b): non-identity offsets/
+  multipliers per-lane SIMD + relu6/hard_swish lane models (downgraded
+  hard_swish formula reproduced bit-exact — Xtensa has no SIMD integer
+  division; goldens pin the downgraded formula).
+- **T3.3 channel-padded conv1x1/fc** (4aad12c): input_c in (0,16)/non-%16
+  via 16B-aligned pad-in-scratch; engagement counter proves SIMD took the
+  path on device.
+- **T3.4 extended mean** (4ecd1ac): looped-accumulation for in_c>256
+  (mv2's 7×7×1280 global mean), positions>256 in chunks; bit-exact.
+- **T3.5 dm>1 depthwise** (d54f8db) + **T3.5b arbitrary-filter anytap**
+  (cc0f5e7): depth_multiplier>1 and non-3×3 filters via chunked ≤32-tap QACC
+  passes — the **kws real 10×8 dm=8 filter** (the 12.3× ESP-NN gap) now
+  dispatches SIMD.
+- **T3.6 small-shape FC** (7cda412/415d7f9): input_dim in (0,16)/non-%16 via
+  pad-in-scratch — closes the sine/hello/anomaly FC gates.
+
+**4. Selector (W4 — T4.1–T4.3):**
+- **T4.1 eligibility mirror** (d9d50e8): host-side mirror of every s3 SIMD
+  gate + cross-crate parity over ~1985 shapes (runtime is canonical).
+- **T4.2 rule-tier selector** (9bfb5fe): conv-family > chain > fold > per-op
+  per FusedGroup; T2 per-op until verified; staged-input 16B alignment
+  decision recorded; per-model selector output in selector-output.md.
+- **T4.3 const-generic dispatch** (15c18a8): shape-typed composed calls +
+  per-model fused-groups doc header; autotuning explicitly out of v1.
+
+**5. Verification (W5 — T5.1–T5.4):**
+- **T5.1 host fused==unfused harness** (7d947b7): all 6 zoo models
+  element-equal + identical FNV-1a (mv2 = the only model with composed
+  groups: 10 residual-add, all T1 → all-composed, PASS). A synthetic T2
+  fixture proves the auto-unfuse path catches a forced divergence
+  (fused-equivalence.md).
+- **T5.2 on-device sweep** (d90cc17 harness) — **REAL-SILICON RUN 1
+  EXECUTED 2026-08-11 17:34** (owner-approved `esptool.py write_flash
+  --encrypt` @ 921600; ESP32-S3 rev v0.2, SPI_BOOT_CRYPT_CNT=0x7; log
+  `device-silicon-run1.log`): model validation PASS bit-exact for
+  sine/hello_world/kws through `Model::<S3Backend>` (ref == s3 == golden);
+  anomaly reproduces the documented ±1 class on both backends (s3==ref);
+  35/40 SIMD checks executed — 33 PASS (incl. **kws 10×8 anytap depthwise**,
+  conv1x1_padded_3ch SIMD-engaged, all 7 fc_small) + 2 documented-class
+  avg-pool ±1 FAILs + **5 blocked by a deterministic firmware panic at the
+  mean check** (defmt `RTT_ENCODER.taken=6`, stack-vs-arena-end clobber)
+  which also blocked the zoo fused/unfused cycle rows, per-kernel rows, and
+  the person_detect stack-probe (all PENDING — recorded, never faked).
+  Follow-up levers recorded (dedicated 256 KB stack / shrink mean-kernel
+  stack / linker stack size) — `device-sweep.md §9`.
+- **T5.3 PAD decision** (09a1d77): **DEFER** the pad-value/zero-point
+  plumbing (T10 follow-up) — PAD never fuses, mv2's substitute gate is the
+  T5.1 host harness, and the s3==ref identical-fill gate must stay intact
+  (pad-decision.md).
+- **T5.4 hygiene** (0701a12): dead-code removal + clippy + module docs.
+
+**6. Benchmarks (W6 — T6.1–T6.3):** model_bench real zoo runners + unfused
+arm (T6.1), ledger-format head-to-head.md (T6.2), speed-closure rows +
+re-tiered bars (T6.3). **Ledger format (user requirement 2026-08-10):**
+every measured row carries ISO timestamp + commit of the measured code +
+FULL Hematite cycles + FULL C-stack cycles + speedup ratio + config — no
+deltas-only rows.
+
+**Measured / ledger results (device unless noted):**
+
+| Row | Hematite (cycles) | C-stack / ESP-NN (cycles) | speedup | source |
+|---|---|---|---|---|
+| Model A — 4-layer CNN | 1,686,922 | 2,630,401 | **1.56×** (H wins) | head-to-head.md §1 / ESPRESSIF_VS_HEMATITE.md |
+| Model B — mv2mini | 763,105 | 994,782 | **1.30×** (H wins) | head-to-head.md §1 |
+| Model C — mv2real | 650,773 | 655,303 | **1.007×** (H wins, floor-limited) | head-to-head.md §1 |
+| sine (FC 1→1) | 618 (pre-opt; user-verified T0.3) | 190 | C 3.3× | espnn-head-to-head.md |
+| hello_world (3×FC) | 10,314 (pre-opt) | 4,675 | C 2.2× | espnn-head-to-head.md |
+| kws (dw dm=8 + FC + softmax) | 12,983,503 / 54 ms (pre-opt) | 1,059,889 / 4 ms | C 12.3× | espnn-head-to-head.md |
+| anomaly_detect (10×FC) | 28,550,253 / 118 ms (pre-opt) | 7,758,145 / 32 ms | C 3.7× | espnn-head-to-head.md |
+| person_detect | SKIP reason=stack (both stacks) | SKIP | — | model-cycles.md §4 |
+| mobilenet_v2 | SKIP reason=no-psram (both stacks) | SKIP | — | model-cycles.md §5 |
+
+The pre-opt zoo rows above are the T3.5b/T3.6 closure baselines; the
+post-optimization on-device re-measurement is PENDING (run-1 panic, §5 of
+this entry). Host-side fused==unfused is asserted bit-exact for all 6 models
+(fused-equivalence.md).
+
+**Re-tiered bars (T6.3):** mv2 1294.5 ms — **hold-as-documented**
+(PSRAM-gated, `PSRAM: 0 bytes` re-confirmed on device run 1); KWS 7 ms →
+**4 ms ESP-NN-relative** (target < 1,059,889 cyc / 4 ms via T3.5b anytap
+depthwise — the old "structurally unreachable" rationale is superseded by
+the user-verified ESP-NN rows); conv1x1 **15.57×** vs scalar-ref (holds);
+**10×** vs-scalar floor (holds). Fixed-point constants live in
+`model_bench.rs` (12945 / 40 / 1557 / 1000) and are pinned by tests — never
+silently re-tiered.
+
+**Bit-exact invariant (F1):** every SIMD kernel's output equals
+`hematite-ref` on host AND device; the fused path equals the unfused path
+element-for-element for all 6 zoo models (T5.1); on device, 33/40 sweep
+checks PASS bit-exact vs ref (2 avg-pool rows are the documented fixed-point
+class, 5 blocked by the harness panic). The only non-bit-exact rows are the
+documented golden divergences (anomaly ±1 single-vs-double rounding; mv2 PAD
+zero-fill vs TFLM zero-point-fill — both DEFERRED_MODELS.md, unchanged).
+
+**Test/CI state (host):** `cargo test -p hematite-s3` 71 passed, `-p
+hematite-codegen` 107, `-p hematite-benchmarks --lib` 37, `cargo check
+--workspace` clean; device `cargo check` (xtensa, model-validation) 0
+errors; qemu-feature build compiles clean. No `unsafe` in emitted code; no
+dead code; clippy zero-new. **Honest note — `cargo test --workspace` does
+not currently compile end-to-end:** a pre-existing E0596 in
+`hematite-tests/tests/models.rs:299` (`model.predict()` on an immutable
+binding — the composed path emits `predict(&mut self)` for mv2's 10 fused
+groups; the file predates the composed-kernels wave, c1b581b). This is not
+one of the four named gates above (all green); it is a source-code breakage
+owned by a kernel/codegen follow-up, not this docs todo (scope: docs only),
+recorded here so the Phase-18 "296 tests" claim is not silently stale.
+
+> **⚠️ Detached-HEAD endnote (branch needed):** ALL composed-kernels commits
+> — T1.1 (a7a52b5) through T6.3 (fc067bf) — landed on a **DETACHED HEAD**
+> (git status: `HEAD detached from 0213f1b`). The work exists only as
+> dangling commits reachable from `fc067bf`; it needs a branch
+> (**`git switch -c composed-kernels`**) before it can be pushed or merged.
+> Creating that branch is out of scope for this docs close-out (T6.4) — the
+> branch is not created here, only recorded. Commits: a7a52b5 (T1.1) ·
+> 57a9fce (T2.1) · c7f28b9 (T1.2) · 18858ba (T1.3) · 0213f1b (T1.4) ·
+> fba770e (T2.2) · faf0e8b (T2.3) · fee6385 (T2.4) · a0e069a (T3.1) ·
+> 2dede3b (T3.2) · 4aad12c (T3.3) · 4ecd1ac (T3.4) · d54f8db (T3.5) ·
+> 7cda412/415d7f9 (T3.6) · cc0f5e7 (T3.5b) · d9d50e8 (T4.1) · 9bfb5fe
+> (T4.2) · 15c18a8 (T4.3) · 7d947b7 (T5.1) · d90cc17 (T5.2) · 09a1d77
+> (T5.3) · 0701a12 (T5.4) · 28482eb (T6.1) · faed3b5 (T6.2) · fc067bf
+> (T6.3).
+
 ---
 
 ## 4. Toolchain / environment reference
@@ -812,13 +1030,17 @@ approved. Hardware bring-up (Phase 9), the C-SIMD bit-exact output match
 the prepared-kernel fast path (Phase 12), the bespoke GPR-accumulator
 (ACCX) kernels (Phase 13), the optimized fast64 ACCX paths (Phase 14), the
 requantize fast paths (Phase 15), the **from-scratch full op-sweep
-(Phase 16)**, the **full MobileNetV2 parity sweep (Phase 17)**, and the
-**scalar-performance sweep (Phase 18)** are
-complete. Phases 9-15 are committed; Phase 16 is committed locally (5
-commits, not pushed); Phases 17 and 18 are uncommitted. Host test suite:
-34 tests in `hematite-benchmarks` + 3 in `hematite-int8` (32-bit
-requantize equivalence) + 3 in `hematite-s3`, 0 failures, maintained
-throughout every change in this log.
+(Phase 16)**, the **full MobileNetV2 parity sweep (Phase 17)**, the
+**S3Backend + first real-silicon SIMD sweep + executed-TFLM goldens +
+zoo-model acceleration (Phase 18, plan `simd-zoo-hardening`, 23 commits)**,
+and the **composed-kernels plan (Phase 19: fusion wiring, composed SIMD
+kernels, shape-flex widening, selector, verification; see §3 Phase 19)**
+are complete. Host test suite: **named gates green (s3 71 / codegen 107 /
+benchmarks --lib 37 / `cargo check --workspace` clean)**; the Phase-18
+"296 tests, 0 failures" full-workspace figure is superseded by the recorded
+pre-existing `hematite-tests` E0596 (Phase 19 §5 note — the composed path's
+`predict(&mut self)` vs an immutable-binding call site; source fix owned by
+a kernel/codegen follow-up, out of docs scope).
 
 On-device benchmark state: all **9 SIMD-capable operations** (conv1x1,
 conv3x3, fc, max/avg-pool, relu, add/sub/mul) run on the real hardware.
@@ -873,24 +1095,29 @@ models. The vendored S16 experiment asm was deleted. Final state
 (`bench55`): all 19 kernel rows + 3 models report `out_fnv(ref/s3)` equal
 on the real board.
 
-**Phase 18** targets the scalar tier itself (motivated by the real-model zoo
-benchmark where gates don't fire): the i64 requantize became pure 32-bit
-(S3, bit-exact, 1.24M-sample cross-check), the four scalar kernels use
-`get_unchecked` + hoisted `input_offset` (S4/S5), and two gate relaxations
-unlock SIMD for real TFLite shapes — `input_offset=128` (TFLite
-`input_zero_point=-128`, new `conv3x3 SAME off128` row) and
-`depth_multiplier>1` (kws `ch_mult=8`, new `depthwise dm8` row). bench58 on
-the real board: **every row bit-exact**, scalar-path fc 271→3 improved
-17817→14600 (1.22×), dm8 depthwise runs SIMD at 91595 cyc (col1=796),
-off128 conv runs SIMD at 1121087 cyc, all three models unchanged
-(cnn 1703422, mv2mini 769931, mv2real 653702).
+**Composed-kernels benchmark status (Phase 19, real-silicon run 1 — 2026-08-11):** the C-vs-Rust head-to-head ledger (`head-to-head.md`, mandatory ISO-timestamp + commit-id + FULL-numbers format) currently reads: Model A 1,686,922 vs 2,630,401 (**1.56×**), Model B 763,105 vs 994,782 (**1.30×**), Model C 650,773 vs 655,303 (**1.007×** — floor-limited, all 6 layers SIMD-engaged); zoo: sine 618 vs 190 (3.3×), hello_world 10,314 vs 4,675 (2.2×), kws 12,983,503 / 54 ms vs 1,059,889 / 4 ms (12.3×), anomaly 28,550,253 / 118 ms vs 7,758,145 / 32 ms (3.7×); person_detect / mobilenet_v2 SKIP (stack / no-PSRAM). **Important:** the zoo Hematite rows are the PRE-optimization device baselines — the post-optimization on-device cycle rows were never measured because the mean-check panic (open decision 6) blocks the cycle-row section. The optimizations are proven correct on silicon (run 1: model validation sine/hello/kws bit-exact; 33/35 SIMD checks PASS — including the T3.5b kws 10×8 anytap depthwise, T3.3 padded conv1x1, T3.6 small-FC; 2 avg-pool ±1 LSB = the documented T3.1 semantics divergence) but their cycle costs await the panic fix + a re-run. Fusion applies only to mobilenet_v2 by design (W0 profile: 10 residual-add groups, 216,384 B eliminated; the other 5 zoo models had zero fusion opportunity — activations are already field-fused in the kernels, zero-cost), the fused dispatch adds zero overhead (host + QEMU-emulated rows: fused/unfused 0.99–1.00×, bit-exact), and mv2's fused-vs-unfused speedup itself is PSRAM-gated on this board.
 
 **Open decisions awaiting explicit direction:**
-1. Force-push the rewritten git history to `origin/main`?
-2. The `person_detect`/`mobilenet_v2` rounding divergence's practical
-   impact on hardware (now that real timing exists).
-3. Phase 16-18 commit/push: everything is uncommitted (or
-   committed-only-locally for Phase 16); committing + pushing is pending
-   explicit user verification per the standing "don't push until I verify"
-   rule. User intent is to open a PR presenting Hematite as the best Rust NN
-   library for ESP32-S3.
+1. Force-push the rewritten git history to `origin/main`? (History was
+   rewritten to the Yatendra Singh identity on 2026-08-06; not yet pushed.)
+2. The `mobilenet_v2` residual (984/1000 vs executed-TFLM golden): TFLM
+   `pad.cc` fills `output_zero_point` (−14) when `constant_values==nullptr`,
+   but `PadParams` carries no zero point — a `PadParams` pad-value plumbing
+   + codegen emission change (**DECIDED DEFER in Phase 19 T5.3**,
+   pad-decision.md; T10 follow-up recorded — kernel workstream).
+3. Zoo-model ESP-NN C baselines: the espnn-baseline harness has only the
+   3 synthetic A/B/C runners; adding tflite-backed zoo runners + a
+   weight-extraction path is a separate scope decision (Metis F8), and the
+   ESP-IDF toolchain is absent on this host. Exact rows-to-add are specified
+   in `benchmarks/espnn-baseline/README.md`.
+4. Pushing Phase 18's 23 local commits to `origin/main` is pending the
+   standing "don't push until I verify" rule. User intent is to open a PR
+   presenting Hematite as the best Rust NN library for ESP32-S3.
+5. **Phase 19's composed-kernels commits (T1.1 → T6.3) sit on a DETACHED
+   HEAD off `0213f1b`** — needs `git switch -c composed-kernels` before
+   push/merge (recorded in the Phase 19 endnote; branch not created here).
+6. **Real-silicon run 1 (2026-08-11 17:34) panic follow-up:** the
+   mean-check stack-vs-arena-end clobber (defmt `RTT_ENCODER.taken=6`)
+   blocks the zoo fused/unfused cycle rows, per-kernel rows and the
+   person_detect stack-probe — levers recorded in device-sweep.md §9.6
+   (dedicated 256 KB stack / shrink mean-kernel stack / linker stack size).

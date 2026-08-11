@@ -7,6 +7,7 @@
 //! This crate is **zero-dependency, `no_std`** and provides:
 //!
 //! * [`KernelBackend`] — the trait every backend implements
+//! * [`FusedKernelBackend`] — the composed-kernel entry points (T2.1)
 //! * [`KernelError`] — the error type all kernel methods return
 //! * [`op_params`] — operator parameter structs mirroring TFLite Micro
 
@@ -15,12 +16,14 @@
 pub mod op_params;
 
 pub use op_params::{
-    ActivationParams, ConcatParams, Conv2DParams, DepthwiseConv2DParams,
-    ElementwiseParams, FullyConnectedParams, FusedActivation, GruParams,
+    ActivationEpilogueParams, ActivationParams, ComposedActivation, ConcatParams,
+    Conv2DParams, DepthwiseConv2DParams, ElementwiseChainParams,
+    ElementwiseChainStep, ElementwiseKind, ElementwiseParams, FoldedPoolParams,
+    FullyConnectedParams, FusedActivation, FusedConvParams, GruParams,
     LstmParams, MatMulParams, PadParams, Padding, PerChannelQuantParam,
-    PoolParams, QuantParam, ReduceParams, ReshapeParams,
-    ResizeNearestParams, SliceParams, SoftmaxParams, SplitParams,
-    SvdfParams, TransposeParams,
+    PoolInputFold, PoolKind, PoolParams, QuantParam, ReduceParams,
+    ReshapeParams, ResizeNearestParams, ResidualAddParams, SliceParams,
+    SoftmaxParams, SplitParams, SvdfParams, TransposeParams,
 };
 
 /// Error type returned by every [`KernelBackend`] method.
@@ -505,4 +508,110 @@ pub trait KernelBackend {
         let _ = params;
         0
     }
+}
+
+/// Composed-kernel entry points (T2.1): fused op groups emitted as ONE
+/// kernel call by the composed emitter.
+///
+/// The fused methods are PURELY ADDITIVE — they sit alongside (never
+/// modify) [`KernelBackend`] and default to nothing: a backend opts in by
+/// implementing this trait.  Each composed call is the sum of the exact
+/// per-op sequence the unfused emitter would emit (anchor op first, then
+/// absorbed residual-add / chain steps / input fold, then the trailing
+/// activation epilogue), so a backend can implement it by simply forwarding
+/// to its own per-op methods and be **bit-exact by construction**.
+///
+/// The composed param structs (see [`op_params`]: [`FusedConvParams`],
+/// [`ElementwiseChainParams`], [`FoldedPoolParams`]) carry the anchor's
+/// per-op params EXACTLY as the unfused emitter would emit them, plus the
+/// fusion-side data the composed kernel needs; the T1.2 emitter derives
+/// them from the T1.1 fusion IR (`FusedGroup` and friends in
+/// `hematite-codegen/src/optimize/fusion.rs`).
+///
+/// # Safety contract of the decomposition
+///
+/// The reference decomposition performs in-place elementwise chaining
+/// (`dst` as both running input and output).  This is only sound because
+/// every hematite-ref elementwise / activation kernel reads `input[i]`
+/// strictly before writing `output[i]` — see the single documented alias
+/// helper in `hematite-ref/src/fused.rs`.
+pub trait FusedKernelBackend: KernelBackend {
+    /// Fused CONV_2D + optional residual-ADD + optional activation
+    /// epilogue, in one kernel call.
+    ///
+    /// # Decomposition (unfused per-op sequence, bit-exact by construction)
+    ///
+    /// 1. `conv2d(src, weight, bias, &params.conv, dst, scratch)`
+    /// 2. if `params.residual.is_some()`:
+    ///    `add(dst, residual_data, add_params, dst)` — two-stage TFLM Add
+    ///    rounding (per-input multipliers first, then i32 sum, then final
+    ///    requantize), in-place.
+    /// 3. if `params.activation.kind != None`: the matching standalone
+    ///    activation op (relu / relu6 / hard_swish) in-place on `dst`.
+    ///
+    /// The embedded `conv` params carry the anchor conv's OWN baked
+    /// activation range (never the absorbed epilogue's) so the conv call
+    /// matches the unfused emission 1:1.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first per-op error ([`KernelError::ShapeMismatch`] /
+    /// [`KernelError::ScratchTooSmall`] / [`KernelError::Unsupported`]).
+    fn fused_conv2d(
+        &mut self,
+        src: &[i8],
+        weight: &[i8],
+        bias: &[i32],
+        params: &FusedConvParams,
+        dst: &mut [i8],
+        scratch: &mut [u8],
+    ) -> Result<(), KernelError>;
+
+    /// Fused elementwise chain (anchor op + absorbed steps) in one pass.
+    ///
+    /// # Decomposition (unfused per-op sequence, bit-exact by construction)
+    ///
+    /// Steps execute in order; step 0 reads `src` as input1, steps ≥ 1 read
+    /// `dst` in-place as input1 (the running value):
+    ///
+    /// * `Add` / `Mul` / `Sub` → `add` / `mul` / `sub` with the step's
+    ///   `ElementwiseParams`-derived fields and `step.operand` as input2
+    ///   (model constant tensors — never alias `dst`).
+    /// * `Relu` / `Relu6` / `HardSwish` → the matching standalone activation
+    ///   op in-place.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first per-op error.
+    fn fused_elementwise_chain(
+        &mut self,
+        src: &[i8],
+        params: &ElementwiseChainParams,
+        dst: &mut [i8],
+    ) -> Result<(), KernelError>;
+
+    /// Fused pool + optional input fold (MUL/SUB) + optional activation
+    /// epilogue, in one kernel call.
+    ///
+    /// # Decomposition (unfused per-op sequence, bit-exact by construction)
+    ///
+    /// 1. if `params.fold.is_some()`: the fold op (`mul` for builtin 18,
+    ///    `sub` for builtin 41) applied to `src` and `fold.operand_data`,
+    ///    writing into `scratch` reinterpreted as the i8 intermediate
+    ///    (`scratch` is provided exactly for this).
+    /// 2. `average_pool_2d` / `max_pool_2d` (per `params.pool_kind`)
+    ///    reading the intermediate (or `src` directly when no fold).
+    /// 3. if `params.activation.kind != None`: the matching standalone
+    ///    activation op in-place on `dst`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first per-op error.
+    fn fused_pool_with_fold(
+        &mut self,
+        src: &[i8],
+        params: &FoldedPoolParams,
+        dst: &mut [i8],
+        scratch: &mut [u8],
+    ) -> Result<(), KernelError>;
 }

@@ -37,7 +37,7 @@ pub mod timing;
 pub mod model_validation;
 
 #[cfg(all(target_arch = "xtensa", feature = "model-validation"))]
-pub mod zoo_bench;
+pub mod simd_validation;
 
 #[cfg(target_arch = "xtensa")]
 pub mod firmware;

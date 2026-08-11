@@ -26,19 +26,24 @@
 //! [`OFFSET_NONE`] in `offsets`.  The T4.1 emitter can declare a second
 //! PSRAM region from that description.
 //!
-//! # T4.1 wiring
+//! # Wiring (T1.3 — LANDED)
 //!
-//! [`plan_arena`] is the seam the T4.1 emitter consumes: `ArenaPlan.offsets`
-//! maps tensor id → arena byte offset (const-usable — plain `[usize; 64]`
-//! entries) and `ArenaPlan.peak_arena_bytes` sizes
-//! `static mut ARENA: [u8; …]`.  Model inputs/outputs and constant tensors
-//! are excluded by the planner (caller-owned / flash-resident memory), never
-//! by this module.
+//! `generate::emit_model_with` calls [`plan_arena`] for every fused model:
+//! on success the per-tensor stack arrays collapse into ONE stack-local
+//! `#[repr(C, align(16))] struct Arena { data: [i8; ARENA_LEN] }` sized to
+//! `ArenaPlan.peak_arena_bytes`, indexed at compile-time offsets from
+//! `ArenaPlan.offsets` (const-usable — plain `[usize; MAX_TENSORS]`, i.e.
+//! 255 entries since T1.3), with disjoint op slices borrowed via
+//! nested `split_at_mut` (safe, no `unsafe` in generated code).  Models the
+//! planner rejects — [`LayoutError::Oversized`] for a single tensor over
+//! the 512 KiB budget, e.g. mobilenet_v2's 224×224×32 activation — fall
+//! back to per-tensor stack emission (`ARENA_LEN = 0`), bit-exact, just
+//! larger (evidence: `local-notes/evidence/composed-kernels/t13-arena.md`).
+//! Model inputs/outputs and constant tensors are excluded by the planner
+//! (caller-owned / flash-resident memory), never by this module.
 //!
-//! This module is not yet wired into `optimize/mod.rs` — the orchestrator's
-//! wiring task declares `pub(crate) mod arena;` after all T4.2 passes land.
-//! Dead-code warnings are expected until then (same convention as
-//! `flatbuffer.rs` / `layout.rs`).
+//! This module is declared `pub(crate) mod arena;` in `optimize/mod.rs` and
+//! consumed by the emitter — nothing here is pending wiring.
 #![allow(dead_code)]
 
 use std::fmt;
@@ -208,14 +213,11 @@ fn model_io_ids(indices: &[u32], tensor_count: usize) -> Vec<u16> {
 /// Split out of [`plan_arena`] so the in-crate tests can hand-build graphs
 /// through the pinned pub(crate) IR types (`ParsedTensor`/`ParsedOp` fields
 /// are pub(crate); `ParsedModel`'s are not, so it has no test constructor).
-#[allow(clippy::too_many_arguments)]
 fn plan_from_pieces(
     tensors: &[ParsedTensor<'_>],
     ops: &[ParsedOp<'_>],
     model_inputs: &[u32],
     model_outputs: &[u32],
-    max_internal: usize,
-    psram_budget: Option<usize>,
 ) -> Result<ArenaPlan, ArenaError> {
     let tensor_count = tensors.len();
     if tensor_count > MAX_TENSORS {
@@ -229,7 +231,7 @@ fn plan_from_pieces(
 
     // `psram_budget: None` — the PSRAM pool split is a documented future
     // path (module docs).  Planner errors propagate verbatim to the macro.
-    liveness_plan(&schedule, &sizes, &model_input_ids, &model_output_ids, max_internal, psram_budget)
+    liveness_plan(&schedule, &sizes, &model_input_ids, &model_output_ids, MAX_INTERNAL, None)
         .map_err(ArenaError::Layout)
 }
 
@@ -239,36 +241,7 @@ fn plan_from_pieces(
 /// `hematite-memory`'s [`liveness_plan`].  See the module docs for the
 /// PSRAM split path and the T4.1 wiring contract.
 pub(crate) fn plan_arena(model: &ParsedModel<'_>) -> Result<ArenaPlan, ArenaError> {
-    plan_from_pieces(
-        model.tensors(),
-        model.ops(),
-        model.inputs(),
-        model.outputs(),
-        MAX_INTERNAL,
-        None,
-    )
-}
-
-/// Compute the arena layout with an explicit SRAM budget and optional PSRAM
-/// split.
-///
-/// Used by the T4.1 emitter's arena entry point ([`emit_model`]'s
-/// `predict_with_arena`), which needs a budget large enough that no
-/// intermediate spills to PSRAM (`None` = single flat region the caller owns)
-/// — the plan's `offsets` are then all valid in one caller-provided arena.
-pub(crate) fn plan_arena_internal(
-    model: &ParsedModel<'_>,
-    max_internal: usize,
-    psram_budget: Option<usize>,
-) -> Result<ArenaPlan, ArenaError> {
-    plan_from_pieces(
-        model.tensors(),
-        model.ops(),
-        model.inputs(),
-        model.outputs(),
-        max_internal,
-        psram_budget,
-    )
+    plan_from_pieces(model.tensors(), model.ops(), model.inputs(), model.outputs())
 }
 
 // ---------------------------------------------------------------------------
@@ -379,7 +352,7 @@ mod tests {
         let schedule = build_schedule(&tensors, &ops).expect("schedule builds");
         let sizes = tensor_byte_sizes(&tensors);
         let plan =
-            plan_from_pieces(&tensors, &ops, &[0], &[3], MAX_INTERNAL, None).expect("3-op chain fits the budget");
+            plan_from_pieces(&tensors, &ops, &[0], &[3]).expect("3-op chain fits the budget");
 
         assert_eq!(plan.offsets[1], 0);
         assert_eq!(plan.offsets[2], 16);
@@ -404,7 +377,7 @@ mod tests {
         let ops =
             vec![op(&[0], &[1]), op(&[1], &[2]), op(&[2], &[3]), op(&[3], &[4])];
         let plan =
-            plan_from_pieces(&tensors, &ops, &[0], &[4], MAX_INTERNAL, None).expect("odd-size graph fits budget");
+            plan_from_pieces(&tensors, &ops, &[0], &[4]).expect("odd-size graph fits budget");
 
         for &off in plan.offsets.iter() {
             if off != OFFSET_NONE {
@@ -437,7 +410,7 @@ mod tests {
         assert_eq!(schedule[1].op_kind, 9);
 
         let plan =
-            plan_from_pieces(&tensors, &ops, &[0], &[2], MAX_INTERNAL, None).expect("in-place graph fits budget");
+            plan_from_pieces(&tensors, &ops, &[0], &[2]).expect("in-place graph fits budget");
         assert_eq!(plan.offsets[1], 0, "in-place tensor gets exactly one offset");
         assert_eq!(plan.peak_arena_bytes, 16, "no duplicate allocation for the in-place output");
     }
@@ -455,7 +428,7 @@ mod tests {
         ];
         let ops = vec![op(&[0], &[1]), op(&[1], &[2]), op(&[0, 2], &[3])];
         let plan =
-            plan_from_pieces(&tensors, &ops, &[0], &[3], MAX_INTERNAL, None).expect("I/O-exclusion graph fits budget");
+            plan_from_pieces(&tensors, &ops, &[0], &[3]).expect("I/O-exclusion graph fits budget");
 
         assert_eq!(plan.offsets[0], OFFSET_NONE, "model input never lives in the arena");
         assert_eq!(plan.offsets[3], OFFSET_NONE, "model output never lives in the arena");
@@ -475,7 +448,7 @@ mod tests {
             tensor("output", &[1], INT8),
         ];
         let ops = vec![op(&[0], &[1]), op(&[1], &[2]), op(&[2], &[3])];
-        let err = plan_from_pieces(&tensors, &ops, &[0], &[3], MAX_INTERNAL, None)
+        let err = plan_from_pieces(&tensors, &ops, &[0], &[3])
             .expect_err("600 KiB live peak exceeds the 512 KiB budget");
         assert_eq!(err, ArenaError::Layout(LayoutError::OutOfBudget));
         assert!(err.to_string().contains("arena plan failed"));
@@ -487,20 +460,21 @@ mod tests {
             tensor("output", &[1], INT8),
         ];
         let ops = vec![op(&[0], &[1]), op(&[1], &[2])];
-        let err = plan_from_pieces(&tensors, &ops, &[0], &[2], MAX_INTERNAL, None)
+        let err = plan_from_pieces(&tensors, &ops, &[0], &[2])
             .expect_err("single tensor over the 512 KiB budget");
         assert_eq!(err, ArenaError::Layout(LayoutError::Oversized));
     }
 
     #[test]
     fn arena_offsets_contract_violations_error_before_planning() {
-        // 257 tensors exceed the planner's MAX_TENSORS arrays.
+        // 256 tensors exceed the planner's MAX_TENSORS arrays (T1.3 raised
+        // the cap from 64 to 255 for the wide zoo subgraphs).
         let many_tensors: Vec<ParsedTensor<'static>> =
-            (0..257).map(|_| tensor("t", &[1], INT8)).collect();
+            (0..256).map(|_| tensor("t", &[1], INT8)).collect();
         let ops = vec![op(&[0], &[1])];
-        let err = plan_from_pieces(&many_tensors, &ops, &[0], &[1], MAX_INTERNAL, None)
-            .expect_err("257 tensors exceed MAX_TENSORS");
-        assert_eq!(err, ArenaError::TooManyTensors { count: 257 });
+        let err = plan_from_pieces(&many_tensors, &ops, &[0], &[1])
+            .expect_err("256 tensors exceed MAX_TENSORS");
+        assert_eq!(err, ArenaError::TooManyTensors { count: 256 });
 
         // An op with 5 real inputs exceeds MAX_IO_PER_OP.
         let tensors = vec![
@@ -513,7 +487,7 @@ mod tests {
             tensor("output", &[1], INT8),
         ];
         let ops = vec![op(&[1, 2, 3, 4, 5], &[6])];
-        let err = plan_from_pieces(&tensors, &ops, &[0], &[6], MAX_INTERNAL, None)
+        let err = plan_from_pieces(&tensors, &ops, &[0], &[6])
             .expect_err("5-input op exceeds MAX_IO_PER_OP");
         assert_eq!(err, ArenaError::TooManyInputs { op: 0, count: 5 });
         assert!(err.to_string().contains("op 0 has 5 inputs"));
@@ -531,7 +505,7 @@ mod tests {
             tensor("output", &[1, 16], INT8),
         ];
         let ops = vec![op(&[0], &[1]), op(&[1], &[2]), op(&[2], &[3])];
-        let plan = plan_from_pieces(&tensors, &ops, &[0], &[3], MAX_INTERNAL, None).expect("graph fits budget");
+        let plan = plan_from_pieces(&tensors, &ops, &[0], &[3]).expect("graph fits budget");
         assert_eq!(plan.offsets[1], 0, "int32 bias sized 4 bytes per element");
         assert_eq!(plan.offsets[2], 32);
         assert_eq!(plan.peak_arena_bytes, 48);
@@ -549,6 +523,65 @@ mod tests {
         assert_eq!(plan.tensor_count, 4);
         for off in plan.offsets.iter().take(4) {
             assert_eq!(*off, OFFSET_NONE);
+        }
+    }
+
+    /// All six zoo models, same paths as the fused-pattern profile
+    /// (optimize/profile.rs) and model_validation.rs.
+    const SINE_TFLITE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/sine.tflite"
+    ));
+    const HELLO_WORLD_TFLITE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/zoo/sine_regression/hello_world_int8.tflite"
+    ));
+    const KWS_TFLITE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/zoo/keyword_spotting/kws_micro_speech_int8.tflite"
+    ));
+    const ANOMALY_TFLITE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/zoo/anomaly_detect/anomaly_detect_int8.tflite"
+    ));
+    const PERSON_DETECT_TFLITE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/zoo/person_detect_vww/person_detect_int8.tflite"
+    ));
+    const MOBILENET_V2_TFLITE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../models/zoo/mobilenetv2_cls/mobilenet_v2_1.0_224_int8.tflite"
+    ));
+
+    /// T1.3 — per-model arena peak pinned from `plan_arena` over the real
+    /// zoo models (recorded in local-notes/evidence/composed-kernels/t13-arena.md).
+    /// Every arena-emitted model must fit MAX_INTERNAL = 512 KiB; models
+    /// that exceed it (mobilenet_v2: the 224×224×32 first-conv activation
+    /// alone is ~1.6 MiB) keep per-tensor stack emission instead.
+    #[test]
+    fn arena_peaks_pinned_for_zoo_models() {
+        let cases: [(&str, &[u8], Result<usize, ArenaError>); 6] = [
+            ("sine", SINE_TFLITE, Ok(0)),
+            ("hello_world", HELLO_WORLD_TFLITE, Ok(32)),
+            ("kws", KWS_TFLITE, Ok(5_968)),
+            ("anomaly_detect", ANOMALY_TFLITE, Ok(272)),
+            ("person_detect", PERSON_DETECT_TFLITE, Ok(55_296)),
+            ("mobilenet_v2", MOBILENET_V2_TFLITE, Err(ArenaError::Layout(LayoutError::Oversized))),
+        ];
+        for (name, bytes, expected) in cases {
+            let model = parse(bytes).unwrap_or_else(|e| panic!("{name}: parse: {e}"));
+            let got = plan_arena(&model).map(|p| p.peak_arena_bytes);
+            assert_eq!(
+                got,
+                expected,
+                "{name}: arena peak diverged from the pinned value (T1.3 evidence)"
+            );
+            if let Ok(peak) = got {
+                assert!(
+                    peak <= MAX_INTERNAL,
+                    "{name}: arena peak {peak} exceeds the 512 KiB device budget"
+                );
+            }
         }
     }
 }

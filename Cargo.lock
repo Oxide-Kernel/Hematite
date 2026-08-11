@@ -710,16 +710,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "espnn-codegen"
-version = "0.1.0"
-dependencies = [
- "hematite-core",
- "hematite-memory",
- "hematite-ref",
- "hematite-tflite",
-]
-
-[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -844,9 +834,11 @@ dependencies = [
 name = "hematite-codegen"
 version = "0.1.0"
 dependencies = [
+ "hematite-benchmarks",
  "hematite-core",
  "hematite-memory",
- "hematite-tflite",
+ "hematite-ref",
+ "hematite-s3",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -897,10 +889,6 @@ dependencies = [
  "hematite-ref",
  "hematite-s3",
 ]
-
-[[package]]
-name = "hematite-tflite"
-version = "0.1.0"
 
 [[package]]
 name = "ident_case"

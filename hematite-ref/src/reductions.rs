@@ -6,9 +6,9 @@
 //! Each kernel mirrors the generator's arithmetic in
 //! `tools/generate_goldens/src/ops/reductions.rs` bit-for-bit:
 //!
-//! 1. **mean:** i32 accumulate over reduction axes, then TFLM
-//!    `QuantizedMeanOrSum` requantize (fold 1/count into the multiplier,
-//!    subtract `count * input_zero_point`, `multiply_by_quantized_multiplier`).
+//! 1. **mean:** i32 accumulate over reduction axes, divide by count
+//!    (round-half-away-from-zero), then per-tensor requantize via
+//!    `multiply_by_quantized_multiplier`.
 //!
 //! 2. **sum:** i32 accumulate over reduction axes, then requantize
 //!    (no division — TFLite SUM keeps output type == input type).
@@ -52,6 +52,22 @@ use hematite_int8::{multiply_by_quantized_multiplier, saturating_cast};
 #[inline(always)]
 fn shape_product(shape: &[i32; 4]) -> usize {
     shape[0] as usize * shape[1] as usize * shape[2] as usize * shape[3] as usize
+}
+
+/// Round-half-away-from-zero integer division: `numerator / denominator`
+/// with halves rounded away from zero.
+///
+/// Same semantics as the pool kernel's `round_half_away_zero` — used by
+/// the mean reduction to divide the accumulated sum by the reduction count.
+#[inline(always)]
+fn round_half_away_zero(numerator: i32, denominator: i32) -> i32 {
+    debug_assert!(denominator > 0, "denominator must be positive");
+    let half = denominator / 2;
+    if numerator > 0 {
+        (numerator + half) / denominator
+    } else {
+        (numerator - half) / denominator
+    }
 }
 
 /// Clamp `value` to `[min, max]` and saturating-cast to i8.
@@ -110,19 +126,13 @@ fn round_div(numerator: i32, denominator: i32) -> i32 {
 
 /// Reduce-mean — scalar reference kernel.
 ///
-/// Mirrors TFLM `reference_ops::QuantizedMeanOrSum` (compute_sum == false)
-/// at the golden pin `18b9e6f2a8c5a9518e588f59c2ba16ef7ef9d551`.
+/// Mirrors `tools/generate_goldens/src/ops/reductions.rs::generate_mean`.
 ///
-/// # Algorithm
+/// # Arrowics
 ///
 /// 1. i32 accumulate over the reduction axes
-/// 2. Fold the `1/count` divisor into the multiplier (truncating i64
-///    division), per TFLM: `shift = min(63 - clz(count), 32)` then
-///    `min(shift, 31 + output_shift)`;
-///    `mult = (mult << shift) / count`; `shift -= shift`.
-/// 3. Per output: `shifted = acc - input_zero_point * count`, requantize via
-///    `multiply_by_quantized_multiplier(shifted, mult, shift)` +
-///    output_offset + clamp. (`input_zero_point = -input_offset`.)
+/// 2. Divide by count (round-half-away-from-zero)
+/// 3. Requantize via `multiply_by_quantized_multiplier` + output_offset + clamp
 ///
 /// # Errors
 ///
@@ -186,19 +196,6 @@ pub fn mean(
     let act_min = params.quantized_activation_min;
     let act_max = params.quantized_activation_max;
 
-    // TFLM `QuantizedMeanOrSum` (compute_sum == false): fold the 1/count
-    // divisor into the multiplier using truncating i64 division.
-    let count: u64 = total_count as u64;
-    let in_zp: i32 = -params.input_offset;
-    if count == 0 {
-        output.fill(0);
-        return Ok(());
-    }
-    let mut mshift = (63 - count.leading_zeros() as i32).min(32);
-    mshift = mshift.min(31 + shift);
-    let mean_mult: i32 = (((mult as i64) << mshift) / count as i64) as i32;
-    let mean_shift: i32 = shift - mshift;
-
     for oh in 0..out_h {
         for ow in 0..out_w {
             for oc in 0..out_c {
@@ -220,8 +217,12 @@ pub fn mean(
                     }
                 }
 
-                let shifted = (acc as i64 - in_zp as i64 * count as i64) as i32;
-                let scaled = multiply_by_quantized_multiplier(shifted, mean_mult, mean_shift);
+                let averaged = if total_count == 0 {
+                    0
+                } else {
+                    round_half_away_zero(acc, total_count)
+                };
+                let scaled = multiply_by_quantized_multiplier(averaged, mult, shift);
                 let val = (scaled + out_off).max(act_min).min(act_max);
                 let out_idx = oh * (out_w * out_c) + ow * out_c + oc;
                 output[out_idx] = clamp_i8(val, act_min, act_max);

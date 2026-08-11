@@ -27,8 +27,11 @@
 //! 10× internal bar (T3.0) — both attributed to the plan in `source` fields.
 
 use hematite_core::op_params::{
-    ActivationParams, Conv2DParams, DepthwiseConv2DParams, ElementwiseParams,
-    FullyConnectedParams, FusedActivation, Padding, PoolParams, SoftmaxParams,
+    ActivationEpilogueParams, ActivationParams, ComposedActivation, Conv2DParams,
+    DepthwiseConv2DParams, ElementwiseChainParams, ElementwiseChainStep, ElementwiseKind,
+    ElementwiseParams, FoldedPoolParams, FusedConvParams, FullyConnectedParams,
+    FusedActivation, Padding, PoolInputFold, PoolKind, PoolParams, ReduceParams,
+    ResidualAddParams, SoftmaxParams,
 };
 use hematite_core::KernelError;
 
@@ -55,6 +58,8 @@ const MULT_32: [i32; 32] = mults::<32>();
 const SHIFT_32: [i32; 32] = shifts::<32>();
 const MULT_64: [i32; 64] = mults::<64>();
 const SHIFT_64: [i32; 64] = shifts::<64>();
+const MULT_128: [i32; 128] = mults::<128>();
+const SHIFT_128: [i32; 128] = shifts::<128>();
 const MULT_1000: [i32; 1000] = mults::<1000>();
 const SHIFT_1000: [i32; 1000] = shifts::<1000>();
 
@@ -93,9 +98,25 @@ pub enum OpKind {
     AvgPool,
     MaxPool,
     Relu,
+    Relu6,
+    HardSwish,
     Add,
     Mul,
     Sub,
+    /// Composed CONV_2D + residual-ADD + activation epilogue (T2.2) — the
+    /// anchor conv's own shape; the epilogue reads the residual const tensor.
+    FusedConv2d,
+    /// Composed elementwise chain (T2.3) — N steps, each step's own
+    /// requantize preserved, register-held between steps on the SIMD path.
+    FusedElementwiseChain,
+    /// Composed pool + MUL/SUB input fold + activation epilogue (T2.4) — the
+    /// anchor pool's own shape; the fold operand is a const tensor embedded
+    /// in the params.
+    FusedPoolFold,
+    /// Reduce-MEAN over the spatial axes (H,W) keeping channels (T3.4) — the
+    /// MobileNetV2 global-average-pool shape; the s3 `reductions::mean`
+    /// dispatches the looped-accumulation SIMD path on device.
+    Mean,
 }
 
 /// A documented competitor / acceptance baseline for a row.
@@ -124,6 +145,10 @@ pub enum KernelParams {
     Pool(&'static PoolParams),
     Activation(&'static ActivationParams<'static>),
     Elementwise(&'static ElementwiseParams),
+    FusedConv(&'static FusedConvParams<'static>),
+    FusedChain(&'static ElementwiseChainParams<'static>),
+    FusedPool(&'static FoldedPoolParams<'static>),
+    Reduce(&'static ReduceParams),
 }
 
 /// A single per-kernel benchmark row.
@@ -291,7 +316,11 @@ const SOFTMAX_1X1000_PARAMS: SoftmaxParams = SoftmaxParams {
     row_size: 1000,
     input_multiplier: 1_717_986_918, // quantize_multiplier(0.1), from the softmax golden
     input_left_shift: 22,
-    diff_min: -128,
+    // TFLM diff_min = -CalculateInputRadius(5, left_shift)
+    // (softmax_common.cc @ 18b9e6f2a8c5a9518e588f59c2ba16ef7ef9d551);
+    // radius = floor(31 * 2^26 / 2^(input_left_shift + 1)) — the +1 matches
+    // TFLM's stored shift (26+s) vs our 25+s convention → -(31 << 26 >> 23) = -248.
+    diff_min: -248,
     input_offset: 0,
     output_offset: -128,
     quantized_activation_min: -128,
@@ -307,6 +336,77 @@ const AVGPOOL_7X7_1280_PARAMS: PoolParams = PoolParams {
     stride_height: 7,
     padding: Padding::Valid,
     activation: FusedActivation::None,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+// ── T3.4 mean rows — spatial-full MEAN (H,W reduced, channels kept) ──────────
+
+/// The mv2 global-average-pool MEAN: 7×7×1280 → 1×1×1280. positions 49
+/// (single position pass) but in_c 1280 — the limit the landed gate could
+/// not serve — now dispatchable via looped accumulation.
+const MV2_GLOBAL_MEAN_7X7_1280_PARAMS: ReduceParams = ReduceParams {
+    keep_dims: false,
+    axis: [1, 2, 0, 0],
+    axis_count: 2,
+    input_shape: [1, 7, 7, 1280],
+    output_shape: [1, 1, 1, 1280],
+    output_type: 0,
+    input_offset: 0,
+    output_offset: 0,
+    output_multiplier: 1 << 30,
+    output_shift: 1,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 16×16×16 → 1×1×16: positions 256, in_c 16 — a single direct
+/// position/channel pass (the landed in-limit path, unchanged).
+const MEAN_16X16_16_PARAMS: ReduceParams = ReduceParams {
+    keep_dims: false,
+    axis: [1, 2, 0, 0],
+    axis_count: 2,
+    input_shape: [1, 16, 16, 16],
+    output_shape: [1, 1, 1, 16],
+    output_type: 0,
+    input_offset: 0,
+    output_offset: 0,
+    output_multiplier: 1 << 30,
+    output_shift: 1,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 32×32×64 → 1×1×64: positions 1024 > 256 — chunked into 4 position passes;
+/// in_c 64 (single channel pass, direct).
+const MEAN_32X32_64_PARAMS: ReduceParams = ReduceParams {
+    keep_dims: false,
+    axis: [1, 2, 0, 0],
+    axis_count: 2,
+    input_shape: [1, 32, 32, 64],
+    output_shape: [1, 1, 1, 64],
+    output_type: 0,
+    input_offset: 0,
+    output_offset: 0,
+    output_multiplier: 1 << 30,
+    output_shift: 1,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 1×1×1280 → 1×1×1280: positions 1, in_c 1280 > 256 — the single-position
+/// in_c>256 case (channel-passed, staged).
+const MEAN_1X1_1280_PARAMS: ReduceParams = ReduceParams {
+    keep_dims: false,
+    axis: [1, 2, 0, 0],
+    axis_count: 2,
+    input_shape: [1, 1, 1, 1280],
+    output_shape: [1, 1, 1, 1280],
+    output_type: 0,
+    input_offset: 0,
+    output_offset: 0,
+    output_multiplier: 1 << 30,
+    output_shift: 1,
     quantized_activation_min: -128,
     quantized_activation_max: 127,
 };
@@ -366,28 +466,6 @@ const SIMD_CONV3X3_SAME_OFF_PARAMS: Conv2DParams<'static> = Conv2DParams {
     dilation_width_factor: 1,
     dilation_height_factor: 1,
     input_offset: 3,
-    weights_offset: 0,
-    output_offset: 0,
-    output_multiplier_per_channel: &MULT_32,
-    output_shift_per_channel: &SHIFT_32,
-    quantized_activation_min: -128,
-    quantized_activation_max: 127,
-};
-
-/// Same SAME conv3x3 as `SIMD_CONV3X3_SAME_OFF_PARAMS` but with
-/// `input_offset = 128` — the standard TFLite first-conv value
-/// (`input_zero_point = -128`). Exercises the relaxed Phase C fold guard that
-/// allows `input_offset` up to 128 (`-input_offset = -128` fits i8).
-const SIMD_CONV3X3_SAME_OFF128_PARAMS: Conv2DParams<'static> = Conv2DParams {
-    input_shape: [1, 16, 16, 32],
-    filter_shape: [32, 3, 3, 32],
-    output_shape: [1, 16, 16, 32],
-    padding: Padding::Same,
-    stride_width: 1,
-    stride_height: 1,
-    dilation_width_factor: 1,
-    dilation_height_factor: 1,
-    input_offset: 128,
     weights_offset: 0,
     output_offset: 0,
     output_multiplier_per_channel: &MULT_32,
@@ -461,12 +539,121 @@ const SIMD_DEPTHWISE_NON16_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseCon
     quantized_activation_max: 127,
 };
 
-/// Depthwise with depth_multiplier 8 (in 1 channel -> out 8 channels) — the
-/// `dm > 1` broadcast path: every input channel is replicated `dm` times in a
-/// padded virtual input (kws uses ch_mult=8).
+/// depth_multiplier = 2 depthwise (T3.5): in_c 8 → out_c 16, 3×3 SAME. The
+/// dm>1 SIMD dispatch stages a replicated input (each input channel fanned
+/// out to dm output channels) and per-channel requantizes — bit-exact vs ref.
+const SIMD_DEPTHWISE_DM2_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseConv2DParams {
+    input_shape: [1, 12, 12, 8],
+    filter_shape: [1, 3, 3, 16],
+    output_shape: [1, 12, 12, 16],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    depth_multiplier: 2,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// depth_multiplier = 4 depthwise (T3.5): in_c 8 → out_c 32.
+const SIMD_DEPTHWISE_DM4_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseConv2DParams {
+    input_shape: [1, 12, 12, 8],
+    filter_shape: [1, 3, 3, 32],
+    output_shape: [1, 12, 12, 32],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    depth_multiplier: 4,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_32,
+    output_shift_per_channel: &SHIFT_32,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// depth_multiplier = 8 depthwise (T3.5): in_c 8 → out_c 64 — the KWS
+/// keyword-spotting fan-out shape family that drives the 12.3× model gap
+/// (kws 12,983,503 → 1,059,889 cyc vs ESP-NN; ESP-NN-relative bar:
+/// < 1,059,889 cyc / 4 ms, user-verified 2026-08-10 — Scope table).
 const SIMD_DEPTHWISE_DM8_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseConv2DParams {
+    input_shape: [1, 12, 12, 8],
+    filter_shape: [1, 3, 3, 64],
+    output_shape: [1, 12, 12, 64],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    depth_multiplier: 8,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_64,
+    output_shift_per_channel: &SHIFT_64,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// T3.5b — the REAL kws depthwise layer (tflite-verified): input
+/// [1,49,40,1], filter [1,10,8,8] (80 taps), output [1,25,20,8] (Relu),
+/// stride 2 SAME, depth_multiplier 8, input_offset +128 (the depthwise input
+/// is the first conv's output with zero point -128 — the Phase-C fold uses
+/// fill -128 which fits in i8). The tap-parameterized anytap SIMD kernel
+/// dispatches this shape in 3 chunked QACC passes (32+32+16 taps; the QACC
+/// 20-bit-lane-safe bound).
+const SIMD_DEPTHWISE_KWS_10X8_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseConv2DParams {
+    input_shape: [1, 49, 40, 1],
+    filter_shape: [1, 10, 8, 8],
+    output_shape: [1, 25, 20, 8],
+    padding: Padding::Same,
+    stride_width: 2,
+    stride_height: 2,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    depth_multiplier: 8,
+    input_offset: 128,
+    weights_offset: 0,
+    output_offset: -128,
+    output_multiplier_per_channel: &MULT_8,
+    output_shift_per_channel: &SHIFT_8,
+    quantized_activation_min: 0,
+    quantized_activation_max: 127,
+};
+
+/// T3.5b — arbitrary 5×5 filter, dm=1 (in_c 8 → out_c 8), stride 1 SAME.
+const SIMD_DEPTHWISE_5X5_DM1_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseConv2DParams {
+    input_shape: [1, 12, 12, 8],
+    filter_shape: [1, 5, 5, 8],
+    output_shape: [1, 12, 12, 8],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    depth_multiplier: 1,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_8,
+    output_shift_per_channel: &SHIFT_8,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// T3.5b — arbitrary 5×5 filter, dm=8 (in_c 1 → out_c 8), stride 1 SAME.
+const SIMD_DEPTHWISE_5X5_DM8_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseConv2DParams {
     input_shape: [1, 12, 12, 1],
-    filter_shape: [1, 3, 3, 8],
+    filter_shape: [1, 5, 5, 8],
     output_shape: [1, 12, 12, 8],
     padding: Padding::Same,
     stride_width: 1,
@@ -479,6 +666,66 @@ const SIMD_DEPTHWISE_DM8_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseConv2
     output_offset: 0,
     output_multiplier_per_channel: &MULT_8,
     output_shift_per_channel: &SHIFT_8,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// T3.5b — arbitrary 7×7 filter, dm=1 (in_c 8 → out_c 8), stride 2 SAME.
+const SIMD_DEPTHWISE_7X7_DM1_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseConv2DParams {
+    input_shape: [1, 14, 14, 8],
+    filter_shape: [1, 7, 7, 8],
+    output_shape: [1, 7, 7, 8],
+    padding: Padding::Same,
+    stride_width: 2,
+    stride_height: 2,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    depth_multiplier: 1,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_8,
+    output_shift_per_channel: &SHIFT_8,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// T3.5b — arbitrary 7×7 filter, dm=8 (in_c 1 → out_c 8), stride 2 SAME.
+const SIMD_DEPTHWISE_7X7_DM8_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseConv2DParams {
+    input_shape: [1, 14, 14, 1],
+    filter_shape: [1, 7, 7, 8],
+    output_shape: [1, 7, 7, 8],
+    padding: Padding::Same,
+    stride_width: 2,
+    stride_height: 2,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    depth_multiplier: 8,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_8,
+    output_shift_per_channel: &SHIFT_8,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// T3.5b — non-square 3×5 filter, dm=2 (in_c 8 → out_c 16), stride 1 SAME.
+const SIMD_DEPTHWISE_3X5_DM2_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseConv2DParams {
+    input_shape: [1, 12, 12, 8],
+    filter_shape: [1, 3, 5, 16],
+    output_shape: [1, 12, 12, 16],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    depth_multiplier: 2,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
     quantized_activation_min: -128,
     quantized_activation_max: 127,
 };
@@ -511,6 +758,204 @@ const SIMD_FC_256X64_OFF_PARAMS: FullyConnectedParams<'static> = FullyConnectedP
     quantized_activation_max: 127,
 };
 
+/// FC 1→1, input_offset 0 — the sine model's single-FC shape (T3.6). The
+/// input_dim 1 is zero-padded to 16 in scratch, then the TIE728 11cn path
+/// runs (pad-in-scratch widening).
+const SIMD_FC_1X1_PARAMS: FullyConnectedParams<'static> = FullyConnectedParams {
+    input_dim: 1,
+    output_dim: 1,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &[1 << 30],
+    output_shift_per_channel: &[0],
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// FC 1→16, input_offset 128 — hello_world's first dense layer (T3.6). The
+/// gated-out shape (input_dim 1 < 16) now dispatches SIMD via pad-in-scratch.
+const SIMD_FC_1X16_PARAMS: FullyConnectedParams<'static> = FullyConnectedParams {
+    input_dim: 1,
+    output_dim: 16,
+    input_offset: 128,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// FC 16→1, input_offset 128 — hello_world's final dense layer (T3.6).
+/// input_dim 16 (%16) needs no pad; output_dim 1 exercises the small-out
+/// path.
+const SIMD_FC_16X1_PARAMS: FullyConnectedParams<'static> = FullyConnectedParams {
+    input_dim: 16,
+    output_dim: 1,
+    input_offset: 128,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &[1 << 30],
+    output_shift_per_channel: &[0],
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// FC 8→128, input_offset 128 — anomaly_detect's gated-out 6th dense layer
+/// (T3.6). input_dim 8 is zero-padded to 16 in scratch.
+const SIMD_FC_8X128_PARAMS: FullyConnectedParams<'static> = FullyConnectedParams {
+    input_dim: 8,
+    output_dim: 128,
+    input_offset: 128,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_128,
+    output_shift_per_channel: &SHIFT_128,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+// ── Conv1x1 channel-padded shapes (T3.3 pad-in-scratch widening) ─────────────
+
+/// 1×1 conv, input_c 3 (non-%16) — the first-conv family (e.g. a 3-channel
+/// pointwise). input_c 3 is zero-padded to 16 in scratch, then the TIE728
+/// 11cn path runs.
+const SIMD_CONV1X1_PAD_3CH_PARAMS: Conv2DParams<'static> = Conv2DParams {
+    input_shape: [1, 1, 1, 3],
+    filter_shape: [16, 1, 1, 3],
+    output_shape: [1, 1, 1, 16],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 1×1 conv, input_c 3, non-zero input_offset 128 (Phase-C fold over padded
+/// weight rows).
+const SIMD_CONV1X1_PAD_3CH_OFF_PARAMS: Conv2DParams<'static> = Conv2DParams {
+    input_shape: [1, 1, 1, 3],
+    filter_shape: [16, 1, 1, 3],
+    output_shape: [1, 1, 1, 16],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    input_offset: 128,
+    weights_offset: 0,
+    output_offset: -10,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 1×1 conv, input_c 8 over 4×4 spatial, input_offset 128 — the
+/// anomaly_detect-style small-channel fold with spatial pixels.
+const SIMD_CONV1X1_PAD_8CH_PARAMS: Conv2DParams<'static> = Conv2DParams {
+    input_shape: [1, 4, 4, 8],
+    filter_shape: [16, 1, 1, 8],
+    output_shape: [1, 4, 4, 16],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    input_offset: 128,
+    weights_offset: 0,
+    output_offset: 5,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 1×1 conv, input_c 15 (pad to 16), input_offset 5.
+const SIMD_CONV1X1_PAD_15CH_PARAMS: Conv2DParams<'static> = Conv2DParams {
+    input_shape: [1, 1, 1, 15],
+    filter_shape: [16, 1, 1, 15],
+    output_shape: [1, 1, 1, 16],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    input_offset: 5,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 1×1 conv, input_c 1 (pad to 16) — the degenerate single-channel
+/// pointwise family.
+const SIMD_CONV1X1_PAD_1CH_PARAMS: Conv2DParams<'static> = Conv2DParams {
+    input_shape: [1, 1, 1, 1],
+    filter_shape: [16, 1, 1, 1],
+    output_shape: [1, 1, 1, 16],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 1×1 conv, input_c 17 (pads to 32), 2×2 spatial.
+const SIMD_CONV1X1_PAD_17CH_PARAMS: Conv2DParams<'static> = Conv2DParams {
+    input_shape: [1, 2, 2, 17],
+    filter_shape: [16, 1, 1, 17],
+    output_shape: [1, 2, 2, 16],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 1×1 conv, input_c 32 (%16, no pad) — the T3.3 no-pad control row.
+const SIMD_CONV1X1_PAD_32CH_PARAMS: Conv2DParams<'static> = Conv2DParams {
+    input_shape: [1, 1, 1, 32],
+    filter_shape: [16, 1, 1, 32],
+    output_shape: [1, 1, 1, 16],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
 /// 2×2 max-pool, stride 2, VALID, channels 16 (%16) — fires
 /// `dl_tie728_s8_max_pool2d_22c1` (hardcoded 2x2/stride-2 pattern).
 const SIMD_MAXPOOL_32X32_PARAMS: PoolParams = PoolParams {
@@ -535,6 +980,135 @@ const SIMD_AVGPOOL_32X32_PARAMS: PoolParams = PoolParams {
     filter_height: 2,
     stride_width: 2,
     stride_height: 2,
+    padding: Padding::Valid,
+    activation: FusedActivation::None,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+// ── T3.1 generic-pool rows — the widened matrix ──────────────────────────────
+//
+// filter {2×2, 3×3, 5×5, global 7×7} × stride {1, 2} × pad {0, 1, SAME} ×
+// clamp {full-range, relu}. The device SIMD path (`simd_eligible_pool`)
+// engages for the no-padding / no-partial-window shapes (pad_total ≤ 0:
+// VALID rows and 2×2/stride-2 SAME); padded rows run the scalar fallback on
+// device (bit-exact vs ref — the pool backend delivers no scratch for
+// spatial padding staging) and are model-verified on the host. The avg
+// fixed-point-vs-ref divergence is documented in
+// `local-notes/evidence/composed-kernels/t31-pool.md`.
+
+/// 3×3 stride-1 VALID (pad_total 0) — the generic hwc1 SIMD path (avg).
+const POOL_3X3_S1_VALID_PARAMS: PoolParams = PoolParams {
+    input_shape: [1, 8, 8, 16],
+    output_shape: [1, 6, 6, 16],
+    filter_width: 3,
+    filter_height: 3,
+    stride_width: 1,
+    stride_height: 1,
+    padding: Padding::Valid,
+    activation: FusedActivation::None,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// Same as `POOL_3X3_S1_VALID_PARAMS` with a relu-range clamp (0..127) —
+/// the generic driver's Rust clamp post-pass.
+const POOL_3X3_S1_VALID_RELU_PARAMS: PoolParams = PoolParams {
+    input_shape: [1, 8, 8, 16],
+    output_shape: [1, 6, 6, 16],
+    filter_width: 3,
+    filter_height: 3,
+    stride_width: 1,
+    stride_height: 1,
+    padding: Padding::Valid,
+    activation: FusedActivation::None,
+    quantized_activation_min: 0,
+    quantized_activation_max: 127,
+};
+
+/// 3×3 stride-1 SAME (pad 1) — model-verified on host; scalar on device.
+const POOL_3X3_S1_SAME_PARAMS: PoolParams = PoolParams {
+    input_shape: [1, 8, 8, 16],
+    output_shape: [1, 8, 8, 16],
+    filter_width: 3,
+    filter_height: 3,
+    stride_width: 1,
+    stride_height: 1,
+    padding: Padding::Same,
+    activation: FusedActivation::None,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 3×3 stride-2 SAME on 12×12 (pad_total 1 — asymmetric SAME, partial
+/// windows) — model-verified on host; scalar on device.
+const POOL_3X3_S2_SAME_PARAMS: PoolParams = PoolParams {
+    input_shape: [1, 12, 12, 16],
+    output_shape: [1, 6, 6, 16],
+    filter_width: 3,
+    filter_height: 3,
+    stride_width: 2,
+    stride_height: 2,
+    padding: Padding::Same,
+    activation: FusedActivation::None,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 5×5 stride-1 SAME on 12×12 (pad 2) — model-verified on host; scalar on
+/// device.
+const POOL_5X5_S1_SAME_PARAMS: PoolParams = PoolParams {
+    input_shape: [1, 12, 12, 16],
+    output_shape: [1, 12, 12, 16],
+    filter_width: 5,
+    filter_height: 5,
+    stride_width: 1,
+    stride_height: 1,
+    padding: Padding::Same,
+    activation: FusedActivation::None,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 5×5 stride-2 SAME on 14×14 (pad_total 3, pad 1) — model-verified on
+/// host; scalar on device.
+const POOL_5X5_S2_SAME_PARAMS: PoolParams = PoolParams {
+    input_shape: [1, 14, 14, 16],
+    output_shape: [1, 7, 7, 16],
+    filter_width: 5,
+    filter_height: 5,
+    stride_width: 2,
+    stride_height: 2,
+    padding: Padding::Same,
+    activation: FusedActivation::None,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// Global 7×7 avg/max pool (pad_total 0) — the generic hwc1 path on a
+/// 1×1 output.
+const POOL_7X7_GLOBAL_PARAMS: PoolParams = PoolParams {
+    input_shape: [1, 7, 7, 16],
+    output_shape: [1, 1, 1, 16],
+    filter_width: 7,
+    filter_height: 7,
+    stride_width: 7,
+    stride_height: 7,
+    padding: Padding::Valid,
+    activation: FusedActivation::None,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// 3×3 stride-1 VALID with 24 channels — the model's C%16 scalar tail
+/// (host-verified); scalar on device (the device gate requires C % 16).
+const POOL_3X3_S1_VALID_C24_PARAMS: PoolParams = PoolParams {
+    input_shape: [1, 8, 8, 24],
+    output_shape: [1, 6, 6, 24],
+    filter_width: 3,
+    filter_height: 3,
+    stride_width: 1,
+    stride_height: 1,
     padding: Padding::Valid,
     activation: FusedActivation::None,
     quantized_activation_min: -128,
@@ -626,6 +1200,433 @@ const SIMD_SUB_256_PARAMS: ElementwiseParams = ElementwiseParams {
     quantized_activation_max: 127,
 };
 
+// ── T3.2 widened elementwise + activation rows ───────────────────────────────
+//
+// Non-identity offset/multiplier pairs exercise the widened per-lane SIMD
+// model (arbitrary quant-affine chains); relu6 / hard_swish exercise the new
+// activation lane models. All n = 256 (multiple of 16 — the lane-model vector
+// main loop engages on device with aligned arena buffers).
+
+/// Elementwise ADD over 256 elements with the two-stage TFLM Add rounding
+/// shape (non-zero zero points, left_shift 20, per-input multipliers, output
+/// requantize) — NOT identity-eligible, engages the T3.2 widened lane model.
+const SIMD_ADD_256_NONIDENTITY_PARAMS: ElementwiseParams = ElementwiseParams {
+    num_elements: 256,
+    input1_offset: -5,
+    input2_offset: 3,
+    output_offset: 1,
+    output_multiplier: 1_342_177_280,
+    output_shift: -18,
+    left_shift: 20,
+    input1_multiplier: 1 << 30,
+    input1_shift: 0,
+    input2_multiplier: 1_288_490_189,
+    input2_shift: -1,
+    quantized_activation_min: -32,
+    quantized_activation_max: 96,
+};
+
+/// Elementwise SUB over 256 elements — same non-identity shape as the ADD row.
+const SIMD_SUB_256_NONIDENTITY_PARAMS: ElementwiseParams = ElementwiseParams {
+    num_elements: 256,
+    input1_offset: -5,
+    input2_offset: 3,
+    output_offset: 1,
+    output_multiplier: 1_342_177_280,
+    output_shift: -18,
+    left_shift: 20,
+    input1_multiplier: 1 << 30,
+    input1_shift: 0,
+    input2_multiplier: 1_288_490_189,
+    input2_shift: -1,
+    quantized_activation_min: -32,
+    quantized_activation_max: 96,
+};
+
+/// Elementwise MUL over 256 elements with non-zero offsets and a real product
+/// requantize (scale change) — engages the T3.2 widened lane model.
+const SIMD_MUL_256_NONIDENTITY_PARAMS: ElementwiseParams = ElementwiseParams {
+    num_elements: 256,
+    input1_offset: 2,
+    input2_offset: -3,
+    output_offset: -7,
+    output_multiplier: 1_717_986_918,
+    output_shift: -3,
+    left_shift: 0,
+    input1_multiplier: 0,
+    input1_shift: 0,
+    input2_multiplier: 0,
+    input2_shift: 0,
+    quantized_activation_min: -16,
+    quantized_activation_max: 111,
+};
+
+/// ReLU6 over 256 elements — the widened lane model clamps to
+/// `quantized_activation_max` forwarded as `quantized_six` (= 24 at
+/// scale 0.25). No requantize (output scale 1.0).
+const SIMD_RELU6_256_PARAMS: ActivationParams<'static> = ActivationParams {
+    input_offset: -1,
+    output_offset: 2,
+    output_multiplier: 0,
+    output_shift: 0,
+    quantized_activation_min: 0,
+    quantized_activation_max: 24,
+    input_multiplier: 0,
+    input_left_shift: 0,
+    input_range_radius: 0,
+    output_multiplier_alpha: 0,
+    output_shift_alpha: 0,
+    output_multiplier_identity: 0,
+    output_shift_identity: 0,
+    alpha_offset: 0,
+    alpha_data: &[],
+    output_multiplier_1: 0,
+    output_shift_1: 0,
+    output_multiplier_2: 0,
+    output_shift_2: 0,
+    reluish_multiplier_fixedpoint_int16: 0,
+    reluish_multiplier_exponent: 0,
+    output_multiplier_fixedpoint_int16: 0,
+    output_multiplier_exponent: 0,
+};
+
+/// HardSwish over 256 elements — the DOWNGRADED integer rational formula
+/// (x·ReLU6(x+3)/6, ±3 round-half correction), pinned by the goldens. The
+/// widened lane model reproduces it bit-exact (per-lane /6 scalar tail).
+const SIMD_HARD_SWISH_256_PARAMS: ActivationParams<'static> = ActivationParams {
+    input_offset: -3,
+    output_offset: 1,
+    output_multiplier: 0,
+    output_shift: 0,
+    quantized_activation_min: 0,
+    quantized_activation_max: 127,
+    input_multiplier: 0,
+    input_left_shift: 0,
+    input_range_radius: 0,
+    output_multiplier_alpha: 0,
+    output_shift_alpha: 0,
+    output_multiplier_identity: 0,
+    output_shift_identity: 0,
+    alpha_offset: 0,
+    alpha_data: &[],
+    output_multiplier_1: 0,
+    output_shift_1: 0,
+    output_multiplier_2: 0,
+    output_shift_2: 0,
+    reluish_multiplier_fixedpoint_int16: 0,
+    reluish_multiplier_exponent: 0,
+    output_multiplier_fixedpoint_int16: 0,
+    output_multiplier_exponent: 0,
+};
+
+// ── Composed fused-conv rows (T2.2) ──────────────────────────────────────────
+//
+// The `fused_conv2d` composed kernel: anchor conv + residual-ADD + activation
+// epilogue in ONE SIMD pass. The rows exercise the two conv-family SIMD paths
+// reachable from a `Conv2DParams` anchor (1×1 and general/3×3). Quant pairs
+// are scale-derived exactly as the T1.2 emitter derives them (StepRequantize):
+// `input1 = QuantizeMultiplier(s1/twice_max)`, `input2 =
+// QuantizeMultiplier(s2/twice_max)`, `output =
+// QuantizeMultiplier(twice_max/(2^20·s_out))` with `left_shift = 20`; the
+// residual scale deliberately differs from the conv output scale so the
+// per-input roundings are non-identity.
+
+/// Deterministic const residual pattern (LCG, full int8 range) — the residual
+/// is a model constant tensor, so it is embedded in the params const.
+const fn residual_pattern<const N: usize>(seed: u64) -> [i8; N] {
+    let mut out = [0i8; N];
+    let mut x = seed;
+    let mut i = 0;
+    while i < N {
+        x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        out[i] = (x >> 33) as i8;
+        i += 1;
+    }
+    out
+}
+
+const FUSED_RESIDUAL_256: [i8; 256] = residual_pattern::<256>(0xF0E1_D2C3);
+const FUSED_RESIDUAL_288: [i8; 288] = residual_pattern::<288>(0x0BAD_F00D);
+
+/// Anchor conv for the 1×1 fused row — full-range activation (the residual
+/// block's conv output feeds the ADD, not a fused activation).
+const SIMD_FUSED_CONV1X1_CONV: Conv2DParams<'static> = Conv2DParams {
+    input_shape: [1, 4, 4, 16],
+    filter_shape: [16, 1, 1, 16],
+    output_shape: [1, 4, 4, 16],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 5,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// Anchor conv for the 3×3 fused row — non-%16 channels (8) exercise the
+/// channel-padded staging path on device.
+const SIMD_FUSED_CONV3X3_CONV: Conv2DParams<'static> = Conv2DParams {
+    input_shape: [1, 6, 6, 8],
+    filter_shape: [8, 3, 3, 8],
+    output_shape: [1, 6, 6, 8],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: -2,
+    output_multiplier_per_channel: &MULT_8,
+    output_shift_per_channel: &SHIFT_8,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// Fused 1×1 anchor: in [1,4,4,16] → out [1,4,4,16], residual + ReLU. The
+/// conv1x1 ACCX SIMD path (in_c 16, %16) — the MobileNetV2 pointwise
+/// residual-block prototype. Conv scale 0.5 / residual 0.3 / add-out 0.4.
+const FUSED_CONV1X1_RESIDUAL_RELU_PARAMS: FusedConvParams<'static> = FusedConvParams {
+    conv: SIMD_FUSED_CONV1X1_CONV,
+    output_scale: 0.5,
+    output_zero_point: 5,
+    output_multiplier_per_channel: &MULT_16,
+    output_shift_per_channel: &SHIFT_16,
+    residual: Some(ResidualAddParams {
+        residual_data: &FUSED_RESIDUAL_256,
+        residual_scale: 0.3,
+        residual_zero_point: -3,
+        output_scale: 0.4,
+        output_zero_point: 1,
+        input1_multiplier: 1 << 30,
+        input1_shift: 0,
+        input2_multiplier: 1_288_490_189,
+        input2_shift: -1,
+        left_shift: 20,
+        output_multiplier: 1_342_177_280,
+        output_shift: -18,
+    }),
+    activation: ActivationEpilogueParams {
+        kind: ComposedActivation::Relu,
+        input_offset: -1,
+        output_offset: 2,
+        output_multiplier: 1_342_177_280,
+        output_shift: 1,
+        quantized_activation_min: 0,
+        quantized_activation_max: 127,
+    },
+};
+
+/// Fused 3×3 anchor: in [1,6,6,8] → out [1,6,6,8] (non-%16 channels →
+/// channel-padded staging on device), residual + HardSwish. Conv scale 0.02 /
+/// residual 0.05 / add-out 0.03.
+const FUSED_CONV3X3_RESIDUAL_HSWISH_PARAMS: FusedConvParams<'static> = FusedConvParams {
+    conv: SIMD_FUSED_CONV3X3_CONV,
+    output_scale: 0.02,
+    output_zero_point: -2,
+    output_multiplier_per_channel: &MULT_8,
+    output_shift_per_channel: &SHIFT_8,
+    residual: Some(ResidualAddParams {
+        residual_data: &FUSED_RESIDUAL_288,
+        residual_scale: 0.05,
+        residual_zero_point: 7,
+        output_scale: 0.03,
+        output_zero_point: 3,
+        input1_multiplier: 1_717_986_918,
+        input1_shift: -2,
+        input2_multiplier: 1 << 30,
+        input2_shift: 0,
+        left_shift: 20,
+        output_multiplier: 1_789_569_707,
+        output_shift: -18,
+    }),
+    activation: ActivationEpilogueParams {
+        kind: ComposedActivation::HardSwish,
+        input_offset: -3,
+        output_offset: -1,
+        output_multiplier: 1_431_655_765,
+        output_shift: 0,
+        quantized_activation_min: 0,
+        quantized_activation_max: 127,
+    },
+};
+
+// ── Composed fused elementwise-chain row (T2.3) ──────────────────────────────
+//
+// The `fused_elementwise_chain` composed kernel: N elementwise steps, each
+// step's own requantize preserved (steps are NEVER collapsed). Quant pairs
+// are scale-derived exactly as the T1.2 emitter derives them (StepRequantize):
+// add/sub use the two-stage TFLM Add rounding (left_shift 20, input_i =
+// QuantizeMultiplier(s_i/twice_max), output =
+// QuantizeMultiplier(twice_max/(2^20·s_out))); mul uses the single product
+// requantize QuantizeMultiplier(s_in1·s_in2/s_out); activations use their
+// output ratio. Every scale here is non-identity, so the chain's per-step
+// roundings are exercised. On device TODAY this row runs the decomposition
+// (the hard_swish step has no SIMD yet, T3.2 — chains SIMD-engage only when
+// EVERY step is identity-eligible, see `fused::chain_simd_eligible`); the
+// chain-runtime < sum-of-per-op-runtimes measurement is T6.x.
+
+/// Deterministic const chain operand pattern (LCG, full int8 range) — model
+/// constant tensors, embedded in the params const (same as the fused-conv
+/// residual).
+const fn chain_operand<const N: usize>(seed: u64) -> [i8; N] {
+    let mut out = [0i8; N];
+    let mut x = seed;
+    let mut i = 0;
+    while i < N {
+        x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        out[i] = (x >> 33) as i8;
+        i += 1;
+    }
+    out
+}
+
+const CHAIN_OPERAND_A: [i8; 256] = chain_operand::<256>(0x0BAD_F00D);
+const CHAIN_OPERAND_B: [i8; 256] = chain_operand::<256>(0xDEAD_BEEF);
+
+/// The plan's canonical 4-op chain: add + relu + mul + hard_swish over 256
+/// elements, every step with NON-identity scales/offsets (add: input1
+/// 0.5/input2 0.3/output 0.4, zps 5/-3/1; relu: 0.4→0.2, zp 1→2; mul:
+/// 0.2·0.05→0.1, zps -2/0→-3; hard_swish: 0.1→0.03, zp 3→1).
+const FUSED_CHAIN_4OP_STEPS: [ElementwiseChainStep<'static>; 4] = [
+    ElementwiseChainStep {
+        kind: ElementwiseKind::Add,
+        operand: Some(&CHAIN_OPERAND_A),
+        input1_offset: -5,
+        input2_offset: 3,
+        output_offset: 1,
+        output_multiplier: 1_342_177_280,
+        output_shift: -18,
+        left_shift: 20,
+        input1_multiplier: 1 << 30,
+        input1_shift: 0,
+        input2_multiplier: 1_288_490_189,
+        input2_shift: -1,
+        quantized_activation_min: i8::MIN as i32,
+        quantized_activation_max: i8::MAX as i32,
+    },
+    ElementwiseChainStep {
+        kind: ElementwiseKind::Relu,
+        operand: None,
+        input1_offset: -1,
+        input2_offset: 0,
+        output_offset: 2,
+        output_multiplier: 1_073_741_824,
+        output_shift: 2,
+        left_shift: 0,
+        input1_multiplier: 0,
+        input1_shift: 0,
+        input2_multiplier: 0,
+        input2_shift: 0,
+        quantized_activation_min: 0,
+        quantized_activation_max: 127,
+    },
+    ElementwiseChainStep {
+        kind: ElementwiseKind::Mul,
+        operand: Some(&CHAIN_OPERAND_B),
+        input1_offset: 2,
+        input2_offset: 0,
+        output_offset: -3,
+        output_multiplier: 1_717_986_918,
+        output_shift: -3,
+        left_shift: 0,
+        input1_multiplier: 0,
+        input1_shift: 0,
+        input2_multiplier: 0,
+        input2_shift: 0,
+        quantized_activation_min: i8::MIN as i32,
+        quantized_activation_max: i8::MAX as i32,
+    },
+    ElementwiseChainStep {
+        kind: ElementwiseKind::HardSwish,
+        operand: None,
+        input1_offset: -3,
+        input2_offset: 0,
+        output_offset: 1,
+        output_multiplier: 1_789_569_707,
+        output_shift: 2,
+        left_shift: 0,
+        input1_multiplier: 0,
+        input1_shift: 0,
+        input2_multiplier: 0,
+        input2_shift: 0,
+        quantized_activation_min: 0,
+        quantized_activation_max: 127,
+    },
+];
+
+const FUSED_CHAIN_4OP_PARAMS: ElementwiseChainParams<'static> = ElementwiseChainParams {
+    num_elements: 256,
+    steps: &FUSED_CHAIN_4OP_STEPS,
+};
+
+// ── Composed pool-with-fold row (T2.4) ───────────────────────────────────────
+//
+// The `fused_pool_with_fold` composed kernel: anchor pool + absorbed MUL/SUB
+// input fold materialized into scratch + activation epilogue. The row uses an
+// IDENTITY MUL fold — zero offsets, full-range clamp, `(1<<30, 0)` output
+// pair — which is in the provably-exact subset (`fused::fold_simd_exact`), so
+// on device the fold SIMD-engages via the elementwise gates and the pool SIMD
+// reads the staged scratch directly (`fused::fused_pool_fold_simd_eligible`).
+
+/// Anchor pool for the composed pool-fold row — 2×2/stride-2/SAME, channels
+/// % 16, full-range clamp: exactly `pool::simd_eligible_pool`'s contract.
+const FUSED_POOL_ANCHOR: PoolParams = PoolParams {
+    input_shape: [1, 4, 4, 16],
+    output_shape: [1, 2, 2, 16],
+    filter_width: 2,
+    filter_height: 2,
+    stride_width: 2,
+    stride_height: 2,
+    padding: Padding::Same,
+    activation: FusedActivation::None,
+    quantized_activation_min: i8::MIN as i32,
+    quantized_activation_max: i8::MAX as i32,
+};
+
+/// Deterministic const fold operand (LCG, full int8 range) — a model constant
+/// tensor, embedded in the params const (same as the fused-conv residual).
+const FOLD_OPERAND_256: [i8; 256] = chain_operand::<256>(0xF00D_CAFE);
+
+/// Identity MUL fold (the `simd_eligible_mul` gate's contract) — in the
+/// provably-exact T2.4 subset, so this group SIMD-engages on device.
+const FUSED_POOL_MUL_FOLD: PoolInputFold<'static> = PoolInputFold {
+    builtin: 18,
+    operand_data: &FOLD_OPERAND_256,
+    operand_zero_point: 0,
+    input_zero_point: 0,
+    output_zero_point: 0,
+    folded_scale: 1.0,
+    left_shift: 0,
+    output_multiplier: 1 << 30,
+    output_shift: 0,
+    input1_multiplier: 0,
+    input1_shift: 0,
+    input2_multiplier: 0,
+    input2_shift: 0,
+    num_elements: 256,
+};
+
+const FUSED_POOL_FOLD_PARAMS: FoldedPoolParams<'static> = FoldedPoolParams {
+    pool: FUSED_POOL_ANCHOR,
+    pool_kind: PoolKind::Average,
+    fold: Some(FUSED_POOL_MUL_FOLD),
+    activation: ActivationEpilogueParams {
+        kind: ComposedActivation::Relu,
+        input_offset: -5,
+        output_offset: 2,
+        output_multiplier: 1_342_177_280,
+        output_shift: 1,
+        quantized_activation_min: 0,
+        quantized_activation_max: 127,
+    },
+};
+
 /// The full per-kernel benchmark table (order = report row order).
 pub const fn kernel_specs() -> &'static [KernelSpec] {
     &[
@@ -706,14 +1707,6 @@ pub const fn kernel_specs() -> &'static [KernelSpec] {
             note: "Phase C non-zero input_offset fold row (input_offset=3).",
         },
         KernelSpec {
-            name: "conv3x3_s8 16x16,32x3x3x32 SAME off128 (SIMD)",
-            tier: MemoryTier::Sram,
-            op: OpKind::Conv2d3x3,
-            params: KernelParams::Conv(&SIMD_CONV3X3_SAME_OFF128_PARAMS),
-            reference: None,
-            note: "Phase C relaxed fold row: input_offset=128 (TFLite input_zero_point=-128).",
-        },
-        KernelSpec {
             name: "fc_s8 256row,64out (SIMD)",
             tier: MemoryTier::Sram,
             op: OpKind::FullyConnected,
@@ -728,6 +1721,109 @@ pub const fn kernel_specs() -> &'static [KernelSpec] {
             params: KernelParams::Fc(&SIMD_FC_256X64_OFF_PARAMS),
             reference: None,
             note: "Phase C non-zero input_offset fold row (input_offset=5).",
+        },
+        KernelSpec {
+            name: "fc_s8 1row,1out (sine, T3.6)",
+            tier: MemoryTier::Sram,
+            op: OpKind::FullyConnected,
+            params: KernelParams::Fc(&SIMD_FC_1X1_PARAMS),
+            reference: Some(CompetitorBaseline {
+                name: "ESP-NN optimized (sine)",
+                cycles: None,
+                target_speedup_x100: None,
+                source: "plan composed-kernels Scope table (user-verified 2026-08-10): sine 618 → 190 cyc (3.3x). Measured Hematite row lands in T6.x (on-device).",
+            }),
+            note: "T3.6 sine-family row: input_dim 1 zero-padded to 16 in scratch (pad-in-scratch widening).",
+        },
+        KernelSpec {
+            name: "fc_s8 1row,16out off128 (hello_world FC1, T3.6)",
+            tier: MemoryTier::Sram,
+            op: OpKind::FullyConnected,
+            params: KernelParams::Fc(&SIMD_FC_1X16_PARAMS),
+            reference: Some(CompetitorBaseline {
+                name: "ESP-NN optimized (hello_world)",
+                cycles: None,
+                target_speedup_x100: None,
+                source: "plan composed-kernels Scope table (user-verified 2026-08-10): hello_world 10,314 → 4,675 cyc (2.2x). Measured Hematite row lands in T6.x (on-device).",
+            }),
+            note: "T3.6 hello_world first dense: input_dim 1 (<16, previously gated out) zero-padded to 16; non-zero input_offset fold over padded rows.",
+        },
+        KernelSpec {
+            name: "fc_s8 16row,1out off128 (hello_world FC3, T3.6)",
+            tier: MemoryTier::Sram,
+            op: OpKind::FullyConnected,
+            params: KernelParams::Fc(&SIMD_FC_16X1_PARAMS),
+            reference: None,
+            note: "T3.6 hello_world final dense: input_dim 16 (%16, no pad), output_dim 1.",
+        },
+        KernelSpec {
+            name: "fc_s8 8row,128out off128 (anomaly FC6, T3.6)",
+            tier: MemoryTier::Sram,
+            op: OpKind::FullyConnected,
+            params: KernelParams::Fc(&SIMD_FC_8X128_PARAMS),
+            reference: Some(CompetitorBaseline {
+                name: "ESP-NN optimized (anomaly_detect)",
+                cycles: None,
+                target_speedup_x100: None,
+                source: "plan composed-kernels Scope table (user-verified 2026-08-10): anomaly 28,550,253 → 7,758,145 cyc (3.7x). Measured Hematite row lands in T6.x (on-device).",
+            }),
+            note: "T3.6 anomaly_detect 6th dense (the only gated-out FC): input_dim 8 zero-padded to 16; non-zero input_offset fold over padded rows.",
+        },
+        KernelSpec {
+            name: "conv1x1_s8 1x1,3->16 (padded, T3.3)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Conv2d1x1,
+            params: KernelParams::Conv(&SIMD_CONV1X1_PAD_3CH_PARAMS),
+            reference: None,
+            note: "T3.3 first-conv family row: input_c 3 (<16, previously gated out) zero-padded to 16 in scratch; TIE728 11cn SIMD.",
+        },
+        KernelSpec {
+            name: "conv1x1_s8 1x1,3->16 off128 (padded, T3.3)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Conv2d1x1,
+            params: KernelParams::Conv(&SIMD_CONV1X1_PAD_3CH_OFF_PARAMS),
+            reference: None,
+            note: "T3.3 input_c 3 padded; non-zero input_offset fold over padded weight rows (Phase C).",
+        },
+        KernelSpec {
+            name: "conv1x1_s8 4x4,8->16 off128 (padded, T3.3)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Conv2d1x1,
+            params: KernelParams::Conv(&SIMD_CONV1X1_PAD_8CH_PARAMS),
+            reference: None,
+            note: "T3.3 input_c 8 padded; spatial 4×4 pixel loop over the staged padded input; input_offset fold.",
+        },
+        KernelSpec {
+            name: "conv1x1_s8 1x1,15->16 off5 (padded, T3.3)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Conv2d1x1,
+            params: KernelParams::Conv(&SIMD_CONV1X1_PAD_15CH_PARAMS),
+            reference: None,
+            note: "T3.3 input_c 15 (pad to 16), input_offset 5 fold.",
+        },
+        KernelSpec {
+            name: "conv1x1_s8 1x1,1->16 (padded, T3.3)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Conv2d1x1,
+            params: KernelParams::Conv(&SIMD_CONV1X1_PAD_1CH_PARAMS),
+            reference: None,
+            note: "T3.3 degenerate single-channel pointwise: input_c 1 padded to 16.",
+        },
+        KernelSpec {
+            name: "conv1x1_s8 2x2,17->16 (padded, T3.3)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Conv2d1x1,
+            params: KernelParams::Conv(&SIMD_CONV1X1_PAD_17CH_PARAMS),
+            reference: None,
+            note: "T3.3 input_c 17 (pad to 32), 2×2 spatial.",
+        },
+        KernelSpec {
+            name: "conv1x1_s8 1x1,32->16 (no-pad, T3.3)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Conv2d1x1,
+            params: KernelParams::Conv(&SIMD_CONV1X1_PAD_32CH_PARAMS),
+            reference: None,
+            note: "T3.3 no-pad control row: input_c 32 (%16) takes the strict direct path.",
         },
         KernelSpec {
             name: "depthwise_s8 12x12,16x3x3x16 S2 SAME (SIMD)",
@@ -754,12 +1850,86 @@ pub const fn kernel_specs() -> &'static [KernelSpec] {
             note: "Phase F non-%16 channel row: 12 channels zero-padded to 16 in scratch.",
         },
         KernelSpec {
-            name: "depthwise_s8 12x12,1x3x3x8 SAME dm8 (SIMD)",
+            name: "depthwise_s8 12x12,8x3x3x16 dm2 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::DepthwiseConv2d,
+            params: KernelParams::Depthwise(&SIMD_DEPTHWISE_DM2_PARAMS),
+            reference: None,
+            note: "T3.5 depth_multiplier=2 row: each input channel fans out to 2 output channels (replicated-input staging + per-channel requantize).",
+        },
+        KernelSpec {
+            name: "depthwise_s8 12x12,8x3x3x32 dm4 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::DepthwiseConv2d,
+            params: KernelParams::Depthwise(&SIMD_DEPTHWISE_DM4_PARAMS),
+            reference: None,
+            note: "T3.5 depth_multiplier=4 row: in_c 8 → out_c 32, 3×3 SAME.",
+        },
+        KernelSpec {
+            name: "depthwise_s8 12x12,8x3x3x64 dm8 (SIMD)",
             tier: MemoryTier::Sram,
             op: OpKind::DepthwiseConv2d,
             params: KernelParams::Depthwise(&SIMD_DEPTHWISE_DM8_PARAMS),
+            reference: Some(CompetitorBaseline {
+                name: "ESP-NN optimized (kws depthwise fan-out)",
+                cycles: None,
+                target_speedup_x100: None,
+                source: "plan composed-kernels Scope table (user-verified 2026-08-10): kws 12,983,503 → 1,059,889 cyc / 54 → 4 ms (12.3×); ESP-NN-relative bar = beat 1,059,889 cyc / 4 ms. Measured Hematite row lands in T6.x (on-device).",
+            }),
+            note: "T3.5 depth_multiplier=8 row — the KWS keyword-spotting fan-out shape family (dm=8).",
+        },
+        KernelSpec {
+            name: "depthwise_s8 kws 49x40,1x10x8x8 dm8 S2 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::DepthwiseConv2d,
+            params: KernelParams::Depthwise(&SIMD_DEPTHWISE_KWS_10X8_PARAMS),
+            reference: Some(CompetitorBaseline {
+                name: "ESP-NN optimized (kws real depthwise, s16 path)",
+                cycles: None,
+                target_speedup_x100: None,
+                source: "plan composed-kernels Scope table (user-verified 2026-08-10): kws 12,983,503 → 1,059,889 cyc / 54 → 4 ms (12.3×); ESP-NN-relative bar = beat 1,059,889 cyc / 4 ms. Measured Hematite row lands in T6.x (on-device).",
+            }),
+            note: "T3.5b the REAL kws depthwise (tflite-verified [1,10,8,8], 80 taps, stride 2, dm 8, input_offset +128): the tap-parameterized anytap kernel runs it in 3 chunked QACC passes (32+32+16) — SIMD ENGAGES.",
+        },
+        KernelSpec {
+            name: "depthwise_s8 12x12,8x5x5x8 dm1 S1 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::DepthwiseConv2d,
+            params: KernelParams::Depthwise(&SIMD_DEPTHWISE_5X5_DM1_PARAMS),
             reference: None,
-            note: "dm=8 broadcast row: input channel replicated 8x in padded virtual input (kws ch_mult=8).",
+            note: "T3.5b arbitrary 5×5 filter, dm=1, stride 1 SAME (25-tap anytap path).",
+        },
+        KernelSpec {
+            name: "depthwise_s8 12x12,1x5x5x8 dm8 S1 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::DepthwiseConv2d,
+            params: KernelParams::Depthwise(&SIMD_DEPTHWISE_5X5_DM8_PARAMS),
+            reference: None,
+            note: "T3.5b arbitrary 5×5 filter, dm=8 fan-out (in_c 1 → out_c 8), stride 1 SAME.",
+        },
+        KernelSpec {
+            name: "depthwise_s8 14x14,8x7x7x8 dm1 S2 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::DepthwiseConv2d,
+            params: KernelParams::Depthwise(&SIMD_DEPTHWISE_7X7_DM1_PARAMS),
+            reference: None,
+            note: "T3.5b arbitrary 7×7 filter, dm=1, stride 2 SAME (49-tap anytap path).",
+        },
+        KernelSpec {
+            name: "depthwise_s8 14x14,1x7x7x8 dm8 S2 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::DepthwiseConv2d,
+            params: KernelParams::Depthwise(&SIMD_DEPTHWISE_7X7_DM8_PARAMS),
+            reference: None,
+            note: "T3.5b arbitrary 7×7 filter, dm=8 fan-out (in_c 1 → out_c 8), stride 2 SAME.",
+        },
+        KernelSpec {
+            name: "depthwise_s8 12x12,8x3x5x16 dm2 S1 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::DepthwiseConv2d,
+            params: KernelParams::Depthwise(&SIMD_DEPTHWISE_3X5_DM2_PARAMS),
+            reference: None,
+            note: "T3.5b non-square 3×5 filter, dm=2 (in_c 8 → out_c 16), stride 1 SAME (15-tap anytap path).",
         },
         KernelSpec {
             name: "max_pool_s8 2x2x16 (SIMD)",
@@ -776,6 +1946,134 @@ pub const fn kernel_specs() -> &'static [KernelSpec] {
             params: KernelParams::Pool(&SIMD_AVGPOOL_32X32_PARAMS),
             reference: None,
             note: "TIE728 avg_pool2d_22c1 SIMD row: 2x2 stride2 VALID, channels 16.",
+        },
+        KernelSpec {
+            name: "avg_pool_s8 3x3 s1 p0 (T3.1 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::AvgPool,
+            params: KernelParams::Pool(&POOL_3X3_S1_VALID_PARAMS),
+            reference: None,
+            note: "T3.1 generic avg-pool: 3x3 stride-1 VALID (pad_total 0) — the hwc1 SIMD path engages on device; fixed-point vs ref documented in t31-pool.md.",
+        },
+        KernelSpec {
+            name: "max_pool_s8 3x3 s1 p0 (T3.1 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::MaxPool,
+            params: KernelParams::Pool(&POOL_3X3_S1_VALID_PARAMS),
+            reference: None,
+            note: "T3.1 generic max-pool: 3x3 stride-1 VALID — hwc1 SIMD engages; max semantics equal ref bit-exact.",
+        },
+        KernelSpec {
+            name: "avg_pool_s8 3x3 s1 p0 relu (T3.1 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::AvgPool,
+            params: KernelParams::Pool(&POOL_3X3_S1_VALID_RELU_PARAMS),
+            reference: None,
+            note: "T3.1 generic avg-pool with relu-range clamp (0..127) — the Rust clamp post-pass over the hwc1 output.",
+        },
+        KernelSpec {
+            name: "max_pool_s8 3x3 s1 p0 relu (T3.1 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::MaxPool,
+            params: KernelParams::Pool(&POOL_3X3_S1_VALID_RELU_PARAMS),
+            reference: None,
+            note: "T3.1 generic max-pool with relu-range clamp — hwc1 SIMD + clamp post-pass.",
+        },
+        KernelSpec {
+            name: "avg_pool_s8 3x3 s1 SAME (T3.1)",
+            tier: MemoryTier::Sram,
+            op: OpKind::AvgPool,
+            params: KernelParams::Pool(&POOL_3X3_S1_SAME_PARAMS),
+            reference: None,
+            note: "T3.1 widened shape (pad 1): model-verified on host (avg fixed-point vs ref documented in t31-pool.md); scalar on device — the pool backend delivers no scratch for spatial padding.",
+        },
+        KernelSpec {
+            name: "max_pool_s8 3x3 s1 SAME (T3.1)",
+            tier: MemoryTier::Sram,
+            op: OpKind::MaxPool,
+            params: KernelParams::Pool(&POOL_3X3_S1_SAME_PARAMS),
+            reference: None,
+            note: "T3.1 widened shape (pad 1): max model == ref bit-exact (host-verified); scalar on device.",
+        },
+        KernelSpec {
+            name: "avg_pool_s8 3x3 s2 SAME (T3.1)",
+            tier: MemoryTier::Sram,
+            op: OpKind::AvgPool,
+            params: KernelParams::Pool(&POOL_3X3_S2_SAME_PARAMS),
+            reference: None,
+            note: "T3.1 widened shape (asymmetric SAME, partial windows): model-verified on host; scalar on device.",
+        },
+        KernelSpec {
+            name: "max_pool_s8 3x3 s2 SAME (T3.1)",
+            tier: MemoryTier::Sram,
+            op: OpKind::MaxPool,
+            params: KernelParams::Pool(&POOL_3X3_S2_SAME_PARAMS),
+            reference: None,
+            note: "T3.1 widened shape (asymmetric SAME): max model == ref (host-verified); scalar on device.",
+        },
+        KernelSpec {
+            name: "avg_pool_s8 5x5 s1 SAME (T3.1)",
+            tier: MemoryTier::Sram,
+            op: OpKind::AvgPool,
+            params: KernelParams::Pool(&POOL_5X5_S1_SAME_PARAMS),
+            reference: None,
+            note: "T3.1 widened shape (5x5, pad 2): model-verified on host; scalar on device.",
+        },
+        KernelSpec {
+            name: "max_pool_s8 5x5 s1 SAME (T3.1)",
+            tier: MemoryTier::Sram,
+            op: OpKind::MaxPool,
+            params: KernelParams::Pool(&POOL_5X5_S1_SAME_PARAMS),
+            reference: None,
+            note: "T3.1 widened shape (5x5, pad 2): max model == ref (host-verified); scalar on device.",
+        },
+        KernelSpec {
+            name: "avg_pool_s8 5x5 s2 SAME (T3.1)",
+            tier: MemoryTier::Sram,
+            op: OpKind::AvgPool,
+            params: KernelParams::Pool(&POOL_5X5_S2_SAME_PARAMS),
+            reference: None,
+            note: "T3.1 widened shape (5x5 stride-2 SAME, pad 1): model-verified on host; scalar on device.",
+        },
+        KernelSpec {
+            name: "max_pool_s8 5x5 s2 SAME (T3.1)",
+            tier: MemoryTier::Sram,
+            op: OpKind::MaxPool,
+            params: KernelParams::Pool(&POOL_5X5_S2_SAME_PARAMS),
+            reference: None,
+            note: "T3.1 widened shape (5x5 stride-2 SAME): max model == ref (host-verified); scalar on device.",
+        },
+        KernelSpec {
+            name: "avg_pool_s8 7x7 global (T3.1 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::AvgPool,
+            params: KernelParams::Pool(&POOL_7X7_GLOBAL_PARAMS),
+            reference: None,
+            note: "T3.1 global avg-pool 7x7x16 (pad_total 0) — the hwc1 SIMD path on a 1x1 output.",
+        },
+        KernelSpec {
+            name: "max_pool_s8 7x7 global (T3.1 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::MaxPool,
+            params: KernelParams::Pool(&POOL_7X7_GLOBAL_PARAMS),
+            reference: None,
+            note: "T3.1 global max-pool 7x7x16 — hwc1 SIMD engages.",
+        },
+        KernelSpec {
+            name: "avg_pool_s8 3x3 s1 p0 c24 (T3.1 tail)",
+            tier: MemoryTier::Sram,
+            op: OpKind::AvgPool,
+            params: KernelParams::Pool(&POOL_3X3_S1_VALID_C24_PARAMS),
+            reference: None,
+            note: "T3.1 C%16 scalar tail (24 channels): host model-verified; scalar on device (device gate requires C % 16).",
+        },
+        KernelSpec {
+            name: "max_pool_s8 3x3 s1 p0 c24 (T3.1 tail)",
+            tier: MemoryTier::Sram,
+            op: OpKind::MaxPool,
+            params: KernelParams::Pool(&POOL_3X3_S1_VALID_C24_PARAMS),
+            reference: None,
+            note: "T3.1 C%16 scalar tail (24 channels): host model-verified; scalar on device.",
         },
         KernelSpec {
             name: "relu_s8 256 (SIMD)",
@@ -808,6 +2106,78 @@ pub const fn kernel_specs() -> &'static [KernelSpec] {
             params: KernelParams::Elementwise(&SIMD_SUB_256_PARAMS),
             reference: None,
             note: "TIE728 sub_w1_16_w2_16 SIMD row: identity contract, n=256.",
+        },
+        KernelSpec {
+            name: "add_s8 256 non-identity offsets (T3.2)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Add,
+            params: KernelParams::Elementwise(&SIMD_ADD_256_NONIDENTITY_PARAMS),
+            reference: None,
+            note: "T3.2 widened lane-model SIMD row: two-stage TFLM Add rounding (zps -5/3/1, left_shift 20, per-input multipliers, output requantize, clamped range). NOT identity-eligible — engages the 16-wide per-lane requantize model on device.",
+        },
+        KernelSpec {
+            name: "sub_s8 256 non-identity offsets (T3.2)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Sub,
+            params: KernelParams::Elementwise(&SIMD_SUB_256_NONIDENTITY_PARAMS),
+            reference: None,
+            note: "T3.2 widened lane-model SIMD row: same non-identity two-stage rounding shape as the ADD row.",
+        },
+        KernelSpec {
+            name: "mul_s8 256 non-identity offsets (T3.2)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Mul,
+            params: KernelParams::Elementwise(&SIMD_MUL_256_NONIDENTITY_PARAMS),
+            reference: None,
+            note: "T3.2 widened lane-model SIMD row: non-zero offsets + real product requantize (scale change). NOT identity-eligible — engages the 16-wide per-lane requantize model on device.",
+        },
+        KernelSpec {
+            name: "relu6_s8 256 (T3.2 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Relu6,
+            params: KernelParams::Activation(&SIMD_RELU6_256_PARAMS),
+            reference: None,
+            note: "T3.2 relu6 lane-model SIMD row: clamp to quantized_six = 24 (quantized_activation_max forwarded), zps -1/2. Vector min/max clamps in 16-wide lanes.",
+        },
+        KernelSpec {
+            name: "hard_swish_s8 256 (T3.2 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::HardSwish,
+            params: KernelParams::Activation(&SIMD_HARD_SWISH_256_PARAMS),
+            reference: None,
+            note: "T3.2 hard_swish lane-model SIMD row: DOWNGRADED integer rational formula (goldens-pinned, NOT the TFLM fixed-point chain); per-lane /6 scalar tail (no SIMD integer division on Xtensa).",
+        },
+        KernelSpec {
+            name: "fused_conv1x1_s8 4x4x16 residual+relu (T2.2)",
+            tier: MemoryTier::Sram,
+            op: OpKind::FusedConv2d,
+            params: KernelParams::FusedConv(&FUSED_CONV1X1_RESIDUAL_RELU_PARAMS),
+            reference: None,
+            note: "Composed conv1x1 + residual-ADD + ReLU in one pass (ACCX conv path; residual read in place, conv output register-held). The mv2 pointwise residual-block prototype.",
+        },
+        KernelSpec {
+            name: "fused_conv3x3_s8 6x6x8 residual+hardswish (T2.2)",
+            tier: MemoryTier::Sram,
+            op: OpKind::FusedConv2d,
+            params: KernelParams::FusedConv(&FUSED_CONV3X3_RESIDUAL_HSWISH_PARAMS),
+            reference: None,
+            note: "Composed 3x3 conv (non-%16 channels → channel-padded staging) + residual-ADD + HardSwish epilogue (downgraded integer formula).",
+        },
+        KernelSpec {
+            name: "fused_chain_s8 4op add+relu+mul+hardswish (T2.3)",
+            tier: MemoryTier::Sram,
+            op: OpKind::FusedElementwiseChain,
+            params: KernelParams::FusedChain(&FUSED_CHAIN_4OP_PARAMS),
+            reference: None,
+            note: "Composed elementwise chain (add+relu+mul+hard_swish, non-identity scales, n=256). On device today this chain runs the decomposition (hard_swish has no SIMD yet, T3.2 — chains SIMD-engage only when EVERY step is identity-eligible). The chain-runtime < sum-of-per-op-runtimes measurement is T6.x.",
+        },
+        KernelSpec {
+            name: "fused_pool_s8 4x4x16 avg+mulfold+relu (T2.4)",
+            tier: MemoryTier::Sram,
+            op: OpKind::FusedPoolFold,
+            params: KernelParams::FusedPool(&FUSED_POOL_FOLD_PARAMS),
+            reference: None,
+            note: "Composed avg-pool + identity MUL input fold + ReLU epilogue (T2.4). The fold is in the provably-exact subset (zero offsets, (1<<30, 0) output pair) so on device the fold SIMD-engages via the elementwise gates and the pool SIMD reads the staged scratch directly.",
         },
         KernelSpec {
             name: "softmax_s8 1x1000 (SIMD)",
@@ -861,6 +2231,38 @@ pub const fn kernel_specs() -> &'static [KernelSpec] {
             params: KernelParams::Pool(&AVGPOOL_7X7_1280_PARAMS),
             reference: None,
             note: "Global average pool, filter 7×7 stride 7.",
+        },
+        KernelSpec {
+            name: "mean_s8 7x7x1280 (mv2 global, T3.4 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Mean,
+            params: KernelParams::Reduce(&MV2_GLOBAL_MEAN_7X7_1280_PARAMS),
+            reference: None,
+            note: "MobileNetV2 global-average-pool MEAN: positions 49 (single position pass), in_c 1280 — the landed gate's in_c>256 limit that bit. The T3.4 looped accumulation folds staged channel passes into an in_c*4-byte accs buffer and requantizes once; SIMD-engages on device. FIRST mean per-kernel cycle baseline (plan T0.1 Item 3).",
+        },
+        KernelSpec {
+            name: "mean_s8 16x16x16 (T3.4 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Mean,
+            params: KernelParams::Reduce(&MEAN_16X16_16_PARAMS),
+            reference: None,
+            note: "positions 256, in_c 16 — single direct position/channel pass, identical to the landed 7b5ddc8 in-limit behavior (regression control); SIMD-engages on device.",
+        },
+        KernelSpec {
+            name: "mean_s8 32x32x64 (T3.4 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Mean,
+            params: KernelParams::Reduce(&MEAN_32X32_64_PARAMS),
+            reference: None,
+            note: "positions 1024 > 256 — chunked into 4 position passes folded into the accs buffer; in_c 64 (single direct channel pass); SIMD-engages on device.",
+        },
+        KernelSpec {
+            name: "mean_s8 1x1x1280 (T3.4 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Mean,
+            params: KernelParams::Reduce(&MEAN_1X1_1280_PARAMS),
+            reference: None,
+            note: "positions 1, in_c 1280 > 256 — the single-position in_c>256 case: staged channel passes accumulate into the 5 KB accs buffer; SIMD-engages on device.",
         },
     ]
 }
@@ -926,7 +2328,7 @@ pub fn layout(spec: &KernelSpec) -> SpecLayout {
         // Relu acts on a single flat int8 tensor: input_len == output_len,
         // no weights or bias. The element count is carried in the spec name
         // but the slices' lengths are what the kernel validates.
-        KernelParams::Activation(p) => {
+        KernelParams::Activation(_p) => {
             // Relu has no num_elements field — the caller's input slice
             // length drives the kernel; the spec row fixes it at 256 for
             // SIMD eligibility. We encode it via a fixed constant.
@@ -948,6 +2350,65 @@ pub fn layout(spec: &KernelSpec) -> SpecLayout {
             output_len: p.num_elements as usize,
             transform_len: 0,
         },
+        // The fused conv consumes the anchor conv's input/weights/bias and
+        // produces the conv output shape. The residual is a const tensor
+        // embedded in the params — no buffer region needed. transform_len 0:
+        // the fused ACCX path reads the RAW `[oc][ic]` weights (no TIE728
+        // 11cn/33cn permutation).
+        KernelParams::FusedConv(p) => SpecLayout {
+            input_len: shape_product(&p.conv.input_shape),
+            weights_len: shape_product(&p.conv.filter_shape),
+            bias_len: p.conv.filter_shape[0] as usize,
+            output_len: shape_product(&p.conv.output_shape),
+            transform_len: 0,
+        },
+        // The fused elementwise chain consumes a single flat int8 input
+        // (`src`, `num_elements` elements) and produces `num_elements` i8
+        // outputs. The step operands are model constant tensors embedded in
+        // the params — no buffer region needed (same as the fused-conv
+        // residual).
+        KernelParams::FusedChain(p) => SpecLayout {
+            input_len: p.num_elements as usize,
+            weights_len: 0,
+            bias_len: 0,
+            output_len: p.num_elements as usize,
+            transform_len: 0,
+        },
+        // The composed pool-fold consumes the anchor pool's input and produces
+        // the pool output shape. The fold operand is a const tensor embedded
+        // in the params — no buffer region needed (same as the fused-conv
+        // residual and the chain operands).
+        KernelParams::FusedPool(p) => SpecLayout {
+            input_len: shape_product(&p.pool.input_shape),
+            weights_len: 0,
+            bias_len: 0,
+            output_len: shape_product(&p.pool.output_shape),
+            transform_len: 0,
+        },
+        // The mean consumes the reduction input and produces the reduced
+        // output (no weights or bias — mean keeps channels, so output_len is
+        // the channel count).
+        KernelParams::Reduce(p) => SpecLayout {
+            input_len: shape_product(&p.input_shape),
+            weights_len: 0,
+            bias_len: 0,
+            output_len: shape_product(&p.output_shape),
+            transform_len: 0,
+        },
+    }
+}
+
+/// Scratch bytes a spec's kernel needs at runtime (host tests allocate
+/// exactly this much). 0 for every row except the composed pool-fold, whose
+/// decomposition stages the absorbed fold into scratch
+/// (`fused_pool_with_fold_scratch_need` — the codegen `emit_fused_pool_fold`
+/// value).
+pub fn spec_scratch_need(spec: &KernelSpec) -> usize {
+    match &spec.params {
+        KernelParams::FusedPool(p) => {
+            hematite_s3::backend::fused_pool_with_fold_scratch_need(p)
+        }
+        _ => 0,
     }
 }
 
@@ -1144,6 +2605,14 @@ pub fn run_kernel(spec: &KernelSpec, bufs: &mut SpecBufs<'_>, scratch: &mut [u8]
             let p = params_activation(spec);
             hematite_s3::activations::relu(bufs.input, p, bufs.output, scratch)
         }
+        OpKind::Relu6 => {
+            let p = params_activation(spec);
+            hematite_s3::activations::relu6(bufs.input, p, bufs.output, scratch, p.quantized_activation_max)
+        }
+        OpKind::HardSwish => {
+            let p = params_activation(spec);
+            hematite_s3::activations::hard_swish(bufs.input, p, bufs.output, scratch)
+        }
         OpKind::Add => {
             let p = params_elementwise(spec);
             hematite_s3::elementwise::add(bufs.input, bufs.weights, p, bufs.output, scratch)
@@ -1155,6 +2624,31 @@ pub fn run_kernel(spec: &KernelSpec, bufs: &mut SpecBufs<'_>, scratch: &mut [u8]
         OpKind::Sub => {
             let p = params_elementwise(spec);
             hematite_s3::elementwise::sub(bufs.input, bufs.weights, p, bufs.output, scratch)
+        }
+        OpKind::FusedConv2d => {
+            let p = params_fused_conv(spec);
+            let mut backend = hematite_s3::backend::S3Backend;
+            hematite_core::FusedKernelBackend::fused_conv2d(
+                &mut backend, bufs.input, bufs.weights, bufs.bias, p, bufs.output, scratch,
+            )
+        }
+        OpKind::FusedElementwiseChain => {
+            let p = params_fused_chain(spec);
+            let mut backend = hematite_s3::backend::S3Backend;
+            hematite_core::FusedKernelBackend::fused_elementwise_chain(
+                &mut backend, bufs.input, p, bufs.output,
+            )
+        }
+        OpKind::FusedPoolFold => {
+            let p = params_fused_pool(spec);
+            let mut backend = hematite_s3::backend::S3Backend;
+            hematite_core::FusedKernelBackend::fused_pool_with_fold(
+                &mut backend, bufs.input, p, bufs.output, scratch,
+            )
+        }
+        OpKind::Mean => {
+            let p = params_reduce(spec);
+            hematite_s3::reductions::mean(bufs.input, p, bufs.output)
         }
     }
 }
@@ -1308,6 +2802,20 @@ fn run_kernel_scalar(
             };
             hematite_s3::activations::relu(bufs.input, p, bufs.output, scratch)
         }
+        OpKind::Relu6 => {
+            let p = match spec.params {
+                KernelParams::Activation(p) => p,
+                _ => return Err(KernelError::Unsupported),
+            };
+            hematite_s3::activations::relu6(bufs.input, p, bufs.output, scratch, p.quantized_activation_max)
+        }
+        OpKind::HardSwish => {
+            let p = match spec.params {
+                KernelParams::Activation(p) => p,
+                _ => return Err(KernelError::Unsupported),
+            };
+            hematite_s3::activations::hard_swish(bufs.input, p, bufs.output, scratch)
+        }
         OpKind::Add => {
             let p = match spec.params {
                 KernelParams::Elementwise(p) => p,
@@ -1328,6 +2836,43 @@ fn run_kernel_scalar(
                 _ => return Err(KernelError::Unsupported),
             };
             hematite_s3::elementwise::sub(bufs.input, bufs.weights, p, bufs.output, scratch)
+        }
+        OpKind::FusedConv2d => {
+            let p = match spec.params {
+                KernelParams::FusedConv(p) => p,
+                _ => return Err(KernelError::Unsupported),
+            };
+            let mut backend = hematite_s3::backend::S3Backend;
+            hematite_core::FusedKernelBackend::fused_conv2d(
+                &mut backend, bufs.input, bufs.weights, bufs.bias, p, bufs.output, scratch,
+            )
+        }
+        OpKind::FusedElementwiseChain => {
+            let p = match spec.params {
+                KernelParams::FusedChain(p) => p,
+                _ => return Err(KernelError::Unsupported),
+            };
+            let mut backend = hematite_s3::backend::S3Backend;
+            hematite_core::FusedKernelBackend::fused_elementwise_chain(
+                &mut backend, bufs.input, p, bufs.output,
+            )
+        }
+        OpKind::FusedPoolFold => {
+            let p = match spec.params {
+                KernelParams::FusedPool(p) => p,
+                _ => return Err(KernelError::Unsupported),
+            };
+            let mut backend = hematite_s3::backend::S3Backend;
+            hematite_core::FusedKernelBackend::fused_pool_with_fold(
+                &mut backend, bufs.input, p, bufs.output, scratch,
+            )
+        }
+        OpKind::Mean => {
+            let p = match spec.params {
+                KernelParams::Reduce(p) => p,
+                _ => return Err(KernelError::Unsupported),
+            };
+            hematite_s3::reductions::mean(bufs.input, p, bufs.output)
         }
     }
 }
@@ -1374,6 +2919,13 @@ pub fn prepare_kernel(spec: &KernelSpec) -> Result<PreparedKernel, KernelError> 
             )),
             _ => Err(KernelError::Unsupported),
         },
+        // relu6/hard_swish have no prepared handle: the public `relu6`/
+        // `hard_swish` kernels dispatch the T3.2 widened lane model
+        // internally (via S3Backend), so the Scalar slot runs them.
+        OpKind::Relu6 | OpKind::HardSwish => match spec.params {
+            KernelParams::Activation(_) => Ok(PreparedKernel::Scalar),
+            _ => Err(KernelError::Unsupported),
+        },
         OpKind::Add => match spec.params {
             KernelParams::Elementwise(p) => Ok(PreparedKernel::Add(
                 hematite_s3::elementwise::PreparedAdd::new(p)?,
@@ -1396,6 +2948,34 @@ pub fn prepare_kernel(spec: &KernelSpec) -> Result<PreparedKernel, KernelError> 
             KernelParams::Depthwise(p) => Ok(PreparedKernel::Depthwise(
                 hematite_s3::depthwise::PreparedDepthwise::new(p)?,
             )),
+            _ => Err(KernelError::Unsupported),
+        },
+        // The fused conv has no prepared handle: `fused_conv2d` internally
+        // dispatches the anchor conv's ACCX SIMD path (via S3Backend), so the
+        // Scalar slot (which runs the public trait method) gets SIMD on device.
+        OpKind::FusedConv2d => match spec.params {
+            KernelParams::FusedConv(_) => Ok(PreparedKernel::Scalar),
+            _ => Err(KernelError::Unsupported),
+        },
+        // The fused chain has no prepared handle either: `fused_elementwise_chain`
+        // internally dispatches the register-held chain SIMD path (via
+        // S3Backend), so the Scalar slot runs the public trait method.
+        OpKind::FusedElementwiseChain => match spec.params {
+            KernelParams::FusedChain(_) => Ok(PreparedKernel::Scalar),
+            _ => Err(KernelError::Unsupported),
+        },
+        // The fused pool-fold has no prepared handle either: `fused_pool_with_fold`
+        // internally dispatches the fold elementwise SIMD + the pool SIMD (via
+        // S3Backend), so the Scalar slot runs the public trait method.
+        OpKind::FusedPoolFold => match spec.params {
+            KernelParams::FusedPool(_) => Ok(PreparedKernel::Scalar),
+            _ => Err(KernelError::Unsupported),
+        },
+        // The mean has no prepared handle either: `reductions::mean` internally
+        // dispatches the looped-accumulation SIMD path (via the accx-style
+        // dispatch), so the Scalar slot runs the public function.
+        OpKind::Mean => match spec.params {
+            KernelParams::Reduce(_) => Ok(PreparedKernel::Scalar),
             _ => Err(KernelError::Unsupported),
         },
         OpKind::Softmax => Ok(PreparedKernel::Scalar),
@@ -1451,6 +3031,37 @@ fn params_elementwise(spec: &KernelSpec) -> &'static ElementwiseParams {
         _ => panic!("spec.op elementwise requires KernelParams::Elementwise"),
     }
 }
+#[cfg(target_arch = "xtensa")]
+fn params_fused_conv(spec: &KernelSpec) -> &'static FusedConvParams<'static> {
+    match spec.params {
+        KernelParams::FusedConv(p) => p,
+        _ => panic!("spec.op fused_conv2d requires KernelParams::FusedConv"),
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
+fn params_fused_chain(spec: &KernelSpec) -> &'static ElementwiseChainParams<'static> {
+    match spec.params {
+        KernelParams::FusedChain(p) => p,
+        _ => panic!("spec.op fused_elementwise_chain requires KernelParams::FusedChain"),
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
+fn params_fused_pool(spec: &KernelSpec) -> &'static FoldedPoolParams<'static> {
+    match spec.params {
+        KernelParams::FusedPool(p) => p,
+        _ => panic!("spec.op fused_pool_with_fold requires KernelParams::FusedPool"),
+    }
+}
+
+#[cfg(target_arch = "xtensa")]
+fn params_reduce(spec: &KernelSpec) -> &'static ReduceParams {
+    match spec.params {
+        KernelParams::Reduce(p) => p,
+        _ => panic!("spec.op mean requires KernelParams::Reduce"),
+    }
+}
 
 /// Dispatch a spec through the matching `hematite-ref` scalar kernel — the
 /// column-1 baseline, measured on device (never a pre-filled number).
@@ -1493,6 +3104,14 @@ pub fn run_ref_kernel(
             let p = params_activation(spec);
             hematite_ref::activation::relu(bufs.input, p, bufs.output, scratch)
         }
+        OpKind::Relu6 => {
+            let p = params_activation(spec);
+            hematite_ref::activation::relu6(bufs.input, p, bufs.output, scratch, p.quantized_activation_max)
+        }
+        OpKind::HardSwish => {
+            let p = params_activation(spec);
+            hematite_ref::activation::hard_swish(bufs.input, p, bufs.output, scratch)
+        }
         OpKind::Add => {
             let p = params_elementwise(spec);
             hematite_ref::elementwise::add(bufs.input, bufs.weights, p, bufs.output, scratch)
@@ -1504,6 +3123,31 @@ pub fn run_ref_kernel(
         OpKind::Sub => {
             let p = params_elementwise(spec);
             hematite_ref::elementwise::sub(bufs.input, bufs.weights, p, bufs.output, scratch)
+        }
+        OpKind::FusedConv2d => {
+            let p = params_fused_conv(spec);
+            let mut backend = hematite_ref::RefBackend;
+            hematite_core::FusedKernelBackend::fused_conv2d(
+                &mut backend, bufs.input, bufs.weights, bufs.bias, p, bufs.output, scratch,
+            )
+        }
+        OpKind::FusedElementwiseChain => {
+            let p = params_fused_chain(spec);
+            let mut backend = hematite_ref::RefBackend;
+            hematite_core::FusedKernelBackend::fused_elementwise_chain(
+                &mut backend, bufs.input, p, bufs.output,
+            )
+        }
+        OpKind::FusedPoolFold => {
+            let p = params_fused_pool(spec);
+            let mut backend = hematite_ref::RefBackend;
+            hematite_core::FusedKernelBackend::fused_pool_with_fold(
+                &mut backend, bufs.input, p, bufs.output, scratch,
+            )
+        }
+        OpKind::Mean => {
+            let p = params_reduce(spec);
+            hematite_ref::reductions::mean(bufs.input, p, bufs.output)
         }
     }
 }
@@ -1572,6 +3216,20 @@ mod tests {
                 };
                 hematite_s3::activations::relu(bufs.input, p, bufs.output, scratch)
             }
+            OpKind::Relu6 => {
+                let p = match spec.params {
+                    KernelParams::Activation(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                hematite_s3::activations::relu6(bufs.input, p, bufs.output, scratch, p.quantized_activation_max)
+            }
+            OpKind::HardSwish => {
+                let p = match spec.params {
+                    KernelParams::Activation(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                hematite_s3::activations::hard_swish(bufs.input, p, bufs.output, scratch)
+            }
             OpKind::Add => {
                 let p = match spec.params {
                     KernelParams::Elementwise(p) => p,
@@ -1592,6 +3250,43 @@ mod tests {
                     _ => return Err("op/params mismatch".into()),
                 };
                 hematite_s3::elementwise::sub(bufs.input, bufs.weights, p, bufs.output, scratch)
+            }
+            OpKind::FusedConv2d => {
+                let p = match spec.params {
+                    KernelParams::FusedConv(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                let mut backend = hematite_s3::backend::S3Backend;
+                hematite_core::FusedKernelBackend::fused_conv2d(
+                    &mut backend, bufs.input, bufs.weights, bufs.bias, p, bufs.output, scratch,
+                )
+            }
+            OpKind::FusedElementwiseChain => {
+                let p = match spec.params {
+                    KernelParams::FusedChain(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                let mut backend = hematite_s3::backend::S3Backend;
+                hematite_core::FusedKernelBackend::fused_elementwise_chain(
+                    &mut backend, bufs.input, p, bufs.output,
+                )
+            }
+            OpKind::FusedPoolFold => {
+                let p = match spec.params {
+                    KernelParams::FusedPool(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                let mut backend = hematite_s3::backend::S3Backend;
+                hematite_core::FusedKernelBackend::fused_pool_with_fold(
+                    &mut backend, bufs.input, p, bufs.output, scratch,
+                )
+            }
+            OpKind::Mean => {
+                let p = match spec.params {
+                    KernelParams::Reduce(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                hematite_s3::reductions::mean(bufs.input, p, bufs.output)
             }
         };
         let out_after = bufs.output.to_vec();
@@ -1656,6 +3351,20 @@ mod tests {
                 };
                 hematite_ref::activation::relu(bufs.input, p, bufs.output, scratch)
             }
+            OpKind::Relu6 => {
+                let p = match spec.params {
+                    KernelParams::Activation(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                hematite_ref::activation::relu6(bufs.input, p, bufs.output, scratch, p.quantized_activation_max)
+            }
+            OpKind::HardSwish => {
+                let p = match spec.params {
+                    KernelParams::Activation(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                hematite_ref::activation::hard_swish(bufs.input, p, bufs.output, scratch)
+            }
             OpKind::Add => {
                 let p = match spec.params {
                     KernelParams::Elementwise(p) => p,
@@ -1676,6 +3385,43 @@ mod tests {
                     _ => return Err("op/params mismatch".into()),
                 };
                 hematite_ref::elementwise::sub(bufs.input, bufs.weights, p, bufs.output, scratch)
+            }
+            OpKind::FusedConv2d => {
+                let p = match spec.params {
+                    KernelParams::FusedConv(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                let mut backend = hematite_ref::RefBackend;
+                hematite_core::FusedKernelBackend::fused_conv2d(
+                    &mut backend, bufs.input, bufs.weights, bufs.bias, p, bufs.output, scratch,
+                )
+            }
+            OpKind::FusedElementwiseChain => {
+                let p = match spec.params {
+                    KernelParams::FusedChain(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                let mut backend = hematite_ref::RefBackend;
+                hematite_core::FusedKernelBackend::fused_elementwise_chain(
+                    &mut backend, bufs.input, p, bufs.output,
+                )
+            }
+            OpKind::FusedPoolFold => {
+                let p = match spec.params {
+                    KernelParams::FusedPool(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                let mut backend = hematite_ref::RefBackend;
+                hematite_core::FusedKernelBackend::fused_pool_with_fold(
+                    &mut backend, bufs.input, p, bufs.output, scratch,
+                )
+            }
+            OpKind::Mean => {
+                let p = match spec.params {
+                    KernelParams::Reduce(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                hematite_ref::reductions::mean(bufs.input, p, bufs.output)
             }
         };
         let out_after = bufs.output.to_vec();
@@ -1701,7 +3447,7 @@ mod tests {
             let mut bias = vec![0i32; lay.bias_len];
             let mut output = vec![0i8; lay.output_len];
             let mut transformed = vec![0i8; lay.transform_len];
-            let mut scratch = vec![0u8; 0];
+            let mut scratch = vec![0u8; spec_scratch_need(spec)];
             {
                 let mut bufs = SpecBufs {
                     input: &mut input,
@@ -1734,7 +3480,7 @@ mod tests {
             let mut bias = vec![0i32; lay.bias_len];
             let mut output = vec![0i8; lay.output_len];
             let mut transformed = vec![0i8; lay.transform_len];
-            let mut scratch = vec![0u8; 0];
+            let mut scratch = vec![0u8; spec_scratch_need(spec)];
             {
                 let mut bufs = SpecBufs {
                     input: &mut input,
@@ -1781,7 +3527,7 @@ mod tests {
             let mut bias = vec![0i32; lay.bias_len];
             let mut output = vec![0i8; lay.output_len];
             let mut transformed = vec![0i8; lay.transform_len];
-            let mut scratch = vec![0u8; 0];
+            let mut scratch = vec![0u8; spec_scratch_need(spec)];
             {
                 let mut bufs = SpecBufs {
                     input: &mut input,
@@ -1796,6 +3542,7 @@ mod tests {
 
                 // Only rows the ACCX gate accepts are SIMD-eligible weighted
                 // ops; the emulation must mirror the asm for exactly those.
+                let is_depthwise = matches!(spec.params, KernelParams::Depthwise(_));
                 let (in_c, out_c, taps) = match &spec.params {
                     KernelParams::Conv(p) if p.filter_shape[1] == 1 && p.filter_shape[2] == 1 => {
                         (p.filter_shape[3] as usize, p.filter_shape[0] as usize, 1)
@@ -1806,9 +3553,42 @@ mod tests {
                     KernelParams::Fc(p) => {
                         (p.input_dim as usize, p.output_dim as usize, 1)
                     }
+                    KernelParams::Depthwise(p) => {
+                        (
+                            p.input_shape[3] as usize,
+                            p.output_shape[3] as usize,
+                            (p.filter_shape[1].max(1) * p.filter_shape[2].max(1)) as usize,
+                        )
+                    }
                     _ => continue,
                 };
-                if !(in_c >= 16 && in_c % 16 == 0 && out_c >= 1) {
+                let eligible = if is_depthwise {
+                    match &spec.params {
+                        KernelParams::Depthwise(p) => {
+                            in_c >= 1
+                                && out_c >= 1
+                                && out_c == in_c * p.depth_multiplier.max(1) as usize
+                        }
+                        _ => unreachable!(),
+                    }
+                } else {
+                    match &spec.params {
+                        // T3.6 — FC accepts any input_dim >= 1: small /
+                        // non-16 input dims are zero-padded in scratch.
+                        KernelParams::Fc(_) => in_c >= 1 && out_c >= 1,
+                        // T3.3 — 1×1 convs accept any in_c >= 1: non-%16
+                        // input channels are zero-padded in scratch (the
+                        // strict `% 16` gate stays the direct path; this
+                        // widened gate feeds the padded emulation below).
+                        KernelParams::Conv(p)
+                            if p.filter_shape[1] == 1 && p.filter_shape[2] == 1 =>
+                        {
+                            in_c >= 1 && out_c >= 1
+                        }
+                        _ => in_c >= 16 && in_c % 16 == 0 && out_c >= 1,
+                    }
+                };
+                if !eligible {
                     continue;
                 }
                 let mut emu = vec![0i8; lay.output_len];
@@ -1822,43 +3602,208 @@ mod tests {
                         let stride_w = p.stride_width as usize;
                         let dil_h = p.dilation_height_factor as usize;
                         let dil_w = p.dilation_width_factor as usize;
-                        // Mirror the dispatch's SAME-pad derivation (same formula
-                        // as conv3x3.rs conv3x3_accx_dispatch). The ACCX kernel
-                        // runs on a zero-padded copy, so out-of-padded-bounds taps
-                        // contribute 0 — equivalent to skipping them here.
+                        // T3.3 — 1×1 convs with non-%16 input channels: the
+                        // SIMD dispatch stages a zero-padded input copy (each
+                        // NHWC pixel padded to `padded_c`) AND zero-padded
+                        // weight rows, runs the kernel on the padded buffers,
+                        // then folds `input_offset` via weight sums over the
+                        // padded rows. Padded lanes contribute 0×0 = 0 — this
+                        // equals the scalar `Σ (in + off)·w` exactly. Mirror
+                        // the pad-in-scratch here.
+                        let is_1x1_padded =
+                            p.filter_shape[1] == 1 && p.filter_shape[2] == 1 && in_c % 16 != 0;
+                        if is_1x1_padded {
+                            let padded_c = in_c.div_ceil(16) * 16;
+                            for oh in 0..out_h {
+                                for ow in 0..out_w {
+                                    let pixel = oh * in_w + ow;
+                                    for oc in 0..out_c {
+                                        let mut raw: i64 = 0;
+                                        let mut wsum: i64 = 0;
+                                        for ic in 0..padded_c {
+                                            let w = if ic < in_c {
+                                                bufs.weights[oc * in_c + ic] as i64
+                                            } else {
+                                                0
+                                            };
+                                            let x = if ic < in_c {
+                                                bufs.input[pixel * in_c + ic] as i64
+                                            } else {
+                                                0
+                                            };
+                                            raw += x * w;
+                                            wsum += w;
+                                        }
+                                        let acc = raw + p.input_offset as i64 * wsum;
+                                        let acc32 = (bufs.bias[oc] as i64 + acc).clamp(
+                                            i32::MIN as i64,
+                                            i32::MAX as i64,
+                                        ) as i32;
+                                        let scaled = multiply_by_quantized_multiplier(
+                                            acc32,
+                                            p.output_multiplier_per_channel[oc],
+                                            p.output_shift_per_channel[oc],
+                                        );
+                                        let clamped = (scaled + p.output_offset).clamp(
+                                            p.quantized_activation_min,
+                                            p.quantized_activation_max,
+                                        );
+                                        emu[(oh * out_w + ow) * out_c + oc] =
+                                            saturating_cast(clamped);
+                                    }
+                                }
+                            }
+                        } else {
+                            // Mirror the dispatch's SAME-pad derivation (same formula
+                            // as conv3x3.rs conv3x3_accx_dispatch). The ACCX kernel
+                            // runs on a zero-padded copy, so out-of-padded-bounds taps
+                            // contribute 0 — equivalent to skipping them here.
+                            let dilated_h =
+                                (p.filter_shape[1] - 1) * p.dilation_height_factor + 1;
+                            let dilated_w =
+                                (p.filter_shape[2] - 1) * p.dilation_width_factor + 1;
+                            let pad_h = (((out_h as i32 - 1) * p.stride_height + dilated_h
+                                - p.input_shape[1])
+                                / 2)
+                                .max(0) as usize;
+                            let pad_w = (((out_w as i32 - 1) * p.stride_width + dilated_w
+                                - p.input_shape[2])
+                                / 2)
+                                .max(0) as usize;
+                            for oh in 0..out_h {
+                                for ow in 0..out_w {
+                                    for oc in 0..out_c {
+                                        let mut acc: i64 = 0;
+                                        for tap in 0..taps {
+                                            let (kh, kw) = if taps == 9 {
+                                                (tap / 3, tap % 3)
+                                            } else {
+                                                (0, 0)
+                                            };
+                                            let ih =
+                                                (oh * stride_h + kh * dil_h) as i32 - pad_h as i32;
+                                            let iw =
+                                                (ow * stride_w + kw * dil_w) as i32 - pad_w as i32;
+                                            if ih < 0
+                                                || iw < 0
+                                                || ih as usize >= in_h
+                                                || iw as usize >= in_w
+                                            {
+                                                continue;
+                                            }
+                                            let ih = ih as usize;
+                                            let iw = iw as usize;
+                                            for ic in 0..in_c {
+                                                let in_idx = (ih * in_w + iw) * in_c + ic;
+                                                // RAW [oc][tap][ic] — asm filter[(oc*taps+tap)*in_c+ic]
+                                                let w_idx = (oc * taps + tap) * in_c + ic;
+                                                acc += bufs.weights[w_idx] as i64
+                                                    * (bufs.input[in_idx] as i64
+                                                        + p.input_offset as i64);
+                                            }
+                                        }
+                                        let acc32 = (bufs.bias[oc] as i64 + acc).clamp(
+                                            i32::MIN as i64,
+                                            i32::MAX as i64,
+                                        ) as i32;
+                                        let scaled = multiply_by_quantized_multiplier(
+                                            acc32,
+                                            p.output_multiplier_per_channel[oc],
+                                            p.output_shift_per_channel[oc],
+                                        );
+                                        let clamped = (scaled + p.output_offset).clamp(
+                                            p.quantized_activation_min,
+                                            p.quantized_activation_max,
+                                        );
+                                        emu[(oh * out_w + ow) * out_c + oc] =
+                                            saturating_cast(clamped);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    KernelParams::Fc(p) => {
+                        // T3.6 — mirror the dispatch's pad-in-scratch: for
+                        // input_dim % 16 != 0 the SIMD kernel runs on a
+                        // zero-padded input (real lanes then zeros) and
+                        // zero-padded weight rows (pad lanes zero), then the
+                        // input_offset fold reads weight sums over the padded
+                        // rows. Padded lanes contribute 0×0 = 0 — this equals
+                        // the scalar `Σ (in + off)·w` exactly.
+                        let padded_dim = in_c.div_ceil(16) * 16;
+                        for oc in 0..out_c {
+                            let mut raw: i64 = 0;
+                            let mut wsum: i64 = 0;
+                            for ic in 0..padded_dim {
+                                let w = if ic < in_c {
+                                    bufs.weights[oc * in_c + ic] as i64
+                                } else {
+                                    0
+                                };
+                                let x = if ic < in_c { bufs.input[ic] as i64 } else { 0 };
+                                raw += x * w;
+                                wsum += w;
+                            }
+                            let acc = raw + p.input_offset as i64 * wsum;
+                            let acc32 = (bufs.bias[oc] as i64 + acc)
+                                .clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+                            let scaled = multiply_by_quantized_multiplier(
+                                acc32,
+                                p.output_multiplier_per_channel[oc],
+                                p.output_shift_per_channel[oc],
+                            );
+                            let clamped = (scaled + p.output_offset).clamp(
+                                p.quantized_activation_min,
+                                p.quantized_activation_max,
+                            );
+                            emu[oc] = saturating_cast(clamped);
+                        }
+                    }
+                    KernelParams::Depthwise(p) => {
+                        // TFLM depthwise fan-out (T3.5): output channel
+                        // `oc = i*dm + j` reads input channel `i`; weights are
+                        // HWCN [tap][out_c], so `w_idx = tap*out_c + oc`. The
+                        // SIMD dispatch stages a replicated input so the
+                        // per-lane kernel contract equals this accumulation.
+                        let in_h = p.input_shape[1] as usize;
+                        let in_w = p.input_shape[2] as usize;
+                        let out_h = p.output_shape[1] as usize;
+                        let out_w = p.output_shape[2] as usize;
+                        let dm = p.depth_multiplier.max(1) as usize;
+                        let fw = p.filter_shape[2].max(1) as usize;
+                        let stride_h = p.stride_height as usize;
+                        let stride_w = p.stride_width as usize;
                         let dilated_h = (p.filter_shape[1] - 1) * p.dilation_height_factor + 1;
                         let dilated_w = (p.filter_shape[2] - 1) * p.dilation_width_factor + 1;
-                        let pad_h = (((out_h as i32 - 1) * p.stride_height + dilated_h - p.input_shape[1])
+                        let pad_h = (((out_h as i32 - 1) * p.stride_height + dilated_h
+                            - p.input_shape[1])
                             / 2)
                             .max(0) as usize;
-                        let pad_w = (((out_w as i32 - 1) * p.stride_width + dilated_w - p.input_shape[2])
+                        let pad_w = (((out_w as i32 - 1) * p.stride_width + dilated_w
+                            - p.input_shape[2])
                             / 2)
                             .max(0) as usize;
                         for oh in 0..out_h {
                             for ow in 0..out_w {
+                                #[allow(clippy::needless_range_loop)]
                                 for oc in 0..out_c {
+                                    let ic = oc / dm;
                                     let mut acc: i64 = 0;
                                     for tap in 0..taps {
-                                        let (kh, kw) = if taps == 9 {
-                                            (tap / 3, tap % 3)
-                                        } else {
-                                            (0, 0)
-                                        };
-                                        let ih = (oh * stride_h + kh * dil_h) as i32 - pad_h as i32;
-                                        let iw = (ow * stride_w + kw * dil_w) as i32 - pad_w as i32;
-                                        if ih < 0 || iw < 0 || ih as usize >= in_h || iw as usize >= in_w
+                                        let (kh, kw) = (tap / fw, tap % fw);
+                                        let ih = (oh * stride_h + kh) as i32 - pad_h as i32;
+                                        let iw = (ow * stride_w + kw) as i32 - pad_w as i32;
+                                        if ih < 0
+                                            || iw < 0
+                                            || ih as usize >= in_h
+                                            || iw as usize >= in_w
                                         {
                                             continue;
                                         }
-                                        let ih = ih as usize;
-                                        let iw = iw as usize;
-                                        for ic in 0..in_c {
-                                            let in_idx = (ih * in_w + iw) * in_c + ic;
-                                            // RAW [oc][tap][ic] — asm filter[(oc*taps+tap)*in_c+ic]
-                                            let w_idx = (oc * taps + tap) * in_c + ic;
-                                            acc += bufs.weights[w_idx] as i64
-                                                * (bufs.input[in_idx] as i64 + p.input_offset as i64);
-                                        }
+                                        let in_idx = (ih as usize * in_w + iw as usize) * in_c + ic;
+                                        let w_idx = tap * out_c + oc;
+                                        acc += bufs.weights[w_idx] as i64
+                                            * (bufs.input[in_idx] as i64 + p.input_offset as i64);
                                     }
                                     let acc32 = (bufs.bias[oc] as i64 + acc).clamp(
                                         i32::MIN as i64,
@@ -1876,29 +3821,6 @@ mod tests {
                                     emu[(oh * out_w + ow) * out_c + oc] = saturating_cast(clamped);
                                 }
                             }
-                        }
-                    }
-                    KernelParams::Fc(p) => {
-                        for oc in 0..out_c {
-                            let mut acc: i64 = 0;
-                            for ic in 0..in_c {
-                                // RAW [oc][ic] — asm filter[oc*in_c+ic]
-                                acc += bufs.weights[oc * in_c + ic] as i64
-                                    * (bufs.input[ic] as i64 + p.input_offset as i64);
-                            }
-                            let acc32 =
-                                (bufs.bias[oc] as i64 + acc).clamp(i32::MIN as i64, i32::MAX as i64)
-                                    as i32;
-                            let scaled = multiply_by_quantized_multiplier(
-                                acc32,
-                                p.output_multiplier_per_channel[oc],
-                                p.output_shift_per_channel[oc],
-                            );
-                            let clamped = (scaled + p.output_offset).clamp(
-                                p.quantized_activation_min,
-                                p.quantized_activation_max,
-                            );
-                            emu[oc] = saturating_cast(clamped);
                         }
                     }
                     _ => unreachable!(),
@@ -1941,7 +3863,7 @@ mod tests {
             let lay = layout(spec);
             let mut bufs = carve_into(&mut arena, &lay).expect("arena must hold every spec");
             fill_pattern(&mut bufs);
-            let mut scratch = [0u8; 0];
+            let mut scratch = vec![0u8; spec_scratch_need(spec)];
             assert!(
                 run_s3(spec, &mut bufs, &mut scratch).is_ok(),
                 "{}: carved buffers rejected by s3 kernel",

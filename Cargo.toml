@@ -6,12 +6,10 @@ members = [
     "hematite-memory",
     "hematite-ref",
     "hematite-s3",
-    "hematite-tflite",
     "hematite-codegen",
     "hematite-tests",
     "hematite-benchmarks",
     "tools/generate_goldens",
-    "tools/espnn_codegen",
 ]
 
 [workspace.package]

@@ -73,6 +73,6 @@ pub const OUTPUT_SHIFT: [i32; 1] = [
 ];
 
 pub const EXPECTED_OUTPUT: [i8; 6] = [
-    1, 13, 3, 18, 3, 23,
+    2, 13, 3, 18, 3, 23,
 ];
 

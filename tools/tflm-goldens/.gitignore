@@ -1,0 +1,5 @@
+# Generated artifacts — never commit. Regenerate with `make inputs` /
+# `make build`. See README.md.
+generated/
+main.o
+tflm-goldens
