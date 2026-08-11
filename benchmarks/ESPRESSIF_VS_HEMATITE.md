@@ -395,6 +395,21 @@ Model C margin is **1.007×** (650,773 vs 655,303) — maintained ≥ 1.007×. T
   correctness-vs-speed trade, not a fixable loss). C rows for conv3x3
   full-image / SAME, depthwise S2, and softmax are still missing on the C side.
 
+## Model-level bars (T6.3 re-tier — `model_bench.rs`)
+
+- MobileNetV2 **1294.5 ms** single-core (×10 fixed point **12945**) —
+  **hold-as-documented**; PSRAM-gated on this board (`PSRAM: 0 bytes`,
+  PROJECT_LOG.md:721), the model row is a PSRAM-gated follow-up.
+- KWS **4 ms** ESP-NN-relative (×10 fixed point **40**, was 70 = 7 ms ESP-DL)
+  — re-tiered via T3.5b: target < 1,059,889 cyc / 4 ms (PROJECT_LOG.md:796-799
+  structural bound; `depthwise_kws_49x40x1_10x8_dm8` on-device PASS
+  `t61-device.log:77`).
+- conv1x1 **15.57×** vs scalar-ref (×100 fixed point **1557**, spec.rs:1681)
+  and **10×** vs-scalar floor (×100 **1000**) — both hold.
+
+Full ledger rows (fused-vs-unfused closure + bar citations):
+`local-notes/evidence/composed-kernels/head-to-head.md §8`.
+
 ## Where to look
 
 - ESP-NN model harness: `benchmarks/espnn-baseline/` (`main.c`, vendored

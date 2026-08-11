@@ -22,15 +22,20 @@
 //! device firmware carves them from the SRAM/PSRAM arena with
 //! [`carve_model_bufs`] — the same carve pattern `bench_kernel` uses.
 //!
-//! # Reference bars (B2 — single-core, documented sources)
+//! # Reference bars (B2 — single-core, documented sources; T6.3 re-tier)
 //!
 //! | Model | Bar | Source |
 //! |-------|-----|--------|
-//! | MobileNetV2 224×224 | **1294.5 ms** single-core | ESP-DL reference, plan T5.3 (B2). The 856 ms figure is the DUAL-core number — never the bar. |
-//! | KWS keyword_spotting_v1 (1×1960) | **7 ms** | edge-ml-model-zoo ESP-DL, plan T5.3 line 308 |
+//! | MobileNetV2 224×224 | **1294.5 ms** single-core — **hold-as-documented** | ESP-DL reference, plan T5.3 (B2). The 856 ms figure is the DUAL-core number — never the bar. PSRAM-gated on this board (`PSRAM: 0 bytes`, PROJECT_LOG.md:721): the model row is a PSRAM-gated follow-up, the bar itself is untouched. |
+//! | KWS keyword_spotting_v1 (1×1960) | **4 ms** — ESP-NN-relative via T3.5b (target < 1,059,889 cyc / 4 ms) | RE-TIERED from the 7 ms ESP-DL bar: PROJECT_LOG.md:796-799 documented the original 54 ms / 7 ms structural bound (dm=8 depthwise); T3.5b's anytap dm>1 depthwise now SIMD-engages (`depthwise_kws_49x40x1_10x8_dm8` on-device PASS, t61-device.log:77; spec row `t35b-depthwise-anyfilter.md:109-121`) |
 //!
-//! `reference_ms_tenths` stores these in ×10 fixed point (12945 = 1294.5 ms)
-//! so the pass/fail comparison is pure integer math — no f32 anywhere.
+//! Internal speedup floors (×100 fixed point): **conv1x1 ≥ 15.57× vs scalar-ref**
+//! (1557, spec.rs:1681 column-2 bar — holds) and **conv SIMD ≥ 10× vs scalar**
+//! (1000, T3.0 column-1 floor — holds for all zoo models).
+//!
+//! `reference_ms_tenths` stores these in ×10 fixed point (12945 = 1294.5 ms,
+//! 40 = 4.0 ms) so the pass/fail comparison is pure integer math — no f32
+//! anywhere.
 
 use crate::spec::MemoryTier;
 use crate::timing::{run_repeated, BenchmarkConfig, Clock, RunLog, RunSummary};
@@ -71,8 +76,8 @@ pub const MOBILENETV2_SPEC: ModelBenchSpec = ModelBenchSpec {
     input_len: 224 * 224 * 3,
     output_len: 1000,
     tier: MemoryTier::Psram,
-    reference_ms_tenths: Some(12945), // 1294.5 ms
-    source: "plan T5.3 line 308 (B2): ESP-DL single-core reference 1294.5 ms; 856 ms is DUAL-core, NOT the bar",
+    reference_ms_tenths: Some(12945), // 1294.5 ms — hold-as-documented (T6.3)
+    source: "plan T5.3 line 308 (B2): ESP-DL single-core reference 1294.5 ms; 856 ms is DUAL-core, NOT the bar. PSRAM-gated on this board: PSRAM: 0 bytes (PROJECT_LOG.md:721) — model row is a PSRAM-gated follow-up (head-to-head.md §speed-closure (a))",
 };
 
 /// KWS — kws_micro_speech_int8, input 1×1960.
@@ -82,13 +87,13 @@ pub const MOBILENETV2_SPEC: ModelBenchSpec = ModelBenchSpec {
 /// `output_len` is the model's real 4-class output (golden
 /// `EXPECTED_OUTPUT: [i8; 4]`), not the stale "12 classes pending" guess.
 pub const KWS_SPEC: ModelBenchSpec = ModelBenchSpec {
-    name: "KWS kws_micro_speech_int8 (bar 7 ms)",
+    name: "KWS kws_micro_speech_int8 (bar 4 ms — ESP-NN-relative, T3.5b)",
     path: "models/zoo/keyword_spotting/kws_micro_speech_int8.tflite",
     input_len: 1960, // 1×1960 per plan T5.3
     output_len: 4,
     tier: MemoryTier::Sram,
-    reference_ms_tenths: Some(70), // 7.0 ms
-    source: "plan T5.3 line 308: KWS 1×1960, edge-ml-model-zoo ESP-DL 7 ms",
+    reference_ms_tenths: Some(40), // 4.0 ms — RE-TIERED (was 70 = 7 ms ESP-DL)
+    source: "plan T5.3 line 308 (7 ms ESP-DL) RE-TIERED to ESP-NN-relative target < 1,059,889 cyc / 4 ms: PROJECT_LOG.md:796-799 (original 54 ms / 7 ms structural bound, dm=8); T3.5b anytap dm>1 depthwise SIMD-engages, depthwise_kws_49x40x1_10x8_dm8 on-device PASS t61-device.log:77; spec row t35b-depthwise-anyfilter.md:109-121",
 };
 
 /// Sine smoke model — shipped in `models/` since T0, usable today as an
@@ -150,6 +155,25 @@ pub const fn model_bench_specs() -> &'static [ModelBenchSpec] {
         PERSON_DETECT_SPEC,
         ANOMALY_SPEC,
     ]
+}
+
+/// Internal speedup acceptance floors, ×100 fixed point (T6.3 re-tier).
+///
+/// These mirror the spec.rs `CompetitorBaseline::target_speedup_x100` bars
+/// (conv1x1 `Some(1557)`, spec.rs:1681) and the T3.0 column-1 floor.  Kept
+/// here so the model-level docs and the report footer render the same
+/// plan-attributed bars as the per-kernel rows — no invented numbers.
+pub mod speedup_bars {
+    /// conv1x1 64×1×1×64 vs scalar-ref — column-2 acceptance bar
+    /// **15.57×** (spec.rs:1681, plan T5.3 line 309; recorded hold in
+    /// head-to-head.md §6.8).  Retained as-is by T6.3 — the on-device SIMD
+    /// row measured 3201 cyc public-API (ESPRESSIF_VS_HEMATITE.md:227).
+    pub const CONV1X1_VS_SCALAR_X100: u32 = 1557;
+    /// conv SIMD vs scalar-ref — T3.0 column-1 floor **10×** (head-to-head.md
+    /// §6.8).  Holds for all zoo models: Model C measures 22× vs its scalar
+    /// ref 14,489,859 cyc (head-to-head.md §5.1); every SIMD-engaged layer is
+    /// above the floor per ESPRESSIF_VS_HEMATITE.md §5.2.
+    pub const SIMD_VS_SCALAR_FLOOR_X100: u32 = 1000;
 }
 
 /// Abstract inference runner — mirrors the generated `Model<B>` API shape
@@ -881,11 +905,18 @@ mod tests {
 
     #[test]
     fn bars_are_the_plan_numbers() {
-        // B2: 1294.5 ms single-core, NEVER 856 (dual-core).
+        // B2: 1294.5 ms single-core, NEVER 856 (dual-core) — hold-as-documented
+        // (PSRAM-gated on this board, PROJECT_LOG.md:721).
         assert_eq!(MOBILENETV2_SPEC.reference_ms_tenths, Some(12945));
         assert_ne!(MOBILENETV2_SPEC.reference_ms_tenths, Some(8560));
-        // KWS: 7 ms.
-        assert_eq!(KWS_SPEC.reference_ms_tenths, Some(70));
+        // KWS: RE-TIERED (T6.3) from 7 ms ESP-DL to the ESP-NN-relative
+        // 4 ms target (< 1,059,889 cyc / 4 ms, T3.5b).
+        assert_eq!(KWS_SPEC.reference_ms_tenths, Some(40));
+        assert_ne!(KWS_SPEC.reference_ms_tenths, Some(70));
+        // Internal speedup floors (×100 fixed point): 15.57× conv1x1 bar
+        // (spec.rs:1681) + 10× vs-scalar floor (T3.0).
+        assert_eq!(speedup_bars::CONV1X1_VS_SCALAR_X100, 1557);
+        assert_eq!(speedup_bars::SIMD_VS_SCALAR_FLOOR_X100, 1000);
     }
 
     #[test]
