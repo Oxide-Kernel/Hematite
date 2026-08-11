@@ -1318,6 +1318,68 @@ fn bench_zoo_model(spec: &ModelBenchSpec, clock: &mut RealClock, canary: &mut St
     }
 }
 
+/// Benchmark one real zoo model through the UNFUSED arm (`#[model_unfused]`
+/// per-op sequence, no fusion schedule) — the T6.1 fused-vs-unfused delta
+/// denominator.  Same SKIP guards as the fused arm: person_detect is
+/// stack-gated, mobilenet_v2 is PSRAM-gated (no unfused runner is wired for
+/// either — `zoo_unfused_runner_for` panics on their paths, which the guards
+/// below keep unreachable).
+#[cfg(feature = "model-validation")]
+fn bench_zoo_model_unfused(spec: &ModelBenchSpec, clock: &mut RealClock, canary: &mut StackCanary) {
+    use crate::model_bench::zoo_unfused_runners::zoo_unfused_runner_for;
+
+    if spec.path == "models/zoo/person_detect_vww/person_detect_int8.tflite" {
+        return;
+    }
+    let arena = unsafe {
+        match spec.tier {
+            crate::spec::MemoryTier::Sram => &mut SRAM_ARENA.0[..],
+            crate::spec::MemoryTier::Psram => &mut **core::ptr::addr_of_mut!(PSRAM_ARENA),
+        }
+    };
+    if arena.is_empty() {
+        return;
+    }
+
+    let mut runner = zoo_unfused_runner_for(spec);
+    let mut bufs = match carve_model_bufs(
+        arena,
+        runner.input_len(),
+        runner.output_len(),
+        runner.scratch_len(),
+    ) {
+        Some(b) => b,
+        None => return,
+    };
+    let cfg = BenchmarkConfig::default();
+    fill_input_pattern(bufs.input);
+    bufs.output.fill(0);
+
+    let log = run_model_bench(clock, &mut runner, bufs.input, bufs.output, bufs.scratch, &cfg);
+    let summary = match summarize(&log) {
+        Some(s) => s,
+        None => return,
+    };
+    let out_fnv = fnv1a(bufs.output);
+
+    firmware_log!(
+        "| {} | {} | {}/{} | {}/{} | {}/{} | bar=None | no-bar (unfused arm) | out_fnv=0x{:08x} |",
+        spec.name,
+        spec.tier.label(),
+        summary.min_cycles,
+        summary.median_cycles,
+        crate::timing::cycles_to_ms(summary.min_cycles, CPU_HZ_240MHZ),
+        crate::timing::cycles_to_ms(summary.median_cycles, CPU_HZ_240MHZ),
+        crate::timing::ns_to_ms(summary.min_wall_ns),
+        crate::timing::ns_to_ms(summary.median_wall_ns),
+        out_fnv,
+    );
+
+    if let Err(e) = canary.verify() {
+        panic!("model bench (unfused) '{}': {}", spec.name, e.describe());
+    }
+}
+
 /// Firmware entry point — runs the full benchmark suite and never returns.
 pub fn run_benchmarks() -> ! {
     // esp-hal 1.1 documented init (context7: `Config::default()
@@ -1431,6 +1493,7 @@ pub fn run_benchmarks() -> ! {
     #[cfg(feature = "model-validation")]
     for spec in model_bench_specs() {
         bench_zoo_model(spec, &mut clock, &mut canary);
+        bench_zoo_model_unfused(spec, &mut clock, &mut canary);
     }
     #[cfg(not(feature = "model-validation"))]
     for spec in model_bench_specs() {

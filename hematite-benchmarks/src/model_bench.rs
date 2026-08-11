@@ -610,6 +610,236 @@ pub mod zoo_runners {
     }
 }
 
+/// Unfused-arm real-zoo `ModelRunner` adapters (T6.1 fused-vs-unfused delta).
+///
+/// The fused `#[model]` adapters above emit composed kernel calls for T1
+/// groups (residual/chain/epilogue).  This module emits the SAME model with
+/// `#[model_unfused]` — the plain per-op sequence with no fusion schedule —
+/// so timing `Model::<S3Backend>` through both arms isolates the cycle cost
+/// of fusion on real silicon.  For sine / hello_world / kws / anomaly the W0
+/// profile found ZERO composed groups, so fused == unfused emission (the
+/// delta is expected ≈ 0 and proves the fused dispatch adds no overhead);
+/// mobilenet_v2 has 10 residual groups but is PSRAM-gated on this board
+/// (PSRAM: 0 bytes) and person_detect is stack-gated — neither has an
+/// unfused arm wired here (unreachable on this board, see
+/// `firmware::bench_zoo_model` SKIP guards).
+#[cfg(feature = "model-validation")]
+pub mod zoo_unfused_runners {
+    use super::{ModelBenchSpec, ModelRunner};
+    use hematite_codegen::model_unfused;
+    use hematite_s3::backend::S3Backend;
+
+    mod model_sine_unfused {
+        use super::*;
+        #[model_unfused("../models/sine.tflite")]
+        pub struct SineModel;
+        pub struct SineRunner {
+            model: Model<S3Backend>,
+        }
+        impl SineRunner {
+            pub fn new() -> Self {
+                Self { model: Model::new(S3Backend) }
+            }
+            pub fn input_len(&self) -> usize {
+                INPUT_LEN
+            }
+            pub fn output_len(&self) -> usize {
+                OUTPUT_LEN
+            }
+            pub fn scratch_len(&self) -> usize {
+                SCRATCH_LEN
+            }
+            pub fn run(&mut self, input: &[i8], output: &mut [i8], scratch: &mut [u8]) -> bool {
+                let input_arr: &[i8; INPUT_LEN] = match input.try_into() {
+                    Ok(a) => a,
+                    Err(_) => return false,
+                };
+                let output_arr: &mut [i8; OUTPUT_LEN] = match output.try_into() {
+                    Ok(b) => b,
+                    Err(_) => return false,
+                };
+                self.model.predict_with_scratch(input_arr, output_arr, scratch).is_ok()
+            }
+        }
+    }
+
+    mod model_hello_world_unfused {
+        use super::*;
+        #[model_unfused("../models/zoo/sine_regression/hello_world_int8.tflite")]
+        pub struct HelloWorldModel;
+        pub struct HelloWorldRunner {
+            model: Model<S3Backend>,
+        }
+        impl HelloWorldRunner {
+            pub fn new() -> Self {
+                Self { model: Model::new(S3Backend) }
+            }
+            pub fn input_len(&self) -> usize {
+                INPUT_LEN
+            }
+            pub fn output_len(&self) -> usize {
+                OUTPUT_LEN
+            }
+            pub fn scratch_len(&self) -> usize {
+                SCRATCH_LEN
+            }
+            pub fn run(&mut self, input: &[i8], output: &mut [i8], scratch: &mut [u8]) -> bool {
+                let input_arr: &[i8; INPUT_LEN] = match input.try_into() {
+                    Ok(a) => a,
+                    Err(_) => return false,
+                };
+                let output_arr: &mut [i8; OUTPUT_LEN] = match output.try_into() {
+                    Ok(b) => b,
+                    Err(_) => return false,
+                };
+                self.model.predict_with_scratch(input_arr, output_arr, scratch).is_ok()
+            }
+        }
+    }
+
+    mod model_kws_unfused {
+        use super::*;
+        #[model_unfused("../models/zoo/keyword_spotting/kws_micro_speech_int8.tflite")]
+        pub struct KwsModel;
+        pub struct KwsRunner {
+            model: Model<S3Backend>,
+        }
+        impl KwsRunner {
+            pub fn new() -> Self {
+                Self { model: Model::new(S3Backend) }
+            }
+            pub fn input_len(&self) -> usize {
+                INPUT_LEN
+            }
+            pub fn output_len(&self) -> usize {
+                OUTPUT_LEN
+            }
+            pub fn scratch_len(&self) -> usize {
+                SCRATCH_LEN
+            }
+            pub fn run(&mut self, input: &[i8], output: &mut [i8], scratch: &mut [u8]) -> bool {
+                let input_arr: &[i8; INPUT_LEN] = match input.try_into() {
+                    Ok(a) => a,
+                    Err(_) => return false,
+                };
+                let output_arr: &mut [i8; OUTPUT_LEN] = match output.try_into() {
+                    Ok(b) => b,
+                    Err(_) => return false,
+                };
+                self.model.predict_with_scratch(input_arr, output_arr, scratch).is_ok()
+            }
+        }
+    }
+
+    mod model_anomaly_unfused {
+        use super::*;
+        #[model_unfused("../models/zoo/anomaly_detect/anomaly_detect_int8.tflite")]
+        pub struct AnomalyModel;
+        pub struct AnomalyRunner {
+            model: Model<S3Backend>,
+        }
+        impl AnomalyRunner {
+            pub fn new() -> Self {
+                Self { model: Model::new(S3Backend) }
+            }
+            pub fn input_len(&self) -> usize {
+                INPUT_LEN
+            }
+            pub fn output_len(&self) -> usize {
+                OUTPUT_LEN
+            }
+            pub fn scratch_len(&self) -> usize {
+                SCRATCH_LEN
+            }
+            pub fn run(&mut self, input: &[i8], output: &mut [i8], scratch: &mut [u8]) -> bool {
+                let input_arr: &[i8; INPUT_LEN] = match input.try_into() {
+                    Ok(a) => a,
+                    Err(_) => return false,
+                };
+                let output_arr: &mut [i8; OUTPUT_LEN] = match output.try_into() {
+                    Ok(b) => b,
+                    Err(_) => return false,
+                };
+                self.model.predict_with_scratch(input_arr, output_arr, scratch).is_ok()
+            }
+        }
+    }
+
+    /// An unfused-arm zoo-model runner (closure-capable models only).
+    pub enum ZooUnfusedRunner {
+        Sine(model_sine_unfused::SineRunner),
+        HelloWorld(model_hello_world_unfused::HelloWorldRunner),
+        Kws(model_kws_unfused::KwsRunner),
+        Anomaly(model_anomaly_unfused::AnomalyRunner),
+    }
+
+    impl ZooUnfusedRunner {
+        pub fn input_len(&self) -> usize {
+            match self {
+                ZooUnfusedRunner::Sine(r) => r.input_len(),
+                ZooUnfusedRunner::HelloWorld(r) => r.input_len(),
+                ZooUnfusedRunner::Kws(r) => r.input_len(),
+                ZooUnfusedRunner::Anomaly(r) => r.input_len(),
+            }
+        }
+        pub fn output_len(&self) -> usize {
+            match self {
+                ZooUnfusedRunner::Sine(r) => r.output_len(),
+                ZooUnfusedRunner::HelloWorld(r) => r.output_len(),
+                ZooUnfusedRunner::Kws(r) => r.output_len(),
+                ZooUnfusedRunner::Anomaly(r) => r.output_len(),
+            }
+        }
+        pub fn scratch_len(&self) -> usize {
+            match self {
+                ZooUnfusedRunner::Sine(r) => r.scratch_len(),
+                ZooUnfusedRunner::HelloWorld(r) => r.scratch_len(),
+                ZooUnfusedRunner::Kws(r) => r.scratch_len(),
+                ZooUnfusedRunner::Anomaly(r) => r.scratch_len(),
+            }
+        }
+    }
+
+    impl ModelRunner for ZooUnfusedRunner {
+        fn input_len(&self) -> usize {
+            self.input_len()
+        }
+        fn output_len(&self) -> usize {
+            self.output_len()
+        }
+        fn predict(&mut self, input: &[i8], output: &mut [i8], scratch: &mut [u8]) -> bool {
+            match self {
+                ZooUnfusedRunner::Sine(r) => r.run(input, output, scratch),
+                ZooUnfusedRunner::HelloWorld(r) => r.run(input, output, scratch),
+                ZooUnfusedRunner::Kws(r) => r.run(input, output, scratch),
+                ZooUnfusedRunner::Anomaly(r) => r.run(input, output, scratch),
+            }
+        }
+    }
+
+    /// Construct the unfused-arm runner for a registry spec (closure-capable
+    /// models only).  Panics on an unwired path — same wiring-error contract
+    /// as `zoo_runners::zoo_runner_for`; the firmware's SKIP guards keep
+    /// person_detect / mobilenet_v2 out of this function on this board.
+    pub fn zoo_unfused_runner_for(spec: &ModelBenchSpec) -> ZooUnfusedRunner {
+        match spec.path {
+            "models/sine.tflite" => {
+                ZooUnfusedRunner::Sine(model_sine_unfused::SineRunner::new())
+            }
+            "models/zoo/sine_regression/hello_world_int8.tflite" => {
+                ZooUnfusedRunner::HelloWorld(model_hello_world_unfused::HelloWorldRunner::new())
+            }
+            "models/zoo/keyword_spotting/kws_micro_speech_int8.tflite" => {
+                ZooUnfusedRunner::Kws(model_kws_unfused::KwsRunner::new())
+            }
+            "models/zoo/anomaly_detect/anomaly_detect_int8.tflite" => {
+                ZooUnfusedRunner::Anomaly(model_anomaly_unfused::AnomalyRunner::new())
+            }
+            other => panic!("zoo_unfused_runner_for: no unfused runner wired for spec path '{other}'"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
