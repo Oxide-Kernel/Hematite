@@ -97,6 +97,8 @@ pub enum OpKind {
     AvgPool,
     MaxPool,
     Relu,
+    Relu6,
+    HardSwish,
     Add,
     Mul,
     Sub,
@@ -981,6 +983,125 @@ const SIMD_SUB_256_PARAMS: ElementwiseParams = ElementwiseParams {
     quantized_activation_max: 127,
 };
 
+// ── T3.2 widened elementwise + activation rows ───────────────────────────────
+//
+// Non-identity offset/multiplier pairs exercise the widened per-lane SIMD
+// model (arbitrary quant-affine chains); relu6 / hard_swish exercise the new
+// activation lane models. All n = 256 (multiple of 16 — the lane-model vector
+// main loop engages on device with aligned arena buffers).
+
+/// Elementwise ADD over 256 elements with the two-stage TFLM Add rounding
+/// shape (non-zero zero points, left_shift 20, per-input multipliers, output
+/// requantize) — NOT identity-eligible, engages the T3.2 widened lane model.
+const SIMD_ADD_256_NONIDENTITY_PARAMS: ElementwiseParams = ElementwiseParams {
+    num_elements: 256,
+    input1_offset: -5,
+    input2_offset: 3,
+    output_offset: 1,
+    output_multiplier: 1_342_177_280,
+    output_shift: -18,
+    left_shift: 20,
+    input1_multiplier: 1 << 30,
+    input1_shift: 0,
+    input2_multiplier: 1_288_490_189,
+    input2_shift: -1,
+    quantized_activation_min: -32,
+    quantized_activation_max: 96,
+};
+
+/// Elementwise SUB over 256 elements — same non-identity shape as the ADD row.
+const SIMD_SUB_256_NONIDENTITY_PARAMS: ElementwiseParams = ElementwiseParams {
+    num_elements: 256,
+    input1_offset: -5,
+    input2_offset: 3,
+    output_offset: 1,
+    output_multiplier: 1_342_177_280,
+    output_shift: -18,
+    left_shift: 20,
+    input1_multiplier: 1 << 30,
+    input1_shift: 0,
+    input2_multiplier: 1_288_490_189,
+    input2_shift: -1,
+    quantized_activation_min: -32,
+    quantized_activation_max: 96,
+};
+
+/// Elementwise MUL over 256 elements with non-zero offsets and a real product
+/// requantize (scale change) — engages the T3.2 widened lane model.
+const SIMD_MUL_256_NONIDENTITY_PARAMS: ElementwiseParams = ElementwiseParams {
+    num_elements: 256,
+    input1_offset: 2,
+    input2_offset: -3,
+    output_offset: -7,
+    output_multiplier: 1_717_986_918,
+    output_shift: -3,
+    left_shift: 0,
+    input1_multiplier: 0,
+    input1_shift: 0,
+    input2_multiplier: 0,
+    input2_shift: 0,
+    quantized_activation_min: -16,
+    quantized_activation_max: 111,
+};
+
+/// ReLU6 over 256 elements — the widened lane model clamps to
+/// `quantized_activation_max` forwarded as `quantized_six` (= 24 at
+/// scale 0.25). No requantize (output scale 1.0).
+const SIMD_RELU6_256_PARAMS: ActivationParams<'static> = ActivationParams {
+    input_offset: -1,
+    output_offset: 2,
+    output_multiplier: 0,
+    output_shift: 0,
+    quantized_activation_min: 0,
+    quantized_activation_max: 24,
+    input_multiplier: 0,
+    input_left_shift: 0,
+    input_range_radius: 0,
+    output_multiplier_alpha: 0,
+    output_shift_alpha: 0,
+    output_multiplier_identity: 0,
+    output_shift_identity: 0,
+    alpha_offset: 0,
+    alpha_data: &[],
+    output_multiplier_1: 0,
+    output_shift_1: 0,
+    output_multiplier_2: 0,
+    output_shift_2: 0,
+    reluish_multiplier_fixedpoint_int16: 0,
+    reluish_multiplier_exponent: 0,
+    output_multiplier_fixedpoint_int16: 0,
+    output_multiplier_exponent: 0,
+};
+
+/// HardSwish over 256 elements — the DOWNGRADED integer rational formula
+/// (x·ReLU6(x+3)/6, ±3 round-half correction), pinned by the goldens. The
+/// widened lane model reproduces it bit-exact (per-lane /6 scalar tail).
+const SIMD_HARD_SWISH_256_PARAMS: ActivationParams<'static> = ActivationParams {
+    input_offset: -3,
+    output_offset: 1,
+    output_multiplier: 0,
+    output_shift: 0,
+    quantized_activation_min: 0,
+    quantized_activation_max: 127,
+    input_multiplier: 0,
+    input_left_shift: 0,
+    input_range_radius: 0,
+    output_multiplier_alpha: 0,
+    output_shift_alpha: 0,
+    output_multiplier_identity: 0,
+    output_shift_identity: 0,
+    alpha_offset: 0,
+    alpha_data: &[],
+    output_multiplier_1: 0,
+    output_shift_1: 0,
+    output_multiplier_2: 0,
+    output_shift_2: 0,
+    reluish_multiplier_fixedpoint_int16: 0,
+    reluish_multiplier_exponent: 0,
+    output_multiplier_fixedpoint_int16: 0,
+    output_multiplier_exponent: 0,
+};
+
 // ── Composed fused-conv rows (T2.2) ──────────────────────────────────────────
 //
 // The `fused_conv2d` composed kernel: anchor conv + residual-ADD + activation
@@ -1714,6 +1835,46 @@ pub const fn kernel_specs() -> &'static [KernelSpec] {
             note: "TIE728 sub_w1_16_w2_16 SIMD row: identity contract, n=256.",
         },
         KernelSpec {
+            name: "add_s8 256 non-identity offsets (T3.2)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Add,
+            params: KernelParams::Elementwise(&SIMD_ADD_256_NONIDENTITY_PARAMS),
+            reference: None,
+            note: "T3.2 widened lane-model SIMD row: two-stage TFLM Add rounding (zps -5/3/1, left_shift 20, per-input multipliers, output requantize, clamped range). NOT identity-eligible — engages the 16-wide per-lane requantize model on device.",
+        },
+        KernelSpec {
+            name: "sub_s8 256 non-identity offsets (T3.2)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Sub,
+            params: KernelParams::Elementwise(&SIMD_SUB_256_NONIDENTITY_PARAMS),
+            reference: None,
+            note: "T3.2 widened lane-model SIMD row: same non-identity two-stage rounding shape as the ADD row.",
+        },
+        KernelSpec {
+            name: "mul_s8 256 non-identity offsets (T3.2)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Mul,
+            params: KernelParams::Elementwise(&SIMD_MUL_256_NONIDENTITY_PARAMS),
+            reference: None,
+            note: "T3.2 widened lane-model SIMD row: non-zero offsets + real product requantize (scale change). NOT identity-eligible — engages the 16-wide per-lane requantize model on device.",
+        },
+        KernelSpec {
+            name: "relu6_s8 256 (T3.2 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Relu6,
+            params: KernelParams::Activation(&SIMD_RELU6_256_PARAMS),
+            reference: None,
+            note: "T3.2 relu6 lane-model SIMD row: clamp to quantized_six = 24 (quantized_activation_max forwarded), zps -1/2. Vector min/max clamps in 16-wide lanes.",
+        },
+        KernelSpec {
+            name: "hard_swish_s8 256 (T3.2 SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::HardSwish,
+            params: KernelParams::Activation(&SIMD_HARD_SWISH_256_PARAMS),
+            reference: None,
+            note: "T3.2 hard_swish lane-model SIMD row: DOWNGRADED integer rational formula (goldens-pinned, NOT the TFLM fixed-point chain); per-lane /6 scalar tail (no SIMD integer division on Xtensa).",
+        },
+        KernelSpec {
             name: "fused_conv1x1_s8 4x4x16 residual+relu (T2.2)",
             tier: MemoryTier::Sram,
             op: OpKind::FusedConv2d,
@@ -2129,6 +2290,14 @@ pub fn run_kernel(spec: &KernelSpec, bufs: &mut SpecBufs<'_>, scratch: &mut [u8]
             let p = params_activation(spec);
             hematite_s3::activations::relu(bufs.input, p, bufs.output, scratch)
         }
+        OpKind::Relu6 => {
+            let p = params_activation(spec);
+            hematite_s3::activations::relu6(bufs.input, p, bufs.output, scratch, p.quantized_activation_max)
+        }
+        OpKind::HardSwish => {
+            let p = params_activation(spec);
+            hematite_s3::activations::hard_swish(bufs.input, p, bufs.output, scratch)
+        }
         OpKind::Add => {
             let p = params_elementwise(spec);
             hematite_s3::elementwise::add(bufs.input, bufs.weights, p, bufs.output, scratch)
@@ -2314,6 +2483,20 @@ fn run_kernel_scalar(
             };
             hematite_s3::activations::relu(bufs.input, p, bufs.output, scratch)
         }
+        OpKind::Relu6 => {
+            let p = match spec.params {
+                KernelParams::Activation(p) => p,
+                _ => return Err(KernelError::Unsupported),
+            };
+            hematite_s3::activations::relu6(bufs.input, p, bufs.output, scratch, p.quantized_activation_max)
+        }
+        OpKind::HardSwish => {
+            let p = match spec.params {
+                KernelParams::Activation(p) => p,
+                _ => return Err(KernelError::Unsupported),
+            };
+            hematite_s3::activations::hard_swish(bufs.input, p, bufs.output, scratch)
+        }
         OpKind::Add => {
             let p = match spec.params {
                 KernelParams::Elementwise(p) => p,
@@ -2408,6 +2591,13 @@ pub fn prepare_kernel(spec: &KernelSpec) -> Result<PreparedKernel, KernelError> 
             KernelParams::Activation(p) => Ok(PreparedKernel::Relu(
                 hematite_s3::activations::PreparedRelu::new(p)?,
             )),
+            _ => Err(KernelError::Unsupported),
+        },
+        // relu6/hard_swish have no prepared handle: the public `relu6`/
+        // `hard_swish` kernels dispatch the T3.2 widened lane model
+        // internally (via S3Backend), so the Scalar slot runs them.
+        OpKind::Relu6 | OpKind::HardSwish => match spec.params {
+            KernelParams::Activation(_) => Ok(PreparedKernel::Scalar),
             _ => Err(KernelError::Unsupported),
         },
         OpKind::Add => match spec.params {
@@ -2573,6 +2763,14 @@ pub fn run_ref_kernel(
             let p = params_activation(spec);
             hematite_ref::activation::relu(bufs.input, p, bufs.output, scratch)
         }
+        OpKind::Relu6 => {
+            let p = params_activation(spec);
+            hematite_ref::activation::relu6(bufs.input, p, bufs.output, scratch, p.quantized_activation_max)
+        }
+        OpKind::HardSwish => {
+            let p = params_activation(spec);
+            hematite_ref::activation::hard_swish(bufs.input, p, bufs.output, scratch)
+        }
         OpKind::Add => {
             let p = params_elementwise(spec);
             hematite_ref::elementwise::add(bufs.input, bufs.weights, p, bufs.output, scratch)
@@ -2672,6 +2870,20 @@ mod tests {
                     _ => return Err("op/params mismatch".into()),
                 };
                 hematite_s3::activations::relu(bufs.input, p, bufs.output, scratch)
+            }
+            OpKind::Relu6 => {
+                let p = match spec.params {
+                    KernelParams::Activation(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                hematite_s3::activations::relu6(bufs.input, p, bufs.output, scratch, p.quantized_activation_max)
+            }
+            OpKind::HardSwish => {
+                let p = match spec.params {
+                    KernelParams::Activation(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                hematite_s3::activations::hard_swish(bufs.input, p, bufs.output, scratch)
             }
             OpKind::Add => {
                 let p = match spec.params {
@@ -2786,6 +2998,20 @@ mod tests {
                     _ => return Err("op/params mismatch".into()),
                 };
                 hematite_ref::activation::relu(bufs.input, p, bufs.output, scratch)
+            }
+            OpKind::Relu6 => {
+                let p = match spec.params {
+                    KernelParams::Activation(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                hematite_ref::activation::relu6(bufs.input, p, bufs.output, scratch, p.quantized_activation_max)
+            }
+            OpKind::HardSwish => {
+                let p = match spec.params {
+                    KernelParams::Activation(p) => p,
+                    _ => return Err("op/params mismatch".into()),
+                };
+                hematite_ref::activation::hard_swish(bufs.input, p, bufs.output, scratch)
             }
             OpKind::Add => {
                 let p = match spec.params {

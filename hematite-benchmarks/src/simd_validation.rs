@@ -315,7 +315,73 @@ fn run_elementwise_check<const N: usize>(op: ElemOp, name: &'static str) {
     report(&compare(name, &got.0, &want.0));
 }
 
-// ── Pool: avg / max, 2×2 stride-2 no-pad, 4x4x16 -> 2x2x16 ──────────────────
+// ── T3.2 widened elementwise: non-identity offsets/multipliers (256) ────────
+
+/// The two-stage TFLM Add rounding params (non-zero zps, left_shift 20,
+/// per-input multipliers, output requantize, clamped range) — NOT
+/// identity-eligible, so on device these checks engage the widened 16-wide
+/// per-lane model (`add_simd_lanes`/`mul_simd_lanes`/`sub_simd_lanes`).
+fn non_identity_elementwise_params(n: i32, op: ElemOp) -> ElementwiseParams {
+    let (input1_offset, input2_offset, output_offset, om, os, ls, i1m, i1s, i2m, i2s, act_min, act_max) =
+        match op {
+            ElemOp::Add | ElemOp::Sub => (
+                -5, 3, 1, 1_342_177_280, -18, 20, 1 << 30, 0, 1_288_490_189, -1, -32, 96,
+            ),
+            ElemOp::Mul => (
+                2, -3, -7, 1_717_986_918, -3, 0, 0, 0, 0, 0, -16, 111,
+            ),
+        };
+    ElementwiseParams {
+        num_elements: n,
+        input1_offset,
+        input2_offset,
+        output_offset,
+        output_multiplier: om,
+        output_shift: os,
+        left_shift: ls,
+        input1_multiplier: i1m,
+        input1_shift: i1s,
+        input2_multiplier: i2m,
+        input2_shift: i2s,
+        quantized_activation_min: act_min,
+        quantized_activation_max: act_max,
+    }
+}
+
+fn run_elementwise_non_identity_check<const N: usize>(op: ElemOp, name: &'static str) {
+    let input1 = Aligned(make_pattern::<N>(0xABCD_0001));
+    let input2 = Aligned(make_pattern::<N>(0x1234_5678));
+    let mut want = Aligned([0i8; N]);
+    let mut got = Aligned([0i8; N]);
+    let params = non_identity_elementwise_params(N as i32, op);
+
+    // Both sides go through the PUBLIC dispatch: hematite-ref is the oracle,
+    // hematite-s3's `add`/`mul`/`sub` take the widened lane-model path on
+    // device (non-identity params + 16-aligned Aligned<> buffers satisfy the
+    // T3.2 gate: any params, n ≥ 16, 16-aligned pointers).
+    match op {
+        ElemOp::Add => {
+            hematite_ref::elementwise::add(&input1.0, &input2.0, &params, &mut want.0, &mut [])
+                .expect("harness: ref non-identity add shape");
+            hematite_s3::elementwise::add(&input1.0, &input2.0, &params, &mut got.0, &mut [])
+                .expect("harness: s3 non-identity add shape");
+        }
+        ElemOp::Sub => {
+            hematite_ref::elementwise::sub(&input1.0, &input2.0, &params, &mut want.0, &mut [])
+                .expect("harness: ref non-identity sub shape");
+            hematite_s3::elementwise::sub(&input1.0, &input2.0, &params, &mut got.0, &mut [])
+                .expect("harness: s3 non-identity sub shape");
+        }
+        ElemOp::Mul => {
+            hematite_ref::elementwise::mul(&input1.0, &input2.0, &params, &mut want.0, &mut [])
+                .expect("harness: ref non-identity mul shape");
+            hematite_s3::elementwise::mul(&input1.0, &input2.0, &params, &mut got.0, &mut [])
+                .expect("harness: s3 non-identity mul shape");
+        }
+    }
+
+    report(&compare(name, &got.0, &want.0));
+}
 
 fn pool_params() -> PoolParams {
     PoolParams {
@@ -461,6 +527,72 @@ fn check_relu_simd_matches_ref() {
         .expect("harness: s3 relu shape");
 
     report(&compare("relu_256", &got.0, &want.0));
+}
+
+// ── T3.2 relu6 / hard_swish: the widened activation lane models (256) ───────
+
+fn activation_params(input_offset: i32, output_offset: i32, act_max: i32) -> ActivationParams<'static> {
+    ActivationParams {
+        input_offset,
+        output_offset,
+        output_multiplier: 0,
+        output_shift: 0,
+        quantized_activation_min: 0,
+        quantized_activation_max: act_max,
+        input_multiplier: 0,
+        input_left_shift: 0,
+        input_range_radius: 0,
+        output_multiplier_alpha: 0,
+        output_shift_alpha: 0,
+        output_multiplier_identity: 0,
+        output_shift_identity: 0,
+        alpha_offset: 0,
+        alpha_data: &[],
+        output_multiplier_1: 0,
+        output_shift_1: 0,
+        output_multiplier_2: 0,
+        output_shift_2: 0,
+        reluish_multiplier_fixedpoint_int16: 0,
+        reluish_multiplier_exponent: 0,
+        output_multiplier_fixedpoint_int16: 0,
+        output_multiplier_exponent: 0,
+    }
+}
+
+/// relu6 — the widened lane model (vector min/max clamps, 16-wide) vs ref.
+/// `quantized_six` is forwarded from `quantized_activation_max` (the S3Backend
+/// adapter's contract).
+fn check_relu6_simd_matches_ref() {
+    let input = Aligned(make_pattern::<256>(0x6E51_0FE1));
+    let mut want = Aligned([0i8; 256]);
+    let mut got = Aligned([0i8; 256]);
+    let params = activation_params(-1, 2, 24); // quantized six @ scale 0.25
+
+    hematite_ref::activation::relu6(&input.0, &params, &mut want.0, &mut [], 24)
+        .expect("harness: ref relu6 shape");
+    hematite_s3::activations::relu6(&input.0, &params, &mut got.0, &mut [], 24)
+        .expect("harness: s3 relu6 shape");
+
+    report(&compare("relu6_256", &got.0, &want.0));
+}
+
+/// hard_swish — the DOWNGRADED integer rational formula (goldens-pinned, NOT
+/// the TFLM fixed-point chain). The s3 scalar and the lane model reproduce
+/// the same downgraded math; hematite-ref implements the same downgraded
+/// formula (same-backend semantics — the known TFLM divergence is pinned by
+/// the goldens, not "fixed" here).
+fn check_hard_swish_simd_matches_ref() {
+    let input = Aligned(make_pattern::<256>(0xD0D0_0D0D));
+    let mut want = Aligned([0i8; 256]);
+    let mut got = Aligned([0i8; 256]);
+    let params = activation_params(-3, 1, 127);
+
+    hematite_ref::activation::hard_swish(&input.0, &params, &mut want.0, &mut [])
+        .expect("harness: ref hard_swish shape");
+    hematite_s3::activations::hard_swish(&input.0, &params, &mut got.0, &mut [])
+        .expect("harness: s3 hard_swish shape");
+
+    report(&compare("hard_swish_256", &got.0, &want.0));
 }
 
 // ── Softmax: 1x1000 (spec.rs SOFTMAX_1X1000_PARAMS) ─────────────────────────
@@ -1234,11 +1366,18 @@ pub fn validate_all() {
     run_elementwise_check::<16>(ElemOp::Sub, "sub_n16");
     run_elementwise_check::<32>(ElemOp::Sub, "sub_n32");
     run_elementwise_check::<48>(ElemOp::Sub, "sub_n48");
+    // T3.2 — widened per-lane model with non-identity offsets/multipliers.
+    run_elementwise_non_identity_check::<256>(ElemOp::Add, "add_n256_nonidentity");
+    run_elementwise_non_identity_check::<256>(ElemOp::Mul, "mul_n256_nonidentity");
+    run_elementwise_non_identity_check::<256>(ElemOp::Sub, "sub_n256_nonidentity");
     run_avg_pool_check();
     run_max_pool_check();
     run_generic_avg_pool_check();
     run_generic_max_pool_checks();
     check_relu_simd_matches_ref();
+    // T3.2 — the widened relu6 / hard_swish activation lane models.
+    check_relu6_simd_matches_ref();
+    check_hard_swish_simd_matches_ref();
     check_softmax_simd_matches_ref();
     check_depthwise_simd_matches_ref();
     check_depthwise_dm8_simd_matches_ref();
