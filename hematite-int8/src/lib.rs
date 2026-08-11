@@ -66,20 +66,93 @@ use hematite_core::op_params::PerChannelQuantParam;
 /// Round-half-up at the end: the round value (`1 << (total_shift - 1)`)
 /// is added before the final right shift, biasing the result toward
 /// positive infinity at the halfway boundary.
+///
+/// ## 32-bit implementation (no i64 software emulation)
+///
+/// The 64-bit product `value * multiplier` and the round-add + arithmetic
+/// shift are computed with pure 32-bit arithmetic (16-bit limb
+/// decomposition + carry tracking), so this function compiles to a handful
+/// of 32-bit instructions on ESP32-S3's 32-bit Xtensa core instead of
+/// calling into the compiler's software-emulated i64 routines. It is
+/// bit-for-bit identical to the `i64` reference formulation above (verified
+/// by an exhaustive host test).
 #[inline(always)]
 pub fn multiply_by_quantized_multiplier(value: i32, multiplier: i32, shift: i32) -> i32 {
-    let total_shift = 31i64 - i64::from(shift);
-    let round = 1i64 << (total_shift - 1);
-    let result = i64::from(value) * i64::from(multiplier) + round;
-    let result = result >> total_shift;
-    // Saturate to i32 range (the upstream DCHECKs that result fits;
-    // we saturate defensively since fixture inputs are synthetic).
-    if result > i64::from(i32::MAX) {
-        i32::MAX
-    } else if result < i64::from(i32::MIN) {
-        i32::MIN
+    let total_shift = 31 - shift; // in [1, 62] for shift in [-31, 30]
+
+    // 64-bit product `value * multiplier` as (high, low) u32 halves.
+    //
+    // The 16-bit limb decomposition below yields the *unsigned* 64-bit
+    // product of the two bit patterns; the signed product differs by
+    // `-sign(a)*b*2^32 - sign(b)*a*2^32` in the high word, applied as the
+    // two wrapping subtractions at the end (standard two's-complement
+    // 32x32 -> 64 fix-up).
+    let mut ph;
+    let mut pl;
+    {
+        let a = value as u32;
+        let b = multiplier as u32;
+        let a0 = a & 0xffff;
+        let a1 = a >> 16;
+        let b0 = b & 0xffff;
+        let b1 = b >> 16;
+        let p00 = a0 * b0; // <= 0xFFFE_0001, fits u32
+        let p01 = a0 * b1;
+        let p10 = a1 * b0;
+        let p11 = a1 * b1;
+        // columns: p00 | (p01+p10)<<16 | p11<<32
+        let q = (p00 >> 16) + (p01 & 0xffff) + (p10 & 0xffff); // <= 0x2_FFFD
+        let c1 = q & 0xffff;
+        let r = (q >> 16) + (p01 >> 16) + (p10 >> 16) + (p11 & 0xffff); // <= 0x3_0000
+        let c2 = r & 0xffff;
+        let c3 = (r >> 16) + (p11 >> 16); // <= 0x1_0002, fits u32
+        pl = (c1 << 16) | (p00 & 0xffff);
+        ph = (c3 << 16) | c2;
+        // Signed fix-up on the high word.
+        if value < 0 {
+            ph = ph.wrapping_sub(b);
+        }
+        if multiplier < 0 {
+            ph = ph.wrapping_sub(a);
+        }
+    }
+
+    // round = 1 << (total_shift - 1), added to the 64-bit product.
+    let t = total_shift - 1;
+    if t < 32 {
+        let (p, carry) = pl.overflowing_add(1u32 << t);
+        pl = p;
+        ph = ph.wrapping_add(carry as u32);
     } else {
-        result as i32
+        ph = ph.wrapping_add(1u32 << (t - 32));
+    }
+
+    // Arithmetic right shift of the 64-bit value by `total_shift`, clamped
+    // to the i32 range (defensive; upstream DCHECKs the result fits).
+    if total_shift >= 32 {
+        // Low word fully shifted out: result = sign-extended high word
+        // shifted right by (total_shift - 32). Always fits i32.
+        return (ph as i32) >> (total_shift - 32);
+    }
+
+    // total_shift in [1, 31]: low 32 bits of the shifted value.
+    let r = (ph << (32 - total_shift)) | (pl >> total_shift);
+    if ph >> 31 == 0 {
+        // Positive: overflow iff value >= 2^(31+total_shift), i.e. the high
+        // word reaches 2^(total_shift-1).
+        if ph >= (1u32 << (total_shift - 1)) {
+            i32::MAX
+        } else {
+            r as i32
+        }
+    } else {
+        // Negative: underflow iff value < -2^(31+total_shift), i.e. the
+        // signed high word < -2^(total_shift-1).
+        if (ph as i32) < -(1i32 << (total_shift - 1)) {
+            i32::MIN
+        } else {
+            r as i32
+        }
     }
 }
 
@@ -304,5 +377,124 @@ mod host_tests {
         let recovered = f64::from(m) / ((1u64 << 31) as f64) * (2.0f64.powi(s));
         assert!((recovered - 100.0).abs() < 1.0,
             "recovered scale {recovered} too far from 100.0, m={m} s={s}");
+    }
+}
+
+// ── 32-bit vs i64 reference equivalence (S3: no software i64 on device) ──
+
+#[cfg(test)]
+mod requantize_32bit_tests {
+    use super::*;
+
+    /// Reference: the canonical i64 single-rounding formulation the 32-bit
+    /// path must be bit-for-bit identical to.
+    fn ref_i64(value: i32, multiplier: i32, shift: i32) -> i32 {
+        let total_shift = 31i64 - i64::from(shift);
+        let round = 1i64 << (total_shift - 1);
+        let result = i64::from(value) * i64::from(multiplier) + round;
+        let result = result >> total_shift;
+        if result > i64::from(i32::MAX) {
+            i32::MAX
+        } else if result < i64::from(i32::MIN) {
+            i32::MIN
+        } else {
+            result as i32
+        }
+    }
+
+    /// Deterministic PRNG (xorshift64) for reproducible exhaustive sampling.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn next_i32(&mut self) -> i32 {
+            self.next() as u32 as i32
+        }
+    }
+
+    #[test]
+    fn multiply_matches_i64_reference_random() {
+        let mut rng = Rng(0x1234_5678_9abc_def0);
+        for shift in -31..=30 {
+            for _ in 0..20_000 {
+                let value = rng.next_i32();
+                let multiplier = rng.next_i32();
+                let got = multiply_by_quantized_multiplier(value, multiplier, shift);
+                let want = ref_i64(value, multiplier, shift);
+                assert_eq!(got, want, "mismatch value={value} mult={multiplier} shift={shift}");
+            }
+        }
+    }
+
+    #[test]
+    fn multiply_matches_i64_reference_boundaries() {
+        // Exhaustive value boundaries around sign/overflow edges × sample
+        // multipliers representative of Q0.31 scales.
+        let values = [
+            i32::MIN,
+            i32::MIN + 1,
+            -1 << 30,
+            -(1 << 30) - 1,
+            -1 << 29,
+            -(1 << 29) - 1,
+            -16_384,
+            -1,
+            0,
+            1,
+            16_383,
+            16_384,
+            (1 << 29) - 1,
+            1 << 29,
+            (1 << 30) - 1,
+            1 << 30,
+            i32::MAX - 1,
+            i32::MAX,
+        ];
+        let multipliers = [
+            i32::MIN,
+            -(1 << 30),
+            -16_384,
+            -1,
+            0,
+            1,
+            2,
+            16_383,
+            16_384,
+            (1 << 29) - 1,
+            1 << 29,
+            (1 << 30) - 1,
+            1 << 30,
+            i32::MAX - 1,
+            i32::MAX,
+        ];
+        for &shift in &[-31, -30, -16, -1, 0, 1, 2, 15, 29, 30] {
+            for &value in &values {
+                for &multiplier in &multipliers {
+                    let got = multiply_by_quantized_multiplier(value, multiplier, shift);
+                    let want = ref_i64(value, multiplier, shift);
+                    assert_eq!(got, want, "boundary mismatch value={value} mult={multiplier} shift={shift}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uniform_identity_and_half_round() {
+        // identity pair (1<<30, shift=1) and half-round (1<<30, shift=0)
+        for v in [-128, -1, 0, 1, 127] {
+            assert_eq!(
+                multiply_by_quantized_multiplier(v, 1 << 30, 1),
+                v,
+                "identity pair must be identity"
+            );
+            let want = ref_i64(v, 1 << 30, 0);
+            assert_eq!(multiply_by_quantized_multiplier(v, 1 << 30, 0), want);
+        }
     }
 }

@@ -133,6 +133,11 @@ pub fn depthwise_conv2d(
     // ── Accumulation loop ───────────────────────────────────────────────
     // TFLM depthwise loop order: batch → oh → ow → ic → dm → fh → fw
     // Output channel: oc = dm + ic * depth_multiplier
+    // SAFETY of the `get_unchecked` calls: slice lengths were validated
+    // above (input/weights/bias/output against shape_product + channel
+    // cross-checks), and the in-bounds guard below guarantees `input_idx`
+    // and `filter_idx` point into the validated ranges.
+    let input_offset = params.input_offset;
     for oh in 0..out_h {
         let input_base_h = oh * params.stride_height - pad_h;
 
@@ -142,7 +147,7 @@ pub fn depthwise_conv2d(
             for ic in 0..input_c {
                 for dm in 0..depth_multiplier {
                     let oc = dm + ic * depth_multiplier;
-                    let mut acc: i32 = bias[oc as usize];
+                    let mut acc: i32 = unsafe { *bias.get_unchecked(oc as usize) };
 
                     for fh in 0..filter_h {
                         let in_h = input_base_h + fh * params.dilation_height_factor;
@@ -158,18 +163,22 @@ pub fn depthwise_conv2d(
                                     (fh * filter_row_stride + fw * filter_col_stride + oc)
                                         as usize;
 
-                                let i_val = i32::from(input[input_idx]);
-                                let w_val = i32::from(weights[filter_idx]);
+                                let i_val = i32::from(unsafe {
+                                    *input.get_unchecked(input_idx)
+                                });
+                                let w_val = i32::from(unsafe {
+                                    *weights.get_unchecked(filter_idx)
+                                });
 
-                                acc += (i_val + params.input_offset) * w_val;
+                                acc += (i_val + input_offset) * w_val;
                             }
                             // else: zero-padding — skip (contribute 0 to accumulator)
                         }
                     }
 
                     // Per-channel requantize + output offset + clamp
-                    let multiplier = multipliers[oc as usize];
-                    let shift = shifts[oc as usize];
+                    let multiplier = unsafe { *multipliers.get_unchecked(oc as usize) };
+                    let shift = unsafe { *shifts.get_unchecked(oc as usize) };
                     let scaled = multiply_by_quantized_multiplier(acc, multiplier, shift);
                     let with_offset = scaled + params.output_offset;
 
@@ -242,8 +251,7 @@ fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, Kerne
         - params.input_shape[2])
         / 2;
 
-    if params.depth_multiplier != 1
-        || params.dilation_height_factor != 1
+    if params.dilation_height_factor != 1
         || params.dilation_width_factor != 1
         || filter_h != 3
         || filter_w != 3
@@ -251,8 +259,20 @@ fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, Kerne
     {
         return Ok(false);
     }
+    // `dm > 1` (e.g. kws's ch_mult=8) is supported by broadcasting every input
+    // channel `ic` to the `dm` output slots `[ic·dm, (ic+1)·dm)` in the padded
+    // virtual input; the QACC kernel's `in_c == out_c` per-lane contract then
+    // holds over the `out_c` virtual channels.
+    let dm = params.depth_multiplier.max(1) as usize;
+    if input_c.checked_mul(dm) != Some(out_c) {
+        return Ok(false);
+    }
     // Phase C fold requires the padded fill `-input_offset` to fit in i8.
-    if params.input_offset != 0 && params.input_offset.abs() > 127 {
+    // `-input_offset` is representable for input_offset in [-127, 128] (the
+    // common TFLite input_zero_point=-128 gives input_offset=128, whose
+    // negation -128 = 0x80 fits i8). input_offset=-128 would need +128 and is
+    // rejected.
+    if params.input_offset < -127 || params.input_offset > 128 {
         return Ok(false);
     }
 
@@ -277,11 +297,15 @@ fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, Kerne
     // `out_c / 16` groups, so we zero-pad the input AND filter channel
     // dimensions up to the next multiple of 16 (same trick as the conv3x3
     // channel padding). Padded channels have zero input and zero weights, so
-    // they contribute 0 to every real output channel (depthwise per-lane
-    // semantics: output channel oc only sees input channel oc).
-    let padded_c = ((input_c + 15) / 16) * 16;
-    let needs_channel_pad = padded_c != input_c;
-    let needs_pad = pad_total_h > 0 || pad_total_w > 0 || needs_channel_pad;
+    // they contribute 0 to every real output channel. For `dm > 1` the virtual
+    // input has `out_c` channels (each real channel broadcast `dm` times), so
+    // the padding rounds `out_c`, not `input_c`.
+    let padded_c = ((out_c + 15) / 16) * 16;
+    let needs_channel_pad = padded_c != out_c;
+    // dm>1 always stages the broadcast virtual input (never uses the raw
+    // input directly), even when out_c is already a multiple of 16.
+    let needs_broadcast = dm > 1;
+    let needs_pad = pad_total_h > 0 || pad_total_w > 0 || needs_channel_pad || needs_broadcast;
 
     //   [padded_input: padded_h*padded_w*padded_c]
     //   [padded_filter: 9*padded_c   (only when channel padding)]
@@ -347,7 +371,18 @@ fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, Kerne
                 let drow = unsafe {
                     p_in.add(((h + pad_h) * padded_w + (w + pad_w)) * padded_c) as *mut i8
                 };
-                unsafe { core::ptr::copy_nonoverlapping(srow, drow, input_c) };
+                if dm == 1 {
+                    unsafe { core::ptr::copy_nonoverlapping(srow, drow, input_c) };
+                } else {
+                    // Broadcast: virtual channel `ic·dm + d` <- real channel `ic`.
+                    for ic in 0..input_c {
+                        let v = unsafe { *srow.add(ic) };
+                        let base = ic * dm;
+                        for d in 0..dm {
+                            unsafe { *drow.add(base + d) = v };
+                        }
+                    }
+                }
             }
         }
 
@@ -383,9 +418,12 @@ fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, Kerne
     }
 
     // Depthwise filter is [tap][oc] (HWCN); wsum[oc] = Σ_tap w[tap·out_c + oc].
+    // Computed from the RAW weights (stride `out_c`) so channel padding never
+    // changes the stride `weight_sums_depthwise` steps by (the padded copy is
+    // `[tap][padded_c]`).
     if input_offset != 0 {
         let ws = unsafe { core::slice::from_raw_parts_mut(wsum, out_c) };
-        let wv = unsafe { core::slice::from_raw_parts(k_w_ptr, 9 * k_in_c) };
+        let wv = unsafe { core::slice::from_raw_parts(w_ptr, 9 * out_c) };
         crate::accx::weight_sums_depthwise(ws, wv, out_c);
     }
 

@@ -45,6 +45,8 @@ const fn shifts<const N: usize>() -> [i32; N] {
 
 const MULT_3: [i32; 3] = mults::<3>();
 const SHIFT_3: [i32; 3] = shifts::<3>();
+const MULT_8: [i32; 8] = mults::<8>();
+const SHIFT_8: [i32; 8] = shifts::<8>();
 const MULT_12: [i32; 12] = mults::<12>();
 const SHIFT_12: [i32; 12] = shifts::<12>();
 const MULT_16: [i32; 16] = mults::<16>();
@@ -372,6 +374,28 @@ const SIMD_CONV3X3_SAME_OFF_PARAMS: Conv2DParams<'static> = Conv2DParams {
     quantized_activation_max: 127,
 };
 
+/// Same SAME conv3x3 as `SIMD_CONV3X3_SAME_OFF_PARAMS` but with
+/// `input_offset = 128` — the standard TFLite first-conv value
+/// (`input_zero_point = -128`). Exercises the relaxed Phase C fold guard that
+/// allows `input_offset` up to 128 (`-input_offset = -128` fits i8).
+const SIMD_CONV3X3_SAME_OFF128_PARAMS: Conv2DParams<'static> = Conv2DParams {
+    input_shape: [1, 16, 16, 32],
+    filter_shape: [32, 3, 3, 32],
+    output_shape: [1, 16, 16, 32],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    input_offset: 128,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_32,
+    output_shift_per_channel: &SHIFT_32,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
 /// Stride-2 SAME depthwise (MobileNetV2 downsampling block): the bespoke QACC
 /// depthwise dispatch zero-pads the input spatially and strides in the pixel
 /// loop (Phase B).
@@ -433,6 +457,28 @@ const SIMD_DEPTHWISE_NON16_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseCon
     output_offset: 0,
     output_multiplier_per_channel: &MULT_12,
     output_shift_per_channel: &SHIFT_12,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// Depthwise with depth_multiplier 8 (in 1 channel -> out 8 channels) — the
+/// `dm > 1` broadcast path: every input channel is replicated `dm` times in a
+/// padded virtual input (kws uses ch_mult=8).
+const SIMD_DEPTHWISE_DM8_PARAMS: DepthwiseConv2DParams<'static> = DepthwiseConv2DParams {
+    input_shape: [1, 12, 12, 1],
+    filter_shape: [1, 3, 3, 8],
+    output_shape: [1, 12, 12, 8],
+    padding: Padding::Same,
+    stride_width: 1,
+    stride_height: 1,
+    dilation_width_factor: 1,
+    dilation_height_factor: 1,
+    depth_multiplier: 8,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_8,
+    output_shift_per_channel: &SHIFT_8,
     quantized_activation_min: -128,
     quantized_activation_max: 127,
 };
@@ -660,6 +706,14 @@ pub const fn kernel_specs() -> &'static [KernelSpec] {
             note: "Phase C non-zero input_offset fold row (input_offset=3).",
         },
         KernelSpec {
+            name: "conv3x3_s8 16x16,32x3x3x32 SAME off128 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::Conv2d3x3,
+            params: KernelParams::Conv(&SIMD_CONV3X3_SAME_OFF128_PARAMS),
+            reference: None,
+            note: "Phase C relaxed fold row: input_offset=128 (TFLite input_zero_point=-128).",
+        },
+        KernelSpec {
             name: "fc_s8 256row,64out (SIMD)",
             tier: MemoryTier::Sram,
             op: OpKind::FullyConnected,
@@ -698,6 +752,14 @@ pub const fn kernel_specs() -> &'static [KernelSpec] {
             params: KernelParams::Depthwise(&SIMD_DEPTHWISE_NON16_PARAMS),
             reference: None,
             note: "Phase F non-%16 channel row: 12 channels zero-padded to 16 in scratch.",
+        },
+        KernelSpec {
+            name: "depthwise_s8 12x12,1x3x3x8 SAME dm8 (SIMD)",
+            tier: MemoryTier::Sram,
+            op: OpKind::DepthwiseConv2d,
+            params: KernelParams::Depthwise(&SIMD_DEPTHWISE_DM8_PARAMS),
+            reference: None,
+            note: "dm=8 broadcast row: input channel replicated 8x in padded virtual input (kws ch_mult=8).",
         },
         KernelSpec {
             name: "max_pool_s8 2x2x16 (SIMD)",

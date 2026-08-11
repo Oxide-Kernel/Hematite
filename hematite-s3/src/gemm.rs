@@ -288,19 +288,24 @@ pub fn fully_connected(
 
     // ── Accumulation loop ───────────────────────────────────────────────
     // TFLM loop order: batch(=0) → oc → accum_depth
+    // SAFETY of the `get_unchecked` calls: slice lengths were validated
+    // above (`input.len()==input_dim`, `weights.len()==output_dim*input_dim`,
+    // `bias.len()==output_dim`, `output.len()==output_dim`), so every index
+    // used in this loop is strictly in-bounds.
+    let input_offset = params.input_offset;
     for oc in 0..output_dim {
-        let mut acc: i32 = bias[oc];
+        let mut acc: i32 = unsafe { *bias.get_unchecked(oc) };
 
         let weight_base = oc * input_dim;
         for d in 0..input_dim {
-            let i_val = i32::from(input[d]);
-            let w_val = i32::from(weights[weight_base + d]);
-            acc += (i_val + params.input_offset) * w_val;
+            let i_val = i32::from(unsafe { *input.get_unchecked(d) });
+            let w_val = i32::from(unsafe { *weights.get_unchecked(weight_base + d) });
+            acc += (i_val + input_offset) * w_val;
         }
 
         // Per-channel requantize + output offset + clamp
-        let multiplier = multipliers[oc];
-        let shift = shifts[oc];
+        let multiplier = unsafe { *multipliers.get_unchecked(oc) };
+        let shift = unsafe { *shifts.get_unchecked(oc) };
         let scaled = multiply_by_quantized_multiplier(acc, multiplier, shift);
         let with_offset = scaled + params.output_offset;
 
@@ -319,7 +324,6 @@ pub fn fully_connected(
 
     Ok(())
 }
-
 // ─────────────────────────────────────────────────────────────────────────────
 // TIE728 SIMD backend — device-only (NEVER compiled on host)
 // ─────────────────────────────────────────────────────────────────────────────

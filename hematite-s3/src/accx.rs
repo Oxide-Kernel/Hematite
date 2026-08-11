@@ -81,11 +81,17 @@ pub(crate) fn accx_eligible_3x3(input_c: usize, out_c: usize) -> bool {
 /// Any `input_c >= 1` is accepted: when `input_c % 16 != 0` the dispatch
 /// zero-pads the input and filter channel dimensions in scratch up to the
 /// next multiple of 16 (the kernel VLDs 16-channel vectors and loops
-/// `out_c / 16` groups), so the `% 16` requirement is lifted here. Depthwise
-/// per-lane semantics require `out_c == input_c` (dm == 1).
+/// `out_c / 16` groups), so the `% 16` requirement is lifted here.
+///
+/// Depthwise per-lane semantics require each output channel to map to exactly
+/// one input channel. For `dm > 1` the dispatch broadcasts every input channel
+/// `ic` to the `dm` output channels `[ic·dm, (ic+1)·dm)` in a padded virtual
+/// input, so the QACC kernel's `in_c == out_c` lane contract still holds. This
+/// is only possible when `out_c` is an integer multiple of `input_c` (i.e. a
+/// valid depth multiplier).
 #[inline]
 pub(crate) fn accx_eligible_depthwise(input_c: usize, out_c: usize) -> bool {
-    input_c >= 1 && out_c >= 1 && input_c == out_c
+    input_c >= 1 && out_c >= 1 && out_c % input_c == 0
 }
 
 /// Context for the per-channel requantize epilogue.

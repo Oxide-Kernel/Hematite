@@ -659,9 +659,73 @@ Engineering notes:
   then folding `offset·Σw` per channel after the MAC.
 - `EE.VMAX.S8` (softmax find-max) assembles cleanly; `l8si` does not exist in
   the Xtensa toolchain — use `l8ui` + `sext`.
-- The vendored S16 experiment (`dl_tie728_s16.S` / `_conv2d.S`,
-  `probe_s16.S`) was deleted: S16 QACC lanes saturate at 16 bits, so it could
-  never be bit-exact; the ACCX + QACC-depthwise kernels supersede it.
+ - The vendored S16 experiment (`dl_tie728_s16.S` / `_conv2d.S`,
+   `probe_s16.S`) was deleted: S16 QACC lanes saturate at 16 bits, so it could
+   never be bit-exact; the ACCX + QACC-depthwise kernels supersede it.
+
+### Phase 18 — Scalar performance: 32-bit requantize + unchecked kernels + gate relaxations
+
+Motivated by the real-model zoo benchmark (Phase 17 follow-up): on models where
+the SIMD gates don't fire (tiny models, `depth_multiplier > 1`, `input_offset`
+outside ±127), Hematite's scalar tier was slower than ESP-NN. The goal: make
+the *scalar* fallback faster than ESP-NN everywhere, not model-specific, while
+keeping the 100% bit-exact contract.
+
+Three change groups, all verified on-device bit-exact (bench58, every row
+`out_fnv(ref/s3)` matches):
+
+1. **S3 — 32-bit requantize (`hematite-int8`)**: `multiply_by_quantized_multiplier`
+   rewritten from software-emulated `i64` to pure 32-bit math: 16-bit limb
+   decomposition of the unsigned 64-bit product, a signed high-word fix-up
+   (`if value < 0 { ph -= b } if multiplier < 0 { ph -= a }` — the unsigned
+   high word differs from the signed product by `-sign(a)·b·2³²`), the
+   `1 << (total_shift-1)` round folded into the correct half, and an
+   arithmetic-shift + i32 saturate tail. Bit-exact vs the old i64
+   formulation, proven by 3 new tests (`multiply_matches_i64_reference_random`
+   1.24M samples, boundary edges, identity/half-round pairs). Removes the
+   i64 emulation cost from every scalar requantize on Xtensa.
+2. **S4/S5 — unchecked + hoisted scalar kernels (`hematite-s3`)**: the four
+   scalar fallback loops (gemm/conv1x1/conv3x3/depthwise) now use
+   `get_unchecked` for all hot slices (`bias`, `input`, `weights`, per-channel
+   `multipliers`/`shifts`) after up-front length validation, and hoist
+   `params.input_offset` out of the inner MAC loop. SAFETY comments document
+   the validated-length invariants. Public API stays 100% bounds-checked;
+   `unsafe` is confined to proven-invariant inner loops.
+3. **Gate relaxations** (unlock SIMD for real TFLite shapes):
+   - `input_offset` guards in conv3x3.rs / depthwise.rs relaxed from
+     `abs > 127` to `input_offset < -127 || input_offset > 128` — the common
+     TFLite `input_zero_point = -128` → `input_offset = 128` now fits the
+     `-input_offset as u8` pad-fill (fits i8). New row
+     `conv3x3_s8 16x16,32x3x3x32 SAME off128 (SIMD)`.
+   - **`depth_multiplier > 1` depthwise** (kws `ch_mult=8`, the biggest zoo
+     gap): `accx_eligible_depthwise` relaxed to `out_c % input_c == 0`; the
+     dispatch now broadcasts each input channel `ic` to the `dm` output slots
+     `[ic·dm,(ic+1)·dm)` in a padded virtual input (staged even when
+     `out_c % 16 == 0`), plus a hard `input_c * dm == out_c` guard and a
+     weight-sum fix (read raw `w_ptr` stride `out_c`, not the padded
+     `k_w_ptr`). New row `depthwise_s8 12x12,1x3x3x8 SAME dm8 (SIMD)`.
+
+Bench58 results (board @240MHz, all rows bit-exact):
+
+| row | cycles (min/med) | vs bench55 |
+|---|---|---|
+| fc_s8 271row,3out (scalar path) | 14600/14627 | 17817 → **1.22x faster** (S3+S4/S5) |
+| conv3x3 SAME off128 (NEW, SIMD) | 1121060/1121087 | 0x9a6f4e45 bit-exact |
+| depthwise dm8 (NEW, SIMD) | 91567/91595 | 0x38c725b4 bit-exact, col1=796 |
+| cnn_model | 1703422 | 0x75eb32f5 unchanged |
+| mv2mini | 769931 | 0x7f23eb05 unchanged |
+| mv2real | 653702 | 0x75eb32f5 unchanged |
+
+The `dm8` row makes kws's `ch_mult=8` depthwise SIMD-eligible (the 20x kws
+zoo gap was entirely that gate); `off128` unblocks essentially every real
+TFLite conv (which uses `input_zero_point = -128`).
+
+Engineering notes:
+- The i64 reference formulation is preserved in `hematite-int8` test module
+  (`ref_i64`) and the two formulations are cross-checked over 1.24M+ samples —
+  the 32-bit path is a drop-in, bit-identical replacement.
+- `depth_multiplier > 1` still scalar when the offset guard rejects
+  `input_offset = -128` (needs `+128` fill); rare in practice.
 
 ---
 
@@ -748,10 +812,12 @@ approved. Hardware bring-up (Phase 9), the C-SIMD bit-exact output match
 the prepared-kernel fast path (Phase 12), the bespoke GPR-accumulator
 (ACCX) kernels (Phase 13), the optimized fast64 ACCX paths (Phase 14), the
 requantize fast paths (Phase 15), the **from-scratch full op-sweep
-(Phase 16)**, and the **full MobileNetV2 parity sweep (Phase 17)** are
+(Phase 16)**, the **full MobileNetV2 parity sweep (Phase 17)**, and the
+**scalar-performance sweep (Phase 18)** are
 complete. Phases 9-15 are committed; Phase 16 is committed locally (5
-commits, not pushed); Phase 17 is uncommitted. Host test suite: 34 tests
-in `hematite-benchmarks` + 3 in `hematite-s3`, 0 failures, maintained
+commits, not pushed); Phases 17 and 18 are uncommitted. Host test suite:
+34 tests in `hematite-benchmarks` + 3 in `hematite-int8` (32-bit
+requantize equivalence) + 3 in `hematite-s3`, 0 failures, maintained
 throughout every change in this log.
 
 On-device benchmark state: all **9 SIMD-capable operations** (conv1x1,
@@ -807,11 +873,23 @@ models. The vendored S16 experiment asm was deleted. Final state
 (`bench55`): all 19 kernel rows + 3 models report `out_fnv(ref/s3)` equal
 on the real board.
 
+**Phase 18** targets the scalar tier itself (motivated by the real-model zoo
+benchmark where gates don't fire): the i64 requantize became pure 32-bit
+(S3, bit-exact, 1.24M-sample cross-check), the four scalar kernels use
+`get_unchecked` + hoisted `input_offset` (S4/S5), and two gate relaxations
+unlock SIMD for real TFLite shapes — `input_offset=128` (TFLite
+`input_zero_point=-128`, new `conv3x3 SAME off128` row) and
+`depth_multiplier>1` (kws `ch_mult=8`, new `depthwise dm8` row). bench58 on
+the real board: **every row bit-exact**, scalar-path fc 271→3 improved
+17817→14600 (1.22×), dm8 depthwise runs SIMD at 91595 cyc (col1=796),
+off128 conv runs SIMD at 1121087 cyc, all three models unchanged
+(cnn 1703422, mv2mini 769931, mv2real 653702).
+
 **Open decisions awaiting explicit direction:**
 1. Force-push the rewritten git history to `origin/main`?
 2. The `person_detect`/`mobilenet_v2` rounding divergence's practical
    impact on hardware (now that real timing exists).
-3. Phase 16 + Phase 17 commit/push: everything is uncommitted (or
+3. Phase 16-18 commit/push: everything is uncommitted (or
    committed-only-locally for Phase 16); committing + pushing is pending
    explicit user verification per the standing "don't push until I verify"
    rule. User intent is to open a PR presenting Hematite as the best Rust NN
