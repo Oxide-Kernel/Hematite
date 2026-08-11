@@ -9,17 +9,13 @@ use crate::tflm_math;
 
 /// Reduce mean over axis.
 ///
-/// Arithmetic: i32 accumulate over reduction axis, divide by count
-/// (round-half-away-from-zero), then per-channel requantize via
-/// `multiply_by_quantized_multiplier`.
+/// Arithmetic: i32 accumulate over reduction axis, then TFLM
+/// `QuantizedMeanOrSum` requantize — fold the 1/count divisor into the
+/// multiplier (truncating i64 division), subtract `count * input_zero_point`,
+/// then `multiply_by_quantized_multiplier` + output_offset + clamp.
 ///
-/// ## Divisor encoding
-///
-/// The output_multiplier/shift in this fixture encode ONLY the
-/// requantize scale — they DO NOT include the 1/count factor.
-/// The kernel divides by count BEFORE calling mbm, matching
-/// the TFLM reference `Mean` int8 semantics (two-step:
-/// round(acc/count), then mbm).
+/// Mirrors `reference_ops::QuantizedMeanOrSum` at the golden pin
+/// `18b9e6f2a8c5a9518e588f59c2ba16ef7ef9d551`.
 pub fn generate_mean(w: &mut FixtureWriter) {
     // Input [1, 2, 3, 2] → reduce axis=1 (height) → output [1, 1, 3, 2]
     let input_shape = [1i32, 2, 3, 2];
@@ -51,6 +47,16 @@ pub fn generate_mean(w: &mut FixtureWriter) {
 
     let mut output: Vec<i8> = vec![0i8; 6]; // 1 × 3 × 2
 
+    // TFLM `QuantizedMeanOrSum` (compute_sum == false): fold the 1/count
+    // divisor into the multiplier using truncating i64 division, then
+    // per output subtract `count * input_zero_point`.
+    let count_u64 = count as u64;
+    let in_zp: i32 = -input_offset;
+    let mut mshift = (63 - count_u64.leading_zeros() as i32).min(32);
+    mshift = mshift.min(31 + output_shift);
+    let mean_mult: i32 = (((output_multiplier as i64) << mshift) / count as i64) as i32;
+    let mean_shift: i32 = output_shift - mshift;
+
     for w in 0..input_w {
         for c in 0..channels {
             let mut acc: i32 = 0;
@@ -58,16 +64,9 @@ pub fn generate_mean(w: &mut FixtureWriter) {
                 let idx = (h * input_w + w) as usize * channels as usize + c as usize;
                 acc += i32::from(input[idx]);
             }
-            // Divide by count (round-half-away-from-zero)
-            let averaged = if count == 0 {
-                0
-            } else if acc > 0 {
-                (acc + count / 2) / count
-            } else {
-                (acc - count / 2) / count
-            };
-            // Requantize
-            let scaled = tflm_math::multiply_by_quantized_multiplier(averaged, output_multiplier, output_shift);
+            let shifted = (acc as i64 - in_zp as i64 * count as i64) as i32;
+            // Requantize with the count-adapted multiplier/shift
+            let scaled = tflm_math::multiply_by_quantized_multiplier(shifted, mean_mult, mean_shift);
             let val = (scaled + output_offset).max(activation_min).min(activation_max);
             let out_idx = (w * channels + c) as usize;
             output[out_idx] = val as i8;

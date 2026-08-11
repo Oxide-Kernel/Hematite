@@ -160,6 +160,26 @@ mod models_keyword_spotting {
             assert_eq!(Model::<RefBackend>::output_len(), flat_len(&models::kws_micro_speech_int8::OUTPUT_SHAPE));
         });
     }
+
+    #[test]
+    fn kws_predict_with_arena_matches_scratch() {
+        let _ = KeywordSpottingModel;
+        on_large_stack(|| {
+            let model = Model::new(RefBackend);
+            let expected = model.predict(&models::kws_micro_speech_int8::INPUT_DATA);
+            let mut out = [0i8; OUTPUT_LEN];
+            let mut arena = vec![0i8; ARENA_LEN];
+            let mut scratch = [0u8; 32768];
+            let r = model.predict_with_arena(
+                &models::kws_micro_speech_int8::INPUT_DATA,
+                &mut out,
+                &mut arena,
+                &mut scratch,
+            );
+            assert_eq!(r, Ok(()), "kws arena path must succeed");
+            assert_eq!(out.as_slice(), expected.as_slice(), "kws arena path diverged");
+        });
+    }
 }
 
 // ── Anomaly detection autoencoder (matches anomaly_detect_v2) ──────────────
@@ -209,6 +229,26 @@ mod models_person_detect {
             let _out = model.predict(&models::person_detect_int8::INPUT_DATA);
         });
     }
+
+    #[test]
+    fn person_detect_predict_with_arena_matches_scratch() {
+        let _ = PersonDetectModel;
+        on_large_stack(|| {
+            let model = Model::new(RefBackend);
+            let expected = model.predict(&models::person_detect_int8::INPUT_DATA);
+            let mut out = [0i8; OUTPUT_LEN];
+            let mut arena = vec![0i8; ARENA_LEN];
+            let mut scratch = [0u8; 32768];
+            let r = model.predict_with_arena(
+                &models::person_detect_int8::INPUT_DATA,
+                &mut out,
+                &mut arena,
+                &mut scratch,
+            );
+            assert_eq!(r, Ok(()), "person_detect arena path must succeed");
+            assert_eq!(out.as_slice(), expected.as_slice(), "person_detect arena diverged");
+        });
+    }
 }
 
 // ── Image classification (MobileNetV2 224², matches imagenet_cls) ──────────
@@ -236,4 +276,57 @@ mod models_mobilenet_v2 {
             let _out = model.predict(&models::mobilenet_v2_1_0_224_int8::INPUT_DATA);
         });
     }
+
+    #[test]
+    fn mobilenet_v2_predict_with_arena_matches_scratch() {
+        let _ = MobileNetV2Model;
+        on_large_stack(|| {
+            let model = Model::new(RefBackend);
+            let expected = model.predict(&models::mobilenet_v2_1_0_224_int8::INPUT_DATA);
+            let mut out = [0i8; OUTPUT_LEN];
+            let mut arena = vec![0i8; ARENA_LEN];
+            let mut scratch = [0u8; 32768];
+            let r = model.predict_with_arena(
+                &models::mobilenet_v2_1_0_224_int8::INPUT_DATA,
+                &mut out,
+                &mut arena,
+                &mut scratch,
+            );
+            assert_eq!(r, Ok(()), "mobilenet_v2 arena path must succeed");
+            assert_eq!(out.as_slice(), expected.as_slice(), "mobilenet_v2 arena diverged");
+        });
+    }
+}
+
+// ── Probe: print pub consts per model (each #[model] needs its own module) ─
+#[cfg(test)]
+mod probe_sizes {
+    use super::*;
+    use hematite_codegen::model;
+
+    macro_rules! probe_model {
+        ($name:ident, $path:literal) => {
+            mod $name {
+                use super::*;
+                #[model($path)]
+                pub struct M;
+                #[test]
+                fn print() {
+                    println!(
+                        concat!("PROBE ", stringify!($name), ": input={} out={} arena={}"),
+                        INPUT_LEN,
+                        OUTPUT_LEN,
+                        ARENA_LEN
+                    );
+                }
+            }
+        };
+    }
+
+    probe_model!(sine, "../models/sine.tflite");
+    probe_model!(hello, "../models/zoo/sine_regression/hello_world_int8.tflite");
+    probe_model!(kws, "../models/zoo/keyword_spotting/kws_micro_speech_int8.tflite");
+    probe_model!(anomaly, "../models/zoo/anomaly_detect/anomaly_detect_int8.tflite");
+    probe_model!(person, "../models/zoo/person_detect_vww/person_detect_int8.tflite");
+    probe_model!(mobilenet, "../models/zoo/mobilenetv2_cls/mobilenet_v2_1.0_224_int8.tflite");
 }

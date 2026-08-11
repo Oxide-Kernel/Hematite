@@ -7,6 +7,7 @@
 
 //! hematite-s3 — ESP32-S3 optimized backend.
 
+pub mod backend;
 pub mod conv1x1;
 pub mod accx;
 pub mod elementwise;

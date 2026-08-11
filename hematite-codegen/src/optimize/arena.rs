@@ -208,11 +208,14 @@ fn model_io_ids(indices: &[u32], tensor_count: usize) -> Vec<u16> {
 /// Split out of [`plan_arena`] so the in-crate tests can hand-build graphs
 /// through the pinned pub(crate) IR types (`ParsedTensor`/`ParsedOp` fields
 /// are pub(crate); `ParsedModel`'s are not, so it has no test constructor).
+#[allow(clippy::too_many_arguments)]
 fn plan_from_pieces(
     tensors: &[ParsedTensor<'_>],
     ops: &[ParsedOp<'_>],
     model_inputs: &[u32],
     model_outputs: &[u32],
+    max_internal: usize,
+    psram_budget: Option<usize>,
 ) -> Result<ArenaPlan, ArenaError> {
     let tensor_count = tensors.len();
     if tensor_count > MAX_TENSORS {
@@ -226,7 +229,7 @@ fn plan_from_pieces(
 
     // `psram_budget: None` — the PSRAM pool split is a documented future
     // path (module docs).  Planner errors propagate verbatim to the macro.
-    liveness_plan(&schedule, &sizes, &model_input_ids, &model_output_ids, MAX_INTERNAL, None)
+    liveness_plan(&schedule, &sizes, &model_input_ids, &model_output_ids, max_internal, psram_budget)
         .map_err(ArenaError::Layout)
 }
 
@@ -236,7 +239,36 @@ fn plan_from_pieces(
 /// `hematite-memory`'s [`liveness_plan`].  See the module docs for the
 /// PSRAM split path and the T4.1 wiring contract.
 pub(crate) fn plan_arena(model: &ParsedModel<'_>) -> Result<ArenaPlan, ArenaError> {
-    plan_from_pieces(model.tensors(), model.ops(), model.inputs(), model.outputs())
+    plan_from_pieces(
+        model.tensors(),
+        model.ops(),
+        model.inputs(),
+        model.outputs(),
+        MAX_INTERNAL,
+        None,
+    )
+}
+
+/// Compute the arena layout with an explicit SRAM budget and optional PSRAM
+/// split.
+///
+/// Used by the T4.1 emitter's arena entry point ([`emit_model`]'s
+/// `predict_with_arena`), which needs a budget large enough that no
+/// intermediate spills to PSRAM (`None` = single flat region the caller owns)
+/// — the plan's `offsets` are then all valid in one caller-provided arena.
+pub(crate) fn plan_arena_internal(
+    model: &ParsedModel<'_>,
+    max_internal: usize,
+    psram_budget: Option<usize>,
+) -> Result<ArenaPlan, ArenaError> {
+    plan_from_pieces(
+        model.tensors(),
+        model.ops(),
+        model.inputs(),
+        model.outputs(),
+        max_internal,
+        psram_budget,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -347,7 +379,7 @@ mod tests {
         let schedule = build_schedule(&tensors, &ops).expect("schedule builds");
         let sizes = tensor_byte_sizes(&tensors);
         let plan =
-            plan_from_pieces(&tensors, &ops, &[0], &[3]).expect("3-op chain fits the budget");
+            plan_from_pieces(&tensors, &ops, &[0], &[3], MAX_INTERNAL, None).expect("3-op chain fits the budget");
 
         assert_eq!(plan.offsets[1], 0);
         assert_eq!(plan.offsets[2], 16);
@@ -372,7 +404,7 @@ mod tests {
         let ops =
             vec![op(&[0], &[1]), op(&[1], &[2]), op(&[2], &[3]), op(&[3], &[4])];
         let plan =
-            plan_from_pieces(&tensors, &ops, &[0], &[4]).expect("odd-size graph fits budget");
+            plan_from_pieces(&tensors, &ops, &[0], &[4], MAX_INTERNAL, None).expect("odd-size graph fits budget");
 
         for &off in plan.offsets.iter() {
             if off != OFFSET_NONE {
@@ -405,7 +437,7 @@ mod tests {
         assert_eq!(schedule[1].op_kind, 9);
 
         let plan =
-            plan_from_pieces(&tensors, &ops, &[0], &[2]).expect("in-place graph fits budget");
+            plan_from_pieces(&tensors, &ops, &[0], &[2], MAX_INTERNAL, None).expect("in-place graph fits budget");
         assert_eq!(plan.offsets[1], 0, "in-place tensor gets exactly one offset");
         assert_eq!(plan.peak_arena_bytes, 16, "no duplicate allocation for the in-place output");
     }
@@ -423,7 +455,7 @@ mod tests {
         ];
         let ops = vec![op(&[0], &[1]), op(&[1], &[2]), op(&[0, 2], &[3])];
         let plan =
-            plan_from_pieces(&tensors, &ops, &[0], &[3]).expect("I/O-exclusion graph fits budget");
+            plan_from_pieces(&tensors, &ops, &[0], &[3], MAX_INTERNAL, None).expect("I/O-exclusion graph fits budget");
 
         assert_eq!(plan.offsets[0], OFFSET_NONE, "model input never lives in the arena");
         assert_eq!(plan.offsets[3], OFFSET_NONE, "model output never lives in the arena");
@@ -443,7 +475,7 @@ mod tests {
             tensor("output", &[1], INT8),
         ];
         let ops = vec![op(&[0], &[1]), op(&[1], &[2]), op(&[2], &[3])];
-        let err = plan_from_pieces(&tensors, &ops, &[0], &[3])
+        let err = plan_from_pieces(&tensors, &ops, &[0], &[3], MAX_INTERNAL, None)
             .expect_err("600 KiB live peak exceeds the 512 KiB budget");
         assert_eq!(err, ArenaError::Layout(LayoutError::OutOfBudget));
         assert!(err.to_string().contains("arena plan failed"));
@@ -455,20 +487,20 @@ mod tests {
             tensor("output", &[1], INT8),
         ];
         let ops = vec![op(&[0], &[1]), op(&[1], &[2])];
-        let err = plan_from_pieces(&tensors, &ops, &[0], &[2])
+        let err = plan_from_pieces(&tensors, &ops, &[0], &[2], MAX_INTERNAL, None)
             .expect_err("single tensor over the 512 KiB budget");
         assert_eq!(err, ArenaError::Layout(LayoutError::Oversized));
     }
 
     #[test]
     fn arena_offsets_contract_violations_error_before_planning() {
-        // 65 tensors exceed the planner's MAX_TENSORS arrays.
+        // 257 tensors exceed the planner's MAX_TENSORS arrays.
         let many_tensors: Vec<ParsedTensor<'static>> =
-            (0..65).map(|_| tensor("t", &[1], INT8)).collect();
+            (0..257).map(|_| tensor("t", &[1], INT8)).collect();
         let ops = vec![op(&[0], &[1])];
-        let err = plan_from_pieces(&many_tensors, &ops, &[0], &[1])
-            .expect_err("65 tensors exceed MAX_TENSORS");
-        assert_eq!(err, ArenaError::TooManyTensors { count: 65 });
+        let err = plan_from_pieces(&many_tensors, &ops, &[0], &[1], MAX_INTERNAL, None)
+            .expect_err("257 tensors exceed MAX_TENSORS");
+        assert_eq!(err, ArenaError::TooManyTensors { count: 257 });
 
         // An op with 5 real inputs exceeds MAX_IO_PER_OP.
         let tensors = vec![
@@ -481,7 +513,7 @@ mod tests {
             tensor("output", &[1], INT8),
         ];
         let ops = vec![op(&[1, 2, 3, 4, 5], &[6])];
-        let err = plan_from_pieces(&tensors, &ops, &[0], &[6])
+        let err = plan_from_pieces(&tensors, &ops, &[0], &[6], MAX_INTERNAL, None)
             .expect_err("5-input op exceeds MAX_IO_PER_OP");
         assert_eq!(err, ArenaError::TooManyInputs { op: 0, count: 5 });
         assert!(err.to_string().contains("op 0 has 5 inputs"));
@@ -499,7 +531,7 @@ mod tests {
             tensor("output", &[1, 16], INT8),
         ];
         let ops = vec![op(&[0], &[1]), op(&[1], &[2]), op(&[2], &[3])];
-        let plan = plan_from_pieces(&tensors, &ops, &[0], &[3]).expect("graph fits budget");
+        let plan = plan_from_pieces(&tensors, &ops, &[0], &[3], MAX_INTERNAL, None).expect("graph fits budget");
         assert_eq!(plan.offsets[1], 0, "int32 bias sized 4 bytes per element");
         assert_eq!(plan.offsets[2], 32);
         assert_eq!(plan.peak_arena_bytes, 48);

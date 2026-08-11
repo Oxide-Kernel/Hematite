@@ -10,8 +10,10 @@
 //! ## Crate structure
 //!
 //! * [`model`] — the proc-macro attribute entry point (only public item).
-//! * [`flatbuffer`] — hand-rolled TFLite flatbuffer parser and IR types
-//!   (consumed by T4.1 generate, T4.2a fusion, T4.2b arena, T4.2c layout).
+//! * [`flatbuffer`] — the TFLite flatbuffer parser and IR types, re-exported
+//!   from the shared `hematite-tflite` crate (consumed by T4.1 generate,
+//!   T4.2a fusion, T4.2b arena, T4.2c layout, and by the ESP-NN C codegen
+//!   tool in `tools/`).
 //!
 //! Because this is a proc-macro crate, only the `#[proc_macro_attribute]`
 //! function is publicly exported.  All parser infrastructure lives in
@@ -19,7 +21,7 @@
 
 use proc_macro::TokenStream;
 
-pub(crate) mod flatbuffer;
+pub(crate) use hematite_tflite as flatbuffer;
 pub(crate) mod generate;
 // T4.2a fusion now compiles (see optimize/fusion.rs) — optimize module
 // restored into the shared build per the gating comment below.
