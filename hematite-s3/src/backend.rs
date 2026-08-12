@@ -202,13 +202,24 @@ fn depthwise_scratch_need(params: &DepthwiseConv2DParams) -> usize {
     let needs_channel_pad = padded_c != out_c;
     let dm_gt_1 = params.depth_multiplier > 1;
     let needs_pad = pad_total_h > 0 || pad_total_w > 0 || needs_channel_pad || dm_gt_1;
+    // T4 — in_c == 1 arbitrary-filter layers use the single-channel broadcast
+    // kernel: the staged input is single-channel (padded_h*padded_w), not
+    // padded_c-wide. Mirrors depthwise.rs `use_bc1`.
+    let input_c = params.input_shape[3].max(0) as usize;
+    let use_bc1 = !is_3x3 && input_c == 1;
 
     let wsum = if params.input_offset != 0 { out_c * 4 } else { 0 };
     let partials = if is_3x3 { 0 } else { padded_c * 4 };
     if needs_pad {
-        let pad_input_len = (in_h + pad_total_h) * (in_w + pad_total_w) * padded_c;
+        let pad_input_len = if use_bc1 {
+            (in_h + pad_total_h) * (in_w + pad_total_w)
+        } else {
+            (in_h + pad_total_h) * (in_w + pad_total_w) * padded_c
+        };
         let pad_filter_len = if needs_channel_pad { taps * padded_c } else { 0 };
-        pad_input_len + pad_filter_len + padded_c * 4 + wsum + partials
+        // +48: worst-case alignment padding in the dispatch carve (in_off,
+        // w_off, accs_off each round up to a 16-byte boundary).
+        pad_input_len + pad_filter_len + padded_c * 4 + wsum + partials + 48
     } else {
         out_c * 4 + wsum + partials
     }
@@ -770,7 +781,7 @@ mod tests {
             quantized_activation_min: -128,
             quantized_activation_max: 127,
         };
-        let expect = (14 * 14 * 16) + 0 + (16 * 4);
+        let expect = (14 * 14 * 16) + 0 + (16 * 4) + 48;
         assert_eq!(depthwise_scratch_need(&p), expect);
         assert_eq!(S3Backend::depthwise_conv2d_scratch_size(&p), expect);
 
@@ -782,14 +793,14 @@ mod tests {
         p2.depth_multiplier = 4;
         p2.output_multiplier_per_channel = &[0; 12];
         p2.output_shift_per_channel = &[0; 12];
-        let expect2 = (14 * 14 * 16) + (9 * 16) + (16 * 4);
+        let expect2 = (14 * 14 * 16) + (9 * 16) + (16 * 4) + 48;
         assert_eq!(depthwise_scratch_need(&p2), expect2);
         assert_eq!(S3Backend::depthwise_conv2d_scratch_size(&p2), expect2);
 
         // Non-zero input_offset adds the per-channel weight-sum buffer.
         let mut p3 = p2;
         p3.input_offset = -3;
-        let expect3 = (14 * 14 * 16) + (9 * 16) + (16 * 4) + (12 * 4);
+        let expect3 = (14 * 14 * 16) + (9 * 16) + (16 * 4) + (12 * 4) + 48;
         assert_eq!(depthwise_scratch_need(&p3), expect3);
         assert_eq!(S3Backend::depthwise_conv2d_scratch_size(&p3), expect3);
 
@@ -815,8 +826,9 @@ mod tests {
             quantized_activation_max: 127,
         };
         // padded_h 58, padded_w 46, padded_c 16; staged filter 80*16; accs 16*4;
-        // partials 16*4.
-        let expect4 = (58 * 46 * 16) + (80 * 16) + (16 * 4) + (16 * 4);
+        // partials 16*4. T4 — in_c == 1 triggers the single-channel broadcast
+        // path, so the staged INPUT is single-channel (58*46, not 58*46*16).
+        let expect4 = (58 * 46) + (80 * 16) + (16 * 4) + (16 * 4) + 48;
         assert_eq!(depthwise_scratch_need(&p4), expect4);
         assert_eq!(S3Backend::depthwise_conv2d_scratch_size(&p4), expect4);
     }

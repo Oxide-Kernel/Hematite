@@ -1434,12 +1434,21 @@ pub fn depthwise_scratch_need_codegen(
     let needs_channel_pad = padded_c != out_c;
     let needs_pad =
         pad_total_h > 0 || pad_total_w > 0 || needs_channel_pad || depth_multiplier > 1;
+    // T4 — in_c == 1 arbitrary-filter layers use the single-channel broadcast
+    // kernel (single-channel staged input). Mirrors backend.rs `use_bc1`.
+    let use_bc1 = !is_3x3 && in_c == 1;
     let wsum = if input_offset != 0 { out_c * 4 } else { 0 };
     let partials = if is_3x3 { 0 } else { padded_c * 4 };
     if needs_pad {
-        let pad_input_len = (in_h + pad_total_h) * (in_w + pad_total_w) * padded_c;
+        let pad_input_len = if use_bc1 {
+            (in_h + pad_total_h) * (in_w + pad_total_w)
+        } else {
+            (in_h + pad_total_h) * (in_w + pad_total_w) * padded_c
+        };
         let pad_filter_len = if needs_channel_pad { taps * padded_c } else { 0 };
-        pad_input_len + pad_filter_len + padded_c * 4 + wsum + partials
+        // +48: worst-case alignment padding in the dispatch carve (in_off,
+        // w_off, accs_off each round up to a 16-byte boundary).
+        pad_input_len + pad_filter_len + padded_c * 4 + wsum + partials + 48
     } else {
         out_c * 4 + wsum + partials
     }
