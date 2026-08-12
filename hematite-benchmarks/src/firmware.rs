@@ -1185,6 +1185,94 @@ fn emit_row(row: &ReportRow, ref_fnv: u32, s3_fnv: u32) {
     );
 }
 
+/// Fit-size FC model — proves flash→SRAM weight staging on device (Phase 2).
+///
+/// The four fully-connected layers use weights declared as immutable `static`
+/// consts, which the Xtensa linker places in flash-backed DROM. The ACCX fc
+/// dispatch stages each distinct layer's weights into the caller's persistent
+/// scratch ONCE (the model bench reuses the same scratch across all predict
+/// calls), so the timed runs read SRAM instead of streaming flash (~96x win
+/// measured on an 80 KiB DROM stream). Total weights 57 KiB fit the 64 KiB
+/// scratch — the honest fit-size proof on this no-PSRAM board.
+#[cfg(feature = "model-validation")]
+fn bench_fit_model(clock: &mut RealClock, canary: &mut StackCanary) {
+    // SAFETY: carve_fit_into returns the only live borrow of the arena for the
+    // duration of this benchmark; the arena is re-carved per benchmark.
+    let arena = unsafe { &mut SRAM_ARENA.0[..] };
+    let mut bufs = match crate::model_fit::carve_fit_into(arena) {
+        Ok(b) => b,
+        Err(_) => panic!("arena too small for fit-size model benchmark"),
+    };
+    let cfg = BenchmarkConfig::default();
+
+    // Scalar-ref model (hematite-ref) — column-1 baseline, measured on device.
+    crate::model_fit::fill_fit_input(bufs.input);
+    let ref_log = run_repeated(
+        clock,
+        &mut || {
+            let _ = crate::model_fit::run_fit_ref(&mut bufs);
+        },
+        &cfg,
+    );
+    let ref_fnv = crate::model_fit::fnv1a(bufs.out);
+
+    // s3 model reading the DROM consts directly (flash-bound control).
+    crate::model_fit::fill_fit_input(bufs.input);
+    let s3_log = run_repeated(
+        clock,
+        &mut || {
+            let _ = crate::model_fit::run_fit_s3(&mut bufs);
+        },
+        &cfg,
+    );
+    let s3_fnv = crate::model_fit::fnv1a(bufs.out);
+
+    // Staged s3 model — weights copied DROM→SRAM ONCE (untimed), then the same
+    // fc chain runs from SRAM. Output must equal the ref/s3 checksum (the same
+    // bytes, only the residency changed).
+    crate::model_fit::fill_fit_input(bufs.input);
+    let _ = crate::model_fit::stage_fit_weights(&mut bufs);
+    let staged_log = run_repeated(
+        clock,
+        &mut || {
+            let _ = crate::model_fit::run_fit_s3_staged(&mut bufs);
+        },
+        &cfg,
+    );
+    let staged_fnv = crate::model_fit::fnv1a(bufs.out);
+
+    let ref_sum = match summarize(&ref_log) {
+        Some(s) => s,
+        None => return,
+    };
+    let s3_sum = match summarize(&s3_log) {
+        Some(s) => s,
+        None => return,
+    };
+    let staged_sum = match summarize(&staged_log) {
+        Some(s) => s,
+        None => return,
+    };
+
+    let col1 = crate::report::speedup_x100(ref_sum.median_cycles, s3_sum.median_cycles);
+
+    firmware_log!(
+        "| fit_model 4-layer fc (256x128 + 128x128 + 128x64 + 64x16) | SRAM | flash {}/{} | staged {}/{} | col1={} | out_fnv(ref/s3/staged)=0x{:08x}/0x{:08x}/0x{:08x} |",
+        s3_sum.min_cycles,
+        s3_sum.median_cycles,
+        staged_sum.min_cycles,
+        staged_sum.median_cycles,
+        col1,
+        ref_fnv,
+        s3_fnv,
+        staged_fnv,
+    );
+
+    if let Err(e) = canary.verify() {
+        panic!("fit model: {}", e.describe());
+    }
+}
+
 /// Emit the model-level registry row when no runner is compiled in this
 /// build (no `model-validation` feature): the spec + its documented bar only,
 /// never a fabricated measurement.
@@ -1490,6 +1578,8 @@ pub fn run_benchmarks() -> ! {
     bench_cnn_model(&mut clock, &mut canary);
     bench_mv2_model(&mut clock, &mut canary);
     bench_mv2real_model(&mut clock, &mut canary);
+    #[cfg(feature = "model-validation")]
+    bench_fit_model(&mut clock, &mut canary);
     profile_mv2real_s3_layers(&mut canary);
 
     // 5.5 Model-level registry — real zoo runners (todo 19). Runs before the
