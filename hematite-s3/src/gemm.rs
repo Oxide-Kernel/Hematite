@@ -287,6 +287,7 @@ fn fc_accx_dispatch(ctx: &mut FcAccxCtx<'_>, uniform: (i32, i32)) -> Result<bool
     let out_offset = params.output_offset;
     let (uniform_mult, uniform_shift) = uniform;
 
+    #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
     unsafe {
         crate::accx::accx_conv1x1(k_in_ptr, k_w_ptr, accs, padded_dim, output_dim);
     }

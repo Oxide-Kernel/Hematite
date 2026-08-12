@@ -203,8 +203,6 @@ static mut WSUM_CACHE: [WsumCacheSlot; WSUM_CACHE_SLOTS] = [WsumCacheSlot {
 /// Round-robin eviction cursor (the next miss overwrites this slot).
 static mut WSUM_CACHE_NEXT: usize = 0;
 
-/// Look up or compute the weight sums for a padded fc/conv weights buffer.
-///
 /// Returns a reference to the caller-provided `out` slice (filled either from
 /// the cache or freshly). Cache key: `(w_ptr, input_offset, padded_dim,
 /// output_dim)`. On a miss the sums are computed via [`weight_sums_conv`] and
@@ -455,6 +453,7 @@ mod device {
     global_asm!(include_str!("asm/s8_requantize.S"));
     global_asm!(include_str!("asm/s8_accx_depthwise.S"));
     global_asm!(include_str!("asm/s8_accx_depthwise_anytap.S"));
+    global_asm!(include_str!("asm/s8_accx_depthwise_anytap_bc1.S"));
 
     /// One input vector → `out_c` raw int32 accumulators.
     ///
@@ -597,6 +596,48 @@ mod device {
     pub unsafe fn accx_depthwise_anytap(ctx: *const AnyTapCtx) {
         asm!(
             "call8 s8_accx_depthwise_anytap",
+            in("a10") ctx,
+            out("a11") _,
+            out("a12") _,
+            out("a13") _,
+            out("a14") _,
+            out("a15") _,
+            clobber_abi("C"),
+        );
+    }
+
+    /// T4 — single-channel broadcast depthwise kernel args (in_c == 1 fast
+    /// path). Layout mirrors [`AnyTapCtx`] EXCEPT the kernel does NOT advance
+    /// the input pointer by g*16 between output groups: for in_c == 1 every
+    /// output lane reads the SAME input byte per tap (broadcast via
+    /// EE.VLDBC.8), so the input stays at the tap base while only the filter
+    /// strides by g*16. `in_c` MUST be 1 (the input byte advance per tap);
+    /// `out_c` is padded_c (filter tap stride, %16, >=16). See the `.S` header.
+    #[repr(C)]
+    pub struct Bc1Ctx {
+        pub input: *const i8,
+        pub filter: *const i8,
+        pub acc_out: *mut i32,
+        pub in_c: u32,
+        pub out_c: u32,
+        pub row_delta: u32,
+        pub taps: u32,
+        pub filter_w: u32,
+        pub col_start: u32,
+    }
+
+    /// One ≤32-tap QACC pass for an in_c == 1 arbitrary-filter depthwise →
+    /// `out_c` raw int32 partial accumulators (Rust adds them into its running
+    /// i32 accs). Single-channel broadcast variant of [`accx_depthwise_anytap`]
+    /// — eliminates the padded_c-wide input replication when in_c == 1.
+    ///
+    /// # Safety
+    /// `ctx` must point at a valid [`Bc1Ctx`]; `filter` 16-byte aligned,
+    /// `acc_out` 16-byte aligned, `in_c == 1`, `out_c % 16 == 0`, `out_c >= 16`,
+    /// buffers sized, `taps` in 1..=32.
+    pub unsafe fn accx_depthwise_anytap_bc1(ctx: *const Bc1Ctx) {
+        asm!(
+            "call8 s8_accx_depthwise_anytap_bc1",
             in("a10") ctx,
             out("a11") _,
             out("a12") _,
