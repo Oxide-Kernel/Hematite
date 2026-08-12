@@ -816,6 +816,35 @@ const SIMD_FC_8X128_PARAMS: FullyConnectedParams<'static> = FullyConnectedParams
     quantized_activation_max: 127,
 };
 
+/// FC 640→128, input_offset 0 — anomaly_detect's op0 dense layer (exact
+/// model dims, uniform mults). Isolates the Rust kernel path at in_c=640
+/// (40 groups) vs the C-harness isolation.
+const SIMD_FC_640X128_PARAMS: FullyConnectedParams<'static> = FullyConnectedParams {
+    input_dim: 640,
+    output_dim: 128,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_128,
+    output_shift_per_channel: &SHIFT_128,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
+/// FC 128→128, input_offset 0 — anomaly_detect's op1..op3/op6..op8 dense
+/// layers (exact model dims).
+const SIMD_FC_128X128_PARAMS: FullyConnectedParams<'static> = FullyConnectedParams {
+    input_dim: 128,
+    output_dim: 128,
+    input_offset: 0,
+    weights_offset: 0,
+    output_offset: 0,
+    output_multiplier_per_channel: &MULT_128,
+    output_shift_per_channel: &SHIFT_128,
+    quantized_activation_min: -128,
+    quantized_activation_max: 127,
+};
+
 // ── Conv1x1 channel-padded shapes (T3.3 pad-in-scratch widening) ─────────────
 
 /// 1×1 conv, input_c 3 (non-%16) — the first-conv family (e.g. a 3-channel
@@ -1768,6 +1797,22 @@ pub const fn kernel_specs() -> &'static [KernelSpec] {
                 source: "plan composed-kernels Scope table (user-verified 2026-08-10): anomaly 28,550,253 → 7,758,145 cyc (3.7x). Measured Hematite row lands in T6.x (on-device).",
             }),
             note: "T3.6 anomaly_detect 6th dense (the only gated-out FC): input_dim 8 zero-padded to 16; non-zero input_offset fold over padded rows.",
+        },
+        KernelSpec {
+            name: "fc_s8 640row,128out (anomaly op0, kernel-isolate)",
+            tier: MemoryTier::Sram,
+            op: OpKind::FullyConnected,
+            params: KernelParams::Fc(&SIMD_FC_640X128_PARAMS),
+            reference: None,
+            note: "TEMP-DEBUG: exact anomaly op0 dims (640→128, uniform mults) to isolate the Rust kernel path at in_c=640/40 groups.",
+        },
+        KernelSpec {
+            name: "fc_s8 128row,128out (anomaly op1-3/6-8, kernel-isolate)",
+            tier: MemoryTier::Sram,
+            op: OpKind::FullyConnected,
+            params: KernelParams::Fc(&SIMD_FC_128X128_PARAMS),
+            reference: None,
+            note: "TEMP-DEBUG: exact anomaly inner dense dims (128→128, uniform mults) to isolate the Rust kernel path at in_c=128/8 groups.",
         },
         KernelSpec {
             name: "conv1x1_s8 1x1,3->16 (padded, T3.3)",

@@ -187,7 +187,7 @@ static int8_t __attribute__((aligned(16))) c_arena[C_ARENA_BYTES];
 #define c_l6b     ((int32_t *)(c_arena + 768 + 2048 + 2048 + 4096 + 1024 + 2048 + 16 + 864 + 32 * 4 + 288 + 32 * 4 + 2048 + 64 * 4 + 576 + 64 * 4 + 8192 + 128 * 4 + 32768)) /* 16 */
 
 /* scratch for esp_nn conv/depthwise */
-static int8_t __attribute__((aligned(16))) s_scratch[8 * 1024];
+static int8_t __attribute__((aligned(16))) s_scratch[12 * 1024];
 
 /* ---------------- fill ---------------- */
 static void fill_pattern(void)
@@ -1045,10 +1045,6 @@ void app_main(void)
     run_zoo_models();
 
     printf("=== benchmark complete - ESP-NN halt ===\n");
-
-    /* ============ ZOO MODELS (real weights + golden inputs, generated) ============ */
-    extern void zoo_run_all(void);
-    zoo_run_all();
 
     vTaskDelay(pdMS_TO_TICKS(1000));
 }

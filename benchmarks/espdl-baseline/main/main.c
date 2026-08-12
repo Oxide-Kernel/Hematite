@@ -177,6 +177,40 @@ typedef struct {
 } AnyTapCtx;
 extern void s8_accx_depthwise_anytap(AnyTapCtx *ctx);
 
+/* ---- bc1 broadcast depthwise (s8_accx_depthwise_anytap_bc1.S) ---- */
+typedef struct {
+    const int8_t *input;
+    const int8_t *filter;
+    int32_t      *acc_out;
+    uint32_t      in_c;
+    uint32_t      out_c;
+    uint32_t      row_delta;
+    uint32_t      taps;
+    uint32_t      filter_w;
+    uint32_t      col_start;
+} Bc1Ctx;
+extern void s8_accx_depthwise_anytap_bc1(Bc1Ctx *ctx);
+
+/* ---- VLDBC.8 broadcast semantics probe ---- */
+extern void probe_vldbc(const int8_t *src, int8_t *out, int32_t offset);
+static int8_t __attribute__((aligned(16))) s_vldbc_in[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+static int8_t __attribute__((aligned(16))) s_vldbc_out[16];
+static int8_t __attribute__((aligned(16))) s_vldbc_neg[16] = {0x80, 0xFF, 0x7F, 0x00, 0x80, 0xFF, 0x7F, 0x00, 0x80, 0xFF, 0x7F, 0x00, 0x80, 0xFF, 0x7F, 0x00};
+static void probe_vldbc_run(void) {
+    for (int off = 0; off < 4; off++) {
+        probe_vldbc(s_vldbc_in, s_vldbc_out, off);
+        printf("[probe_vldbc] pos off=%d (addr%%16=%d) out=", off, (int)((uintptr_t)(s_vldbc_in + off) & 15));
+        for (int i = 0; i < 16; i++) printf("%d ", s_vldbc_out[i]);
+        printf("\n");
+    }
+    for (int off = 0; off < 4; off++) {
+        probe_vldbc(s_vldbc_neg, s_vldbc_out, off);
+        printf("[probe_vldbc] NEG off=%d (byte=0x%02x) out=", off, (unsigned)(uint8_t)s_vldbc_neg[off]);
+        for (int i = 0; i < 16; i++) printf("%d ", s_vldbc_out[i]);
+        printf("\n");
+    }
+}
+
 
 /* ---- conv1x1 64x1x1x64 ---- */
 #define IN_C   64
@@ -198,6 +232,16 @@ extern void s8_accx_depthwise_anytap(AnyTapCtx *ctx);
 #define FC_IN_DIM  256
 #define FC_OUT_DIM 64
 #define FC_W_LEN   (FC_IN_DIM * FC_OUT_DIM)
+
+/* ---- TEMP-DEBUG: anomaly-shaped fc rows (pure kernel isolation).
+ * Groups = in_c/16 is the kernel-loop driver; out_c is just the oc loop
+ * count, so out=16 keeps DRAM small while exercising in_c=640/128. */
+#define A640_IN_DIM 640
+#define A640_OUT_DIM 16
+#define A640_W_LEN  (A640_IN_DIM * A640_OUT_DIM)
+#define A128_IN_DIM 128
+#define A128_OUT_DIM 16
+#define A128_W_LEN  (A128_IN_DIM * A128_OUT_DIM)
 
 /* ---- pools 32x32x16 -> 16x16x16 ---- */
 #define P_IN_H  32
@@ -224,6 +268,32 @@ static int8_t  s_fc_in[FC_IN_DIM] __attribute__((aligned(16)));
 static int8_t  s_fc_w[FC_W_LEN] __attribute__((aligned(16)));
 static int32_t s_fc_b[FC_OUT_DIM] __attribute__((aligned(16)));
 static int8_t  s_fc_out[FC_OUT_DIM] __attribute__((aligned(16)));
+
+/* TEMP-DEBUG: anomaly-shaped fc buffers (pure kernel isolation). */
+static int8_t  s_a640_in[A640_IN_DIM] __attribute__((aligned(16)));
+static int8_t  s_a640_w[A640_W_LEN] __attribute__((aligned(16)));
+static int32_t s_a640_accx[A640_OUT_DIM] __attribute__((aligned(16)));
+static int8_t  s_a128_in[A128_IN_DIM] __attribute__((aligned(16)));
+static int8_t  s_a128_w[A128_W_LEN] __attribute__((aligned(16)));
+static int32_t s_a128_accx[A128_OUT_DIM] __attribute__((aligned(16)));
+/* TEMP-DEBUG (flash-latency hypothesis): same weight shape but `static const`
+ * so the linker places it in DROM (flash, 0x3c...) instead of DRAM (SRAM). */
+static const int8_t s_a640_w_const[A640_W_LEN] __attribute__((aligned(16))) = {
+    [0 ... (A640_W_LEN - 1)] = 0x0b
+};
+static const int8_t s_a128_w_const[A128_W_LEN] __attribute__((aligned(16))) = {
+    [0 ... (A128_W_LEN - 1)] = 0x0b
+};
+/* TEMP-DEBUG: FULL 640x128 DROM weight stream (80KB, exceeds DCache) — the
+ * exact anomaly op0/op9 weight footprint. Const => DROM, no DRAM cost. */
+#define A640B_IN_DIM  640
+#define A640B_OUT_DIM 128
+#define A640B_W_LEN   (A640B_IN_DIM * A640B_OUT_DIM)
+static const int8_t s_a640b_w_const[A640B_W_LEN] __attribute__((aligned(16))) = {
+    [0 ... (A640B_W_LEN - 1)] = 0x0b
+};
+static int8_t  s_a640b_in[A640B_IN_DIM] __attribute__((aligned(16)));
+static int32_t s_a640b_accx[A640B_OUT_DIM] __attribute__((aligned(16)));
 
 static int8_t  s_p_in[P_IN_LEN] __attribute__((aligned(16)));
 static int8_t  s_p_out[P_OUT_LEN] __attribute__((aligned(16)));
@@ -297,6 +367,13 @@ static void fill_pattern_fc(void) {
     for (int i = 0; i < FC_IN_DIM; i++)  s_fc_in[i]  = (int8_t)((i * 7 + 3) & 0xFF);
     for (int i = 0; i < FC_W_LEN; i++)   s_fc_w[i]   = (int8_t)((i * 13 + 11) & 0xFF);
     for (int i = 0; i < FC_OUT_DIM; i++) s_fc_b[i]   = (int32_t)(i * 17 - 8);
+
+    /* TEMP-DEBUG: fill the anomaly-shaped fc buffers too. */
+    for (int i = 0; i < A640_IN_DIM; i++)  s_a640_in[i]  = (int8_t)((i * 7 + 3) & 0xFF);
+    for (int i = 0; i < A640_W_LEN; i++)   s_a640_w[i]   = (int8_t)((i * 13 + 11) & 0xFF);
+    for (int i = 0; i < A128_IN_DIM; i++)  s_a128_in[i]  = (int8_t)((i * 7 + 3) & 0xFF);
+    for (int i = 0; i < A128_W_LEN; i++)   s_a128_w[i]   = (int8_t)((i * 13 + 11) & 0xFF);
+    for (int i = 0; i < A640B_IN_DIM; i++) s_a640b_in[i] = (int8_t)((i * 7 + 3) & 0xFF);
     for (int i = 0; i < FC_OUT_DIM; i++) s_fc_out[i] = 0;
 }
 
@@ -912,6 +989,28 @@ static void kern_fc_orig_pure(void) {
     s8_accx_conv1x1_orig(s_fc_in, s_fc_w, s_fc_accx, FC_IN_DIM, FC_OUT_DIM);
 }
 
+/* TEMP-DEBUG: anomaly-shaped pure kernel rows. */
+static void kern_a640_pure(void) {
+    s8_accx_conv1x1(s_a640_in, s_a640_w, s_a640_accx, A640_IN_DIM, A640_OUT_DIM);
+}
+
+static void kern_a128_pure(void) {
+    s8_accx_conv1x1(s_a128_in, s_a128_w, s_a128_accx, A128_IN_DIM, A128_OUT_DIM);
+}
+
+/* Flash-latency hypothesis: identical call but weights come from DROM consts. */
+static void kern_a640_pure_drom(void) {
+    s8_accx_conv1x1(s_a640_in, s_a640_w_const, s_a640_accx, A640_IN_DIM, A640_OUT_DIM);
+}
+
+static void kern_a128_pure_drom(void) {
+    s8_accx_conv1x1(s_a128_in, s_a128_w_const, s_a128_accx, A128_IN_DIM, A128_OUT_DIM);
+}
+
+/* Full 640x128 DROM stream — the exact anomaly op0/op9 footprint. */
+static void kern_a640b_pure_drom(void) {
+    s8_accx_conv1x1(s_a640b_in, s_a640b_w_const, s_a640b_accx, A640B_IN_DIM, A640B_OUT_DIM);
+}
 static int32_t s_c3_accx[C3_OUT_C] __attribute__((aligned(16)));
 static int8_t s_ref[C3_OUT_LEN] __attribute__((aligned(16)));
 static int8_t s_ref64[FC_OUT_DIM] __attribute__((aligned(16)));
@@ -1056,6 +1155,80 @@ static void kern_anytap_kws_pure(void) {
     }
 }
 
+/* bc1 broadcast-kernel mirror of the Rust dispatch: single-channel padded
+ * input (58x46), filter [80][16] padded_c, per-pixel x 3 chunks of 32 taps,
+ * partials folded — NO wsum/requantize, exactly like kern_anytap_kws_pure. */
+#define s_kws_in1  (s_c3_in)   /* 65536B >= 58*46=2668B single-channel */
+/* Stage the single-channel padded input: channel-0 byte of each (h,w) from
+ * the padded_c-wide fill, matching the Rust dispatch's single-channel copy. */
+static void fill_kws_bc1(void) {
+    for (int i = 0; i < KWS_FH * KWS_FW * KWS_PC; i++)
+        s_kws_w[i] = (i % KWS_PC < 8) ? (int8_t)((i * 13 + 11) & 0xFF) : 0;  /* pad lanes 8-15 zero */
+    for (int h = 0; h < KWS_PAD_H; h++)
+        for (int w = 0; w < KWS_PAD_W; w++)
+            s_kws_in1[h * KWS_PAD_W + w] = (int8_t)(((h * KWS_PAD_W + w) * 16 * 7 + 3) & 0xFF);
+    for (int i = 0; i < KWS_PC; i++) { s_kws_part[i] = 0; s_kws_accx[i] = 0; }
+}
+static void kern_bc1_kws_pure(void) {
+    const uint32_t row_delta = (KWS_PAD_W - KWS_FW) * 1;   /* single-channel */
+    const uint32_t filt_w = KWS_FW;
+    for (int oh = 0; oh < KWS_OH; oh++) {
+        for (int ow = 0; ow < KWS_OW; ow++) {
+            const int px = (oh * 2 * KWS_PAD_W + ow * 2) * 1; /* k_in_c==1 */
+            int tap_start = 0;
+            while (tap_start < KWS_FH * KWS_FW) {
+                int taps = KWS_FH * KWS_FW - tap_start;
+                if (taps > 32) taps = 32;
+                const int row = tap_start / KWS_FW;
+                const int col = tap_start % KWS_FW;
+                const int8_t *in_ptr = s_kws_in1 + px +
+                    (row * (KWS_FW * 1 + row_delta) + col * 1);
+                Bc1Ctx ctx;
+                ctx.input = in_ptr;
+                ctx.filter = s_kws_w + tap_start * KWS_PC;   /* [tap][16] */
+                ctx.acc_out = s_kws_part;
+                ctx.in_c = 1;
+                ctx.out_c = KWS_PC;
+                ctx.row_delta = row_delta;
+                ctx.taps = (uint32_t)taps;
+                ctx.filter_w = filt_w;
+                ctx.col_start = (uint32_t)col;
+                s8_accx_depthwise_anytap_bc1(&ctx);
+                for (int i = 0; i < KWS_PC; i++)
+                    s_kws_accx[i] = s_kws_accx[i] + s_kws_part[i];
+                tap_start += taps;
+            }
+        }
+    }
+}
+/* Correct scalar over the SAME single-channel padded 58x46 input: per output
+ * pixel, 80 taps at (oh*2 + row - pad, ow*2 + col - pad) with pad=1, reading
+ * the padded single-channel buffer directly (0 for OOB = the -fill/off fold
+ * analogue). */
+static void kern_scalar_kws_bc1(void) {
+    const int32_t out_h = 25, out_w = 20, out_c = 8, fh = 10, fw = 8;
+    for (int32_t oh = 0; oh < out_h; oh++) {
+        for (int32_t ow = 0; ow < out_w; ow++) {
+            for (int32_t oc = 0; oc < KWS_PC; oc++) {
+                int32_t acc = 0;
+                for (int32_t k = 0; k < fh; k++) {
+                    for (int32_t l = 0; l < fw; l++) {
+                        const int32_t ih = oh * 2 + k;   /* kernel reads the
+                                                            directly-filled
+                                                            padded buffer at
+                                                            (oh*2+row, ow*2+col) */
+                        const int32_t iw = ow * 2 + l;
+                        const int32_t inb = (ih >= 0 && ih < KWS_PAD_H && iw >= 0 && iw < KWS_PAD_W)
+                            ? s_kws_in1[ih * KWS_PAD_W + iw] : 0;
+                        acc += inb * s_kws_w[(k * fw + l) * KWS_PC + oc];
+                    }
+                }
+                s_kws_accx[oc] = s_kws_accx[oc] + acc;  /* fold like the kernel */
+            }
+        }
+    }
+}
+
 /* Scalar depthwise mirror of hematite-ref for the kws shape: [1,49,40,1] ->
  * [1,25,20,8], SAME stride2, 10x8 filter, input_offset 128, act 0..127.
  * Uses the raw (unpadded) s_c3_in buffer as the 49x40x1 input. */
@@ -1139,6 +1312,7 @@ void app_main(void) {
     probe_accx_run();
     probe_s8accx_run();
     probe_qacc_layout_run();
+    probe_vldbc_run();
 
     /* conv1x1 64x1x1x64 */
     run_bench("conv1x1_s8 64x1x1x64 TIE728-SIMD (dl_tie728_s8_conv2d_11cn)",
@@ -1203,6 +1377,12 @@ void app_main(void) {
     run_bench("depthwise_s8 kws 49x40,1x10x8x8 dm8 S2 SCALAR (raw bounds-skip)",
               fill_kws, kern_scalar_kws, (const int8_t *)s_kws_accx,
               KWS_PC * 4);
+    run_bench("depthwise_s8 kws 49x40,1x10x8x8 dm8 S2 BC1 PURE (broadcast kernel)",
+              fill_kws_bc1, kern_bc1_kws_pure, (const int8_t *)s_kws_accx,
+              KWS_PC * 4);
+    run_bench("depthwise_s8 kws 49x40,1x10x8x8 dm8 S2 BC1 SCALAR (same data)",
+              fill_kws_bc1, kern_scalar_kws_bc1, (const int8_t *)s_kws_accx,
+              KWS_PC * 4);
 
     /* fc 256 -> 64 */
     run_bench("fc_s8 256row,64out TIE728-SIMD (dl_tie728_s8_conv2d_11cn)",
@@ -1226,6 +1406,19 @@ void app_main(void) {
     printf("== fc_s8 256row,64out BESPOKE-ACCX orig PURE ==\n");
     run_bench("fc_s8 256row,64out BESPOKE-ACCX orig PURE", fill_pattern_fc,
               kern_fc_orig_pure, (const int8_t *)s_fc_accx, FC_OUT_DIM * 4);
+
+    run_bench("fc_s8 640row,16out BESPOKE-ACCX PURE (in_c=640) HWLOOP", fill_pattern_fc,
+              kern_a640_pure, (const int8_t *)s_a640_accx, A640_OUT_DIM * 4);
+    run_bench("fc_s8 128row,16out BESPOKE-ACCX PURE (in_c=128) HWLOOP", fill_pattern_fc,
+              kern_a128_pure, (const int8_t *)s_a128_accx, A128_OUT_DIM * 4);
+    printf("== DROM vs SRAM weights (flash-latency hypothesis) ==\n");
+    run_bench("fc_s8 640row,16out PURE DROM-w (in_c=640) HWLOOP", fill_pattern_fc,
+              kern_a640_pure_drom, (const int8_t *)s_a640_accx, A640_OUT_DIM * 4);
+    run_bench("fc_s8 128row,16out PURE DROM-w (in_c=128) HWLOOP", fill_pattern_fc,
+              kern_a128_pure_drom, (const int8_t *)s_a128_accx, A128_OUT_DIM * 4);
+    printf("== full 640x128 DROM stream (80KB, exact anomaly op0 footprint) ==\n");
+    run_bench("fc_s8 640row,128out PURE DROM-w (in_c=640) HWLOOP", fill_pattern_fc,
+              kern_a640b_pure_drom, (const int8_t *)s_a640b_accx, A640B_OUT_DIM * 4);
 
     /* max pool 2x2x16 */
     run_bench("max_pool_s8 2x2x16 TIE728-SIMD (dl_tie728_s8_max_pool2d_22c1)",
