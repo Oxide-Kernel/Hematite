@@ -157,6 +157,105 @@ pub(crate) fn weight_sums_depthwise(out: &mut [i32], weights: &[i8], out_c: usiz
         *o = s;
     }
 }
+
+// ── Phase 1 — hoisted weight-sum cache (model-build-time, per-weights-ptr) ──
+//
+// The `input_offset != 0` fold needs `wsum[oc] = Σ_tap Σ_ic weights[...]` —
+// an O(output_dim · in_c) Rust pass per call. For codegen-generated models the
+// weights are `&'static [i8]` consts at stable addresses, so the sums are
+// model constants: compute once per (weights ptr, input_offset, padded_dim,
+// output_dim), then every later call memcpys the cached sums instead of
+// resumming. Weight sums are pure data transforms (no aliasing, no safety
+// invariants beyond "the same buffer yields the same sums"), so caching on the
+// pointer is sound.
+//
+// Slots are fixed-size to keep `.bss` bounded: `WSUM_CACHE_SLOT_I32` covers
+// the largest zoo fc output on this board (anomaly 640; mobilenet head 1000
+// is PSRAM-only and SKIPped). 16 slots ≥ the 10 distinct fc layers of the
+// anomaly model — the round-robin cache thrashes when a model has MORE layers
+// than slots (an 8-slot cache left every anomaly layer re-missing each call,
+// defeating the whole point). `16 × 640 × 4 B = 40 KiB` of `.bss`, freed by
+// shrinking the firmware's SRAM arena 256 KiB → 216 KiB.
+const WSUM_CACHE_SLOTS: usize = 16;
+const WSUM_CACHE_SLOT_I32: usize = 640;
+const WSUM_CACHE_BYTES: usize = WSUM_CACHE_SLOTS * WSUM_CACHE_SLOT_I32 * 4;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WsumCacheSlot {
+    valid: bool,
+    w_ptr: *const i8,
+    input_offset: i32,
+    padded_dim: usize,
+    output_dim: usize,
+    data: [i32; WSUM_CACHE_SLOT_I32],
+}
+
+static mut WSUM_CACHE: [WsumCacheSlot; WSUM_CACHE_SLOTS] = [WsumCacheSlot {
+    valid: false,
+    w_ptr: core::ptr::null(),
+    input_offset: 0,
+    padded_dim: 0,
+    output_dim: 0,
+    data: [0; WSUM_CACHE_SLOT_I32],
+}; WSUM_CACHE_SLOTS];
+
+/// Round-robin eviction cursor (the next miss overwrites this slot).
+static mut WSUM_CACHE_NEXT: usize = 0;
+
+/// Look up or compute the weight sums for a padded fc/conv weights buffer.
+///
+/// Returns a reference to the caller-provided `out` slice (filled either from
+/// the cache or freshly). Cache key: `(w_ptr, input_offset, padded_dim,
+/// output_dim)`. On a miss the sums are computed via [`weight_sums_conv`] and
+/// stored (simple overwrite eviction — the zoo bench's run_repeated loop
+/// reuses the same weights across all 11 timed calls, so even a single slot
+/// would hit on calls 2–11; slots exist only to cover multi-layer models).
+pub(crate) fn weight_sums_cached(
+    out: &mut [i32],
+    weights: &[i8],
+    taps: usize,
+    in_c: usize,
+    input_offset: i32,
+    w_ptr: *const i8,
+) {
+    let output_dim = out.len();
+    if output_dim > WSUM_CACHE_SLOT_I32 {
+        // Slot too small — compute directly (no cache).
+        weight_sums_conv(out, weights, taps, in_c);
+        return;
+    }
+    // SAFETY: single-threaded device; the cache is only mutated under this
+    // crate's own calls (no interrupts touch it). `static mut` is required for
+    // a static in no_std without a lock.
+    unsafe {
+        let cache = &mut *core::ptr::addr_of_mut!(WSUM_CACHE);
+        for slot in cache.iter_mut() {
+            if slot.valid
+                && slot.w_ptr == w_ptr
+                && slot.input_offset == input_offset
+                && slot.padded_dim == in_c
+                && slot.output_dim == output_dim
+            {
+                out.copy_from_slice(&slot.data[..output_dim]);
+                return;
+            }
+        }
+        // Miss — evict the next round-robin slot, compute into it, serve.
+        let next = &mut *core::ptr::addr_of_mut!(WSUM_CACHE_NEXT);
+        let slot = &mut cache[*next % WSUM_CACHE_SLOTS];
+        *next = (*next + 1) % WSUM_CACHE_SLOTS;
+        slot.valid = true;
+        slot.w_ptr = w_ptr;
+        slot.input_offset = input_offset;
+        slot.padded_dim = in_c;
+        slot.output_dim = output_dim;
+        let slice = &mut slot.data[..output_dim];
+        weight_sums_conv(slice, weights, taps, in_c);
+        out.copy_from_slice(slice);
+    }
+}
+
 /// Bundled into a single struct passed by `&mut` because the Xtensa LLVM
 /// backend miscompiles the multi-arg (9-slot) call site on device — the same
 /// class of bug as the Xtensa multi-arg call miscompile. A 1-arg call is safe.

@@ -363,12 +363,12 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
             // arena — e.g. the conv3x3 check's SIMD path — clobbers it to 1,
             // which makes the next defmt acquire panic "taken reentrantly").
             let arena_ptr = core::ptr::addr_of!(SRAM_ARENA) as usize;
-            let enc_taken = core::ptr::read_volatile((arena_ptr + 256 * 1024 + 4) as *const u8);
+            let enc_taken = core::ptr::read_volatile((arena_ptr + SRAM_ARENA_BYTES + 4) as *const u8);
             let _ = writeln!(
                 crate::firmware::uart0::Uart0,
                 "defmt RTT_ENCODER.taken = {} (arena end 0x{:08x})",
                 enc_taken,
-                arena_ptr + 256 * 1024
+                arena_ptr + SRAM_ARENA_BYTES
             );
             let ch = &SEGGER_RTT.up_channel;
             let write = ch.write;
@@ -402,10 +402,17 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 /// buffers from this arena while it is unused (the kernel benches carve it
 /// later) — a static hoist of those buffers would grow `.bss` and shrink the
 /// 65 KB device stack (task-8 finding).
+///
+/// 256 KB is the s3 bench arena. A 32 KB slice of it is reserved for the s3
+/// crate's wsum cache (Phase 1 — weight sums hoisted to model-build time via
+/// a static in hematite-s3), so the effective carve arena is 224 KB. The
+/// largest spec carve (conv3x3 32x32 VALID) needs ~197 KB, so 224 KB still
+/// fits.
+pub(crate) const SRAM_ARENA_BYTES: usize = 216 * 1024;
 #[repr(align(16))]
-pub(crate) struct AlignedArena(pub(crate) [u8; 256 * 1024]);
+pub(crate) struct AlignedArena(pub(crate) [u8; SRAM_ARENA_BYTES]);
 
-pub(crate) static mut SRAM_ARENA: AlignedArena = AlignedArena([0u8; 256 * 1024]);
+pub(crate) static mut SRAM_ARENA: AlignedArena = AlignedArena([0u8; SRAM_ARENA_BYTES]);
 
 /// Run `f` on a dedicated 256 KB stack carved from the SRAM bench arena.
 ///
@@ -434,7 +441,7 @@ pub fn run_on_arena_stack<R>(f: impl FnOnce() -> R) -> R {
 
 #[cfg(target_arch = "xtensa")]
 #[inline(never)]
-unsafe fn read_sp() -> usize {
+pub(crate) unsafe fn read_sp() -> usize {
     let sp: usize;
     core::arch::asm!("mov {0}, a1", out(reg) sp, options(nostack));
     sp

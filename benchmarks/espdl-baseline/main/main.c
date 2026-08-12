@@ -163,6 +163,21 @@ extern void s8_accx_depthwise(const int8_t *input, const int8_t *filter,
                               int32_t *acc_out, int32_t in_c, int32_t out_c,
                               int32_t row_delta);
 
+/* ---- anytap depthwise (s8_accx_depthwise_anytap.S) ---- */
+typedef struct {
+    const int8_t *input;
+    const int8_t *filter;
+    int32_t      *acc_out;
+    uint32_t      in_c;
+    uint32_t      out_c;
+    uint32_t      row_delta;
+    uint32_t      taps;
+    uint32_t      filter_w;
+    uint32_t      col_start;
+} AnyTapCtx;
+extern void s8_accx_depthwise_anytap(AnyTapCtx *ctx);
+
+
 /* ---- conv1x1 64x1x1x64 ---- */
 #define IN_C   64
 #define OUT_C  64
@@ -972,6 +987,120 @@ static void kern_depthwise_pure(void) {
                               s_dw_accx, DW_C, DW_C, row_delta);
 }
 
+/* ---- kws 10x8 dm8 SAME stride2 anytap probe (isolates kernel cost) ----
+ * Mirrors the Rust dispatch's padded representation for the kws layer:
+ *   input   [1,49,40,1]  -> padded [58,46,16]   (pad_total_h=9, pad_total_w=6)
+ *   filter  [1,10,8,8]   -> padded 80 taps x 16 (padded_c = pad16(out_c=8))
+ *   output  [1,25,20,8]  -> padded out_c = 16
+ *   stride 2/2, dm=8, row_delta = (padded_w - filter_w)*padded_c = 608
+ */
+#define KWS_PAD_H 58
+#define KWS_PAD_W 46
+#define KWS_PC    16
+#define KWS_FH    10
+#define KWS_FW    8
+#define KWS_OH    25
+#define KWS_OW    20
+#define KWS_PAD_H 58
+#define KWS_PAD_W 46
+#define KWS_PC    16
+#define KWS_FH    10
+#define KWS_FW    8
+#define KWS_OH    25
+#define KWS_OW    20
+/* Reuse the conv3x3 buffers (rows above already ran; s_c3_in 65536B >=
+ * 58*46*16=42688B padded input, s_c3_w 36864B >= 80*16 filter). */
+#define s_kws_in  s_c3_in
+#define s_kws_w   s_c3_w
+static int32_t s_kws_part[KWS_PC] __attribute__((aligned(16)));
+static int32_t s_kws_accx[KWS_PC] __attribute__((aligned(16)));
+
+static void fill_kws(void) {
+    for (int i = 0; i < KWS_PAD_H * KWS_PAD_W * KWS_PC; i++) s_kws_in[i] = (int8_t)((i * 7 + 3) & 0xFF);
+    for (int i = 0; i < KWS_FH * KWS_FW * KWS_PC; i++) s_kws_w[i] = (int8_t)((i * 13 + 11) & 0xFF);
+    for (int i = 0; i < KWS_PC; i++) s_kws_part[i] = 0;
+}
+
+/* Pure kernel path: 500 px x 3 chunks of 32 taps, partials folded, NO
+ * staging/wsum/requantize — the exact anytap call+fold cost. */
+static void kern_anytap_kws_pure(void) {
+    const uint32_t row_delta = (KWS_PAD_W - KWS_FW) * KWS_PC;
+    const uint32_t filt_w = KWS_FW;
+    for (int oh = 0; oh < KWS_OH; oh++) {
+        for (int ow = 0; ow < KWS_OW; ow++) {
+            const int px = (oh * 2 * KWS_PAD_W + ow * 2) * KWS_PC;
+            int tap_start = 0;
+            while (tap_start < KWS_FH * KWS_FW) {
+                int taps = KWS_FH * KWS_FW - tap_start;
+                if (taps > 32) taps = 32;
+                const int row = tap_start / KWS_FW;
+                const int col = tap_start % KWS_FW;
+                const int8_t *in_ptr = s_kws_in + px +
+                    (row * (KWS_FW * KWS_PC + row_delta) + col * KWS_PC);
+                AnyTapCtx ctx;
+                ctx.input = in_ptr;
+                ctx.filter = s_kws_w + tap_start * KWS_PC;
+                ctx.acc_out = s_kws_part;
+                ctx.in_c = KWS_PC;
+                ctx.out_c = KWS_PC;
+                ctx.row_delta = row_delta;
+                ctx.taps = (uint32_t)taps;
+                ctx.filter_w = filt_w;
+                ctx.col_start = (uint32_t)col;
+                s8_accx_depthwise_anytap(&ctx);
+                for (int i = 0; i < KWS_PC; i++)
+                    s_kws_accx[i] = s_kws_accx[i] + s_kws_part[i];
+                tap_start += taps;
+            }
+        }
+    }
+}
+
+/* Scalar depthwise mirror of hematite-ref for the kws shape: [1,49,40,1] ->
+ * [1,25,20,8], SAME stride2, 10x8 filter, input_offset 128, act 0..127.
+ * Uses the raw (unpadded) s_c3_in buffer as the 49x40x1 input. */
+static void kern_scalar_kws(void) {
+    const int32_t in_h = 49, in_w = 40, in_c = 1;
+    const int32_t out_h = 25, out_w = 20, out_c = 8;
+    const int32_t dm = 8, fh = 10, fw = 8, stride = 2, pad = 1;
+    const int32_t in_off = 128, out_off = -128, act_min = 0, act_max = 127;
+    const int32_t input_row_stride = in_w * in_c;
+    const int32_t filter_row_stride = fw * out_c;
+    for (int32_t oh = 0; oh < out_h; oh++) {
+        const int32_t ib_h = oh * stride - pad;
+        for (int32_t ow = 0; ow < out_w; ow++) {
+            const int32_t ib_w = ow * stride - pad;
+            for (int32_t ic = 0; ic < in_c; ic++) {
+                for (int32_t d = 0; d < dm; d++) {
+                    const int32_t oc = d + ic * dm;
+                    int32_t acc = 0; /* bias 0 for the probe */
+                    for (int32_t k = 0; k < fh; k++) {
+                        const int32_t in_row = ib_h + k;
+                        const int32_t row_ok = in_row >= 0 && in_row < in_h;
+                        for (int32_t l = 0; l < fw; l++) {
+                            const int32_t in_col = ib_w + l;
+                            if (row_ok && in_col >= 0 && in_col < in_w) {
+                                const int32_t in_idx =
+                                    (in_row * input_row_stride + in_col * in_c + ic);
+                                const int32_t f_idx =
+                                    (k * filter_row_stride + l * out_c + oc);
+                                const int32_t iv = (int32_t)s_c3_in[in_idx] + in_off;
+                                const int32_t wv = (int32_t)s_c3_w[f_idx];
+                                acc += iv * wv;
+                            }
+                        }
+                    }
+                    int32_t scaled = req(acc, 1 << 30, 0);
+                    int32_t vo = scaled + out_off;
+                    if (vo > act_max) vo = act_max;
+                    if (vo < act_min) vo = act_min;
+                    s_kws_accx[0] += vo; /* fold into checksum-ish sink */
+                }
+            }
+        }
+    }
+}
+
 static void run_bench(const char *label, bench_fn fill, bench_fn kern,
                       const int8_t *outbuf, size_t outlen) {
     const int WARMUP = 1, TIMED = 10;
@@ -1066,6 +1195,14 @@ void app_main(void) {
            (unsigned)fnv1a((const int8_t *)s_dw_out, DW_OUT_LEN));
     run_bench("depthwise_s8 7x7,32x3x3x32 BESPOKE-QACC PURE", fill_depthwise,
               kern_depthwise_pure, (const int8_t *)s_dw_accx, DW_C * 4);
+
+    /* --- kws 10x8 dm8 SAME stride2 anytap kernel-only probe --- */
+    run_bench("depthwise_s8 kws 49x40,1x10x8x8 dm8 S2 ANYTAP PURE (kernel only)",
+              fill_kws, kern_anytap_kws_pure, (const int8_t *)s_kws_accx,
+              KWS_PC * 4);
+    run_bench("depthwise_s8 kws 49x40,1x10x8x8 dm8 S2 SCALAR (raw bounds-skip)",
+              fill_kws, kern_scalar_kws, (const int8_t *)s_kws_accx,
+              KWS_PC * 4);
 
     /* fc 256 -> 64 */
     run_bench("fc_s8 256row,64out TIE728-SIMD (dl_tie728_s8_conv2d_11cn)",

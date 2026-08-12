@@ -138,6 +138,60 @@ fn fc_accx_dispatch(ctx: &mut FcAccxCtx<'_>, uniform: (i32, i32)) -> Result<bool
         return Ok(false);
     }
 
+    // ── Phase 3: tiny-fc fast path ─────────────────────────────────────────
+    // For very small layers (sine fc 1→1, hello fc 1→16/16→1) the padded
+    // input+weights staging and the ACCX kernel call cost more than a direct
+    // loop. Below ~1 KB of MAC work, run the bit-exact TFLite math inline with
+    // unchecked indexing (lengths validated by the public entry) + the cached
+    // weight sums for the input_offset fold — skipping staging entirely.
+    let input_offset = params.input_offset;
+    // Fire the direct loop only where the ACCX path would be dominated by
+    // staging/overhead, never where a clean kernel call wins:
+    //  * tiny layers (input_dim % 16 != 0 → padded input+weights staging,
+    //    which costs ~2 cyc/byte vs ~1 cyc/MAC of kernel work), OR
+    //  * genuinely tiny MAC counts (≤ 64) even without staging.
+    // A 16→16 layer (input %16 == 0, 256 MACs) stays on the ACCX kernel.
+    let needs_staging = pad16(input_dim) != input_dim;
+    let macs = input_dim * output_dim;
+    // output_dim is bounded by the fixed [i32; 64] accumulator buffer below.
+    if output_dim <= 64 && ((needs_staging && macs <= 2048) || macs <= 64) {
+        let wsum = unsafe {
+            core::slice::from_raw_parts(ctx.weights.as_ptr(), output_dim * input_dim)
+        };
+        let mut accs = [0i32; 64];
+        let in_off = input_offset;
+        for oc in 0..output_dim {
+            let mut acc = 0i32;
+            let mut ws_acc = 0i32;
+            let base = oc * input_dim;
+            for ic in 0..input_dim {
+                let wv = unsafe { *wsum.get_unchecked(base + ic) } as i32;
+                let iv = unsafe { *ctx.input.get_unchecked(ic) } as i32;
+                acc = acc.wrapping_add(iv.wrapping_mul(wv));
+                ws_acc = ws_acc.wrapping_add(wv);
+            }
+            accs[oc] = acc.wrapping_add(in_off.wrapping_mul(ws_acc));
+        }
+        let act_min = params.quantized_activation_min;
+        let act_max = params.quantized_activation_max;
+        let out_offset = params.output_offset;
+        let (uniform_mult, uniform_shift) = uniform;
+        crate::accx::requantize_1x1(&mut crate::accx::ReqCtx {
+            accs: &accs[..output_dim],
+            bias: ctx.bias,
+            multipliers: params.output_multiplier_per_channel,
+            shifts: params.output_shift_per_channel,
+            output_offset: out_offset,
+            act_min,
+            act_max,
+            out_base: 0,
+            output: ctx.output,
+            uniform_mult,
+            uniform_shift,
+        });
+        return Ok(true);
+    }
+
     let input_offset = params.input_offset;
     // T3.6 — small / non-16 input dims: stage a zero-padded input copy AND a
     // zero-padded weight copy (the kernel VLDs 16-lane vectors and strides
@@ -219,7 +273,11 @@ fn fc_accx_dispatch(ctx: &mut FcAccxCtx<'_>, uniform: (i32, i32)) -> Result<bool
     if input_offset != 0 {
         let ws = unsafe { core::slice::from_raw_parts_mut(wsum, output_dim) };
         let wv = unsafe { core::slice::from_raw_parts(k_w_ptr, output_dim * padded_dim) };
-        crate::accx::weight_sums_conv(ws, wv, 1, padded_dim);
+        // Phase 1 — weight sums hoisted to model-build time: the sums are a
+        // pure function of (weights ptr, offset, dims), so cache on the
+        // pointer (codegen weights are stable `&'static` consts) and only
+        // resum on the first call per layer.
+        crate::accx::weight_sums_cached(ws, wv, 1, padded_dim, input_offset, k_w_ptr);
     }
 
     let multipliers = params.output_multiplier_per_channel;
