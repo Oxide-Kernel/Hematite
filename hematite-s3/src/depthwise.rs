@@ -566,10 +566,13 @@ fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, Kerne
         None => (0, i32::MIN),
     };
 
+    let px_row_step = stride_h * k_pad_w * k_in_c;
+    let px_col_step = stride_w * k_in_c;
+    let mut px_base = 0usize;
     for oh in 0..out_h {
+        let mut px = px_base;
+        let mut po = oh * out_w * out_c;
         for ow in 0..out_w {
-            let px = (oh * stride_h * k_pad_w + ow * stride_w) * k_in_c;
-            let po = (oh * out_w + ow) * out_c;
             if is_3x3 {
                 // Silicon-proven 3x3 path (unchanged).
                 unsafe {
@@ -667,7 +670,10 @@ fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, Kerne
                 uniform_mult,
                 uniform_shift,
             });
+            px += px_col_step;
+            po += out_c;
         }
+        px_base += px_row_step;
     }
     Ok(true)
 }
