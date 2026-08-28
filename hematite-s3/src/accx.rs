@@ -157,6 +157,103 @@ pub(crate) fn weight_sums_depthwise(out: &mut [i32], weights: &[i8], out_c: usiz
         *o = s;
     }
 }
+
+// ── Phase 1 — hoisted weight-sum cache (model-build-time, per-weights-ptr) ──
+//
+// The `input_offset != 0` fold needs `wsum[oc] = Σ_tap Σ_ic weights[...]` —
+// an O(output_dim · in_c) Rust pass per call. For codegen-generated models the
+// weights are `&'static [i8]` consts at stable addresses, so the sums are
+// model constants: compute once per (weights ptr, input_offset, padded_dim,
+// output_dim), then every later call memcpys the cached sums instead of
+// resumming. Weight sums are pure data transforms (no aliasing, no safety
+// invariants beyond "the same buffer yields the same sums"), so caching on the
+// pointer is sound.
+//
+// Slots are fixed-size to keep `.bss` bounded: `WSUM_CACHE_SLOT_I32` covers
+// the largest zoo fc output on this board (anomaly 640; mobilenet head 1000
+// is PSRAM-only and SKIPped). 16 slots ≥ the 10 distinct fc layers of the
+// anomaly model — the round-robin cache thrashes when a model has MORE layers
+// than slots (an 8-slot cache left every anomaly layer re-missing each call,
+// defeating the whole point). `16 × 640 × 4 B = 40 KiB` of `.bss`, freed by
+// shrinking the firmware's SRAM arena 256 KiB → 216 KiB.
+const WSUM_CACHE_SLOTS: usize = 16;
+const WSUM_CACHE_SLOT_I32: usize = 640;
+const WSUM_CACHE_BYTES: usize = WSUM_CACHE_SLOTS * WSUM_CACHE_SLOT_I32 * 4;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WsumCacheSlot {
+    valid: bool,
+    w_ptr: *const i8,
+    input_offset: i32,
+    padded_dim: usize,
+    output_dim: usize,
+    data: [i32; WSUM_CACHE_SLOT_I32],
+}
+
+static mut WSUM_CACHE: [WsumCacheSlot; WSUM_CACHE_SLOTS] = [WsumCacheSlot {
+    valid: false,
+    w_ptr: core::ptr::null(),
+    input_offset: 0,
+    padded_dim: 0,
+    output_dim: 0,
+    data: [0; WSUM_CACHE_SLOT_I32],
+}; WSUM_CACHE_SLOTS];
+
+/// Round-robin eviction cursor (the next miss overwrites this slot).
+static mut WSUM_CACHE_NEXT: usize = 0;
+
+/// Returns a reference to the caller-provided `out` slice (filled either from
+/// the cache or freshly). Cache key: `(w_ptr, input_offset, padded_dim,
+/// output_dim)`. On a miss the sums are computed via [`weight_sums_conv`] and
+/// stored (simple overwrite eviction — the zoo bench's run_repeated loop
+/// reuses the same weights across all 11 timed calls, so even a single slot
+/// would hit on calls 2–11; slots exist only to cover multi-layer models).
+pub(crate) fn weight_sums_cached(
+    out: &mut [i32],
+    weights: &[i8],
+    taps: usize,
+    in_c: usize,
+    input_offset: i32,
+    w_ptr: *const i8,
+) {
+    let output_dim = out.len();
+    if output_dim > WSUM_CACHE_SLOT_I32 {
+        // Slot too small — compute directly (no cache).
+        weight_sums_conv(out, weights, taps, in_c);
+        return;
+    }
+    // SAFETY: single-threaded device; the cache is only mutated under this
+    // crate's own calls (no interrupts touch it). `static mut` is required for
+    // a static in no_std without a lock.
+    unsafe {
+        let cache = &mut *core::ptr::addr_of_mut!(WSUM_CACHE);
+        for slot in cache.iter_mut() {
+            if slot.valid
+                && slot.w_ptr == w_ptr
+                && slot.input_offset == input_offset
+                && slot.padded_dim == in_c
+                && slot.output_dim == output_dim
+            {
+                out.copy_from_slice(&slot.data[..output_dim]);
+                return;
+            }
+        }
+        // Miss — evict the next round-robin slot, compute into it, serve.
+        let next = &mut *core::ptr::addr_of_mut!(WSUM_CACHE_NEXT);
+        let slot = &mut cache[*next % WSUM_CACHE_SLOTS];
+        *next = (*next + 1) % WSUM_CACHE_SLOTS;
+        slot.valid = true;
+        slot.w_ptr = w_ptr;
+        slot.input_offset = input_offset;
+        slot.padded_dim = in_c;
+        slot.output_dim = output_dim;
+        let slice = &mut slot.data[..output_dim];
+        weight_sums_conv(slice, weights, taps, in_c);
+        out.copy_from_slice(slice);
+    }
+}
+
 /// Bundled into a single struct passed by `&mut` because the Xtensa LLVM
 /// backend miscompiles the multi-arg (9-slot) call site on device — the same
 /// class of bug as the Xtensa multi-arg call miscompile. A 1-arg call is safe.
@@ -356,6 +453,7 @@ mod device {
     global_asm!(include_str!("asm/s8_requantize.S"));
     global_asm!(include_str!("asm/s8_accx_depthwise.S"));
     global_asm!(include_str!("asm/s8_accx_depthwise_anytap.S"));
+    global_asm!(include_str!("asm/s8_accx_depthwise_anytap_bc1.S"));
 
     /// One input vector → `out_c` raw int32 accumulators.
     ///
@@ -498,6 +596,48 @@ mod device {
     pub unsafe fn accx_depthwise_anytap(ctx: *const AnyTapCtx) {
         asm!(
             "call8 s8_accx_depthwise_anytap",
+            in("a10") ctx,
+            out("a11") _,
+            out("a12") _,
+            out("a13") _,
+            out("a14") _,
+            out("a15") _,
+            clobber_abi("C"),
+        );
+    }
+
+    /// T4 — single-channel broadcast depthwise kernel args (in_c == 1 fast
+    /// path). Layout mirrors [`AnyTapCtx`] EXCEPT the kernel does NOT advance
+    /// the input pointer by g*16 between output groups: for in_c == 1 every
+    /// output lane reads the SAME input byte per tap (broadcast via
+    /// EE.VLDBC.8), so the input stays at the tap base while only the filter
+    /// strides by g*16. `in_c` MUST be 1 (the input byte advance per tap);
+    /// `out_c` is padded_c (filter tap stride, %16, >=16). See the `.S` header.
+    #[repr(C)]
+    pub struct Bc1Ctx {
+        pub input: *const i8,
+        pub filter: *const i8,
+        pub acc_out: *mut i32,
+        pub in_c: u32,
+        pub out_c: u32,
+        pub row_delta: u32,
+        pub taps: u32,
+        pub filter_w: u32,
+        pub col_start: u32,
+    }
+
+    /// One ≤32-tap QACC pass for an in_c == 1 arbitrary-filter depthwise →
+    /// `out_c` raw int32 partial accumulators (Rust adds them into its running
+    /// i32 accs). Single-channel broadcast variant of [`accx_depthwise_anytap`]
+    /// — eliminates the padded_c-wide input replication when in_c == 1.
+    ///
+    /// # Safety
+    /// `ctx` must point at a valid [`Bc1Ctx`]; `filter` 16-byte aligned,
+    /// `acc_out` 16-byte aligned, `in_c == 1`, `out_c % 16 == 0`, `out_c >= 16`,
+    /// buffers sized, `taps` in 1..=32.
+    pub unsafe fn accx_depthwise_anytap_bc1(ctx: *const Bc1Ctx) {
+        asm!(
+            "call8 s8_accx_depthwise_anytap_bc1",
             in("a10") ctx,
             out("a11") _,
             out("a12") _,

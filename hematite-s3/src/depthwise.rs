@@ -365,13 +365,25 @@ fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, Kerne
     let padded_c = ((out_c + 15) / 16) * 16;
     let needs_channel_pad = padded_c != out_c;
     let needs_pad = pad_total_h > 0 || pad_total_w > 0 || needs_channel_pad || dm_gt_1;
+    // T4 — single-channel broadcast fast path (in_c == 1, arbitrary filter):
+    // stage a SINGLE-CHANNEL padded input and let the kernel broadcast each
+    // input byte to all 16 lanes (EE.VLDBC.8). This is the in_c==1 analogue of
+    // the padded_c-wide replication `s8_accx_depthwise_anytap.S` needs; it
+    // shrinks the staging traffic ~16x (kws: 42.7KB -> 2.7KB) so the layer
+    // fits small scratch AND runs the broadcast kernel.
+    let use_bc1 = !is_3x3 && input_c == 1;
 
     //   [padded_input: padded_h*padded_w*padded_c]
+    //                    (use_bc1: single-channel padded_h*padded_w)
     //   [padded_filter: taps*padded_c   (only when channel padding)]
     //   [accs: padded_c*4][wsum: out_c*4 (only when input_offset != 0)]
     //   [partials: padded_c*4 (only the anytap/chunked path; the 3x3
     //    silicon-proven kernel writes accs directly and needs no partials)]
-    let pad_input_len = padded_h * padded_w * padded_c;
+    let pad_input_len = if use_bc1 {
+        padded_h * padded_w
+    } else {
+        padded_h * padded_w * padded_c
+    };
     let pad_filter_len = if needs_channel_pad { taps * padded_c } else { 0 };
     let input_offset = params.input_offset;
     let wsum_extra = if input_offset != 0 { out_c * 4 } else { 0 };
@@ -400,13 +412,17 @@ fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, Kerne
     // (16-byte aligned bases) and copy the real interior at (h+pad_h, w+pad_w);
     // the kernel then runs on the padded buffers with stride stepping in the
     // caller pixel loop. When no padding, use the input directly.
-    let (k_in_ptr, k_w_ptr, k_pad_w, k_in_c, row_delta);
+    let (k_in_ptr, k_w_ptr, k_pad_w, k_in_c, k_filter_stride, row_delta);
     let mut wsum: *mut i32 = core::ptr::null_mut();
     let mut partials: *mut i32 = core::ptr::null_mut();
     if needs_pad {
         let scratch_u = ctx.scratch.as_mut_ptr() as usize;
         let in_off = (scratch_u + 15) & !15;
-        let w_off = in_off + pad_input_len;
+        // Re-align after the padded input: for the in_c == 1 broadcast path
+        // pad_input_len = padded_h*padded_w can be a NON-16-multiple (e.g.
+        // 58*46 = 2668 for kws), and the kernel's EE.VLD.128.XP requires the
+        // filter pointer to be 16-byte aligned.
+        let w_off = (in_off + pad_input_len + 15) & !15;
         let accs_off = (w_off + pad_filter_len + 15) & !15;
         let p_in = unsafe { ctx.scratch.as_mut_ptr().add(in_off - scratch_u) };
         let p_w = if needs_channel_pad {
@@ -433,7 +449,21 @@ fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, Kerne
         // contribute 0 regardless.
         let fill: u8 = if input_offset != 0 { (-input_offset) as u8 } else { 0 };
         unsafe { core::ptr::write_bytes(p_in, fill, pad_input_len) };
-        if dm_gt_1 {
+        if use_bc1 {
+            // T4 — single-channel staging: copy the raw in_c == 1 interior at
+            // (h+pad_h, w+pad_w) into the single-channel padded buffer. No
+            // dm>1 replication needed — the broadcast kernel fans the one
+            // input byte across all 16 lanes per tap (the filter carries the
+            // per-output-channel weights, matching depthwise semantics).
+            let src = ctx.input.as_ptr();
+            for h in 0..in_h {
+                for w in 0..in_w {
+                    let srow = unsafe { src.add(h * in_w + w) };
+                    let drow = unsafe { p_in.add((h + pad_h) * padded_w + (w + pad_w)) };
+                    unsafe { *drow = *srow as u8 };
+                }
+            }
+        } else if dm_gt_1 {
             // T3.5 — fan out each input channel `dm` times so output channel
             // `oc = i*dm + j` reads input channel `i`. Padded channel slots
             // keep the fill; their (padded) weights are zero so they
@@ -477,9 +507,18 @@ fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, Kerne
         k_in_ptr = p_in as *const i8;
         k_w_ptr = p_w as *const i8;
         k_pad_w = padded_w;
-        k_in_c = padded_c;
+        if use_bc1 {
+            // T4 — in_c == 1 broadcast path: input advances 1 byte per tap
+            // (the kernel broadcasts it); the FILTER still strides padded_c
+            // (its tap dimension is [tap][padded_c]).
+            k_in_c = 1;
+            k_filter_stride = padded_c;
+        } else {
+            k_in_c = padded_c;
+            k_filter_stride = padded_c;
+        }
         row_delta = if padded_w >= filter_w_u {
-            (padded_w - filter_w_u) * padded_c
+            (padded_w - filter_w_u) * k_in_c
         } else {
             0
         };
@@ -493,6 +532,7 @@ fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, Kerne
         k_w_ptr = w_ptr;
         k_pad_w = in_w;
         k_in_c = input_c;
+        k_filter_stride = input_c;
         row_delta = if in_w >= filter_w_u {
             (in_w - filter_w_u) * input_c
         } else {
@@ -507,12 +547,13 @@ fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, Kerne
     }
 
     // Depthwise filter is [tap][oc] (HWCN); wsum[oc] = Σ_tap w[tap·out_c + oc].
-    // The stride is `k_in_c` (== padded_c when channel-padded, == out_c on the
-    // raw [tap][out_c] filter otherwise) so the staged layout is read correctly.
+    // The stride is `k_filter_stride` (== padded_c when channel-padded or
+    // broadcast, == out_c on the raw [tap][out_c] filter otherwise) so the
+    // staged layout is read correctly.
     if input_offset != 0 {
         let ws = unsafe { core::slice::from_raw_parts_mut(wsum, out_c) };
-        let wv = unsafe { core::slice::from_raw_parts(k_w_ptr, taps * k_in_c) };
-        crate::accx::weight_sums_depthwise(ws, wv, k_in_c);
+        let wv = unsafe { core::slice::from_raw_parts(k_w_ptr, taps * k_filter_stride) };
+        crate::accx::weight_sums_depthwise(ws, wv, k_filter_stride);
     }
 
     let multipliers = params.output_multiplier_per_channel;
@@ -525,10 +566,13 @@ fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, Kerne
         None => (0, i32::MIN),
     };
 
+    let px_row_step = stride_h * k_pad_w * k_in_c;
+    let px_col_step = stride_w * k_in_c;
+    let mut px_base = 0usize;
     for oh in 0..out_h {
+        let mut px = px_base;
+        let mut po = oh * out_w * out_c;
         for ow in 0..out_w {
-            let px = (oh * stride_h * k_pad_w + ow * stride_w) * k_in_c;
-            let po = (oh * out_w + ow) * out_c;
             if is_3x3 {
                 // Silicon-proven 3x3 path (unchanged).
                 unsafe {
@@ -563,20 +607,41 @@ fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, Kerne
                             px + (row * (filter_w_u * k_in_c + row_delta) + col * k_in_c),
                         )
                     };
-                    // SAFETY: the filter is `[taps][k_in_c]`; `tap_start < taps`.
-                    let w_ptr = unsafe { k_w_ptr.add(tap_start * k_in_c) };
-                    unsafe {
-                        crate::accx::accx_depthwise_anytap(&crate::accx::AnyTapCtx {
-                            input: in_ptr,
-                            filter: w_ptr,
-                            acc_out: partials,
-                            in_c: k_in_c as u32,
-                            out_c: k_in_c as u32,
-                            row_delta: row_delta as u32,
-                            taps: chunk_taps as u32,
-                            filter_w: filter_w_u as u32,
-                            col_start: col as u32,
-                        });
+                    // SAFETY: the filter is `[taps][k_filter_stride]`;
+                    // `tap_start < taps`.
+                    let w_ptr = unsafe { k_w_ptr.add(tap_start * k_filter_stride) };
+                    if use_bc1 {
+                        // T4 — single-channel broadcast kernel: input stride 1
+                        // (EE.VLDBC.8 broadcast); filter VLD stride = padded_c
+                        // (`k_filter_stride`; the kernel's `out_c` field is the
+                        // FILTER tap stride, NOT the input channel count).
+                        unsafe {
+                            crate::accx::accx_depthwise_anytap_bc1(&crate::accx::Bc1Ctx {
+                                input: in_ptr,
+                                filter: w_ptr,
+                                acc_out: partials,
+                                in_c: 1,
+                                out_c: k_filter_stride as u32,
+                                row_delta: row_delta as u32,
+                                taps: chunk_taps as u32,
+                                filter_w: filter_w_u as u32,
+                                col_start: col as u32,
+                            });
+                        }
+                    } else {
+                        unsafe {
+                            crate::accx::accx_depthwise_anytap(&crate::accx::AnyTapCtx {
+                                input: in_ptr,
+                                filter: w_ptr,
+                                acc_out: partials,
+                                in_c: k_in_c as u32,
+                                out_c: k_in_c as u32,
+                                row_delta: row_delta as u32,
+                                taps: chunk_taps as u32,
+                                filter_w: filter_w_u as u32,
+                                col_start: col as u32,
+                            });
+                        }
                     }
                     let acc_slice = unsafe { core::slice::from_raw_parts_mut(accs, padded_c) };
                     let part_slice = unsafe { core::slice::from_raw_parts(partials, padded_c) };
@@ -605,7 +670,10 @@ fn depthwise_accx_dispatch(ctx: &mut DepthwiseAccxCtx<'_>) -> Result<bool, Kerne
                 uniform_mult,
                 uniform_shift,
             });
+            px += px_col_step;
+            po += out_c;
         }
+        px_base += px_row_step;
     }
     Ok(true)
 }
@@ -783,6 +851,117 @@ mod tests {
                 }
                 crate::accx::requantize_1x1(&mut crate::accx::ReqCtx {
                     accs: &accs,
+                    bias,
+                    multipliers,
+                    shifts,
+                    output_offset: p.output_offset,
+                    act_min: p.quantized_activation_min,
+                    act_max: p.quantized_activation_max,
+                    out_base: (oh * out_w + ow) * out_c,
+                    output: &mut output,
+                    uniform_mult,
+                    uniform_shift,
+                });
+            }
+        }
+        output
+    }
+
+    /// T4 — bc1 single-channel dispatch model: fill `-input_offset`, interior
+    /// copy at `(h+pad_h, w+pad_w)`, input byte advances 1 per tap (+row_delta
+    /// at row boundary), filter `[tap][padded_c]`, per-lane broadcast MAC,
+    /// then fold + requantize. Bit-exact mirror of the device bc1 path.
+    fn bc1_model_layer(
+        input: &[i8],
+        weights: &[i8],
+        bias: &[i32],
+        p: &DepthwiseConv2DParams<'_>,
+    ) -> Vec<i8> {
+        let in_h = p.input_shape[1] as usize;
+        let in_w = p.input_shape[2] as usize;
+        let out_h = p.output_shape[1] as usize;
+        let out_w = p.output_shape[2] as usize;
+        let out_c = p.output_shape[3] as usize;
+        let stride_h = p.stride_height.max(1) as usize;
+        let stride_w = p.stride_width.max(1) as usize;
+        let filter_h = p.filter_shape[1].max(1) as usize;
+        let filter_w = p.filter_shape[2].max(1) as usize;
+        let taps = filter_h * filter_w;
+
+        let dilated_h = (p.filter_shape[1] - 1) * p.dilation_height_factor + 1;
+        let dilated_w = (p.filter_shape[2] - 1) * p.dilation_width_factor + 1;
+        let pad_total_h =
+            ((out_h as i32 - 1) * p.stride_height + dilated_h - in_h as i32).max(0) as usize;
+        let pad_total_w =
+            ((out_w as i32 - 1) * p.stride_width + dilated_w - in_w as i32).max(0) as usize;
+        let pad_h = pad_total_h / 2;
+        let pad_w = pad_total_w / 2;
+        let padded_h = in_h + pad_total_h;
+        let padded_w = in_w + pad_total_w;
+        let padded_c = ((out_c + 15) / 16) * 16;
+        let row_delta = if padded_w >= filter_w { padded_w - filter_w } else { 0 };
+
+        let fill: u8 = if p.input_offset != 0 { (-p.input_offset) as u8 } else { 0 };
+        let mut staged_in = vec![fill; padded_h * padded_w];
+        for h in 0..in_h {
+            for w in 0..in_w {
+                staged_in[(h + pad_h) * padded_w + (w + pad_w)] = input[h * in_w + w] as u8;
+            }
+        }
+
+        let mut staged_w = vec![0i8; taps * padded_c];
+        for tap in 0..taps {
+            staged_w[tap * padded_c..tap * padded_c + out_c]
+                .copy_from_slice(&weights[tap * out_c..(tap + 1) * out_c]);
+        }
+
+        let mut wsum = vec![0i32; out_c];
+        crate::accx::weight_sums_depthwise(&mut wsum, &staged_w, padded_c);
+
+        let multipliers = p.output_multiplier_per_channel;
+        let shifts = p.output_shift_per_channel;
+        let (uniform_mult, uniform_shift) = match crate::accx::uniform_scale(multipliers, shifts) {
+            Some((m, s)) => (m, s),
+            None => (0, i32::MIN),
+        };
+        let mut output = vec![0i8; out_h * out_w * out_c];
+        for oh in 0..out_h {
+            for ow in 0..out_w {
+                let base = oh * stride_h * padded_w + ow * stride_w;
+                let mut accs = vec![0i32; padded_c];
+                let mut tap_start = 0;
+                while tap_start < taps {
+                    let chunk_taps = (taps - tap_start).min(32);
+                    let row = tap_start / filter_w;
+                    let col = tap_start % filter_w;
+                    let in_ptr = base + row * (filter_w + row_delta) + col;
+                    // Simulate the kernel's exact pointer arithmetic: read one
+                    // byte per tap, advance 1, and add `row_delta` whenever the
+                    // column counter reaches `filter_w` (which happens after
+                    // `filter_w - col` taps in the first partial row, then every
+                    // `filter_w` taps after).
+                    let mut cur = in_ptr;
+                    let mut cc = col;
+                    for t in 0..chunk_taps {
+                        let iv = i32::from(staged_in[cur] as i8);
+                        for oc in 0..padded_c {
+                            let wv = i32::from(staged_w[(tap_start + t) * padded_c + oc]);
+                            accs[oc] = accs[oc].wrapping_add(iv.wrapping_mul(wv));
+                        }
+                        cur += 1;
+                        cc += 1;
+                        if cc == filter_w {
+                            cc = 0;
+                            cur += row_delta;
+                        }
+                    }
+                    tap_start += chunk_taps;
+                }
+                if p.input_offset != 0 {
+                    fold_input_offset(&mut accs[..out_c], &wsum, p.input_offset);
+                }
+                crate::accx::requantize_1x1(&mut crate::accx::ReqCtx {
+                    accs: &accs[..out_c],
                     bias,
                     multipliers,
                     shifts,
@@ -989,6 +1168,122 @@ mod tests {
             }
         }
         assert!(checked >= 500, "arbitrary-filter matrix did not expand ({checked})");
+    }
+
+    /// T4 — bc1 (in_c == 1) single-channel broadcast dispatch model. Mirrors
+    /// the EXACT device path the kws 10x8 dm8 layer runs: single-channel
+    /// padded staging (fill `-input_offset`, interior copied at
+    /// `(h+pad_h, w+pad_w)`), input advancing 1 byte/tap with `+row_delta` at
+    /// row boundaries, filter `[tap][padded_c]`, per-lane broadcast MAC, then
+    /// the Phase-C fold + requantize. Must equal `hematite-ref` bit-exact.
+    #[test]
+    fn depthwise_bc1_in_c1_model_matches_ref_bit_exact() {
+        let mut checked = 0;
+        // The exact kws shape (non-square SAME stride2) the device exercises:
+        // [1,49,40,1] -> [1,25,20,8] dm=8, 10x8 filter, in_off 128.
+        {
+            let n = 8usize;
+            let mults = vec![1 << 30; n];
+            let shifts = vec![0i32; n];
+            let p = DepthwiseConv2DParams {
+                input_shape: [1, 49, 40, 1],
+                filter_shape: [1, 10, 8, 8],
+                output_shape: [1, 25, 20, 8],
+                padding: Padding::Same,
+                stride_width: 2,
+                stride_height: 2,
+                dilation_width_factor: 1,
+                dilation_height_factor: 1,
+                depth_multiplier: 8,
+                input_offset: 128,
+                weights_offset: 0,
+                output_offset: -128,
+                output_multiplier_per_channel: &mults,
+                output_shift_per_channel: &shifts,
+                quantized_activation_min: 0,
+                quantized_activation_max: 127,
+            };
+            let input = pattern(0xBC1E_0001u32, 49 * 40);
+            let weights = pattern(0xB0C1u32, 10 * 8 * 8);
+            let bias = pattern_i32(0x1BC1u32, n);
+            let got = bc1_model_layer(&input, &weights, &bias, &p);
+            let mut want = vec![0i8; got.len()];
+            hematite_ref::depthwise_conv::depthwise_conv2d(
+                &input, &weights, &bias, &p, &mut want, &mut [],
+            )
+            .expect("ref depthwise accepts the shape");
+            assert_eq!(
+                got, want,
+                "bc1 kws-exact [1,49,40,1]->[1,25,20,8] dm8 10x8 SAME s2 in_off128: \
+                 bc1 model must equal ref scalar"
+            );
+            checked += 1;
+        }
+        for &(fh, fw) in &[(3, 3), (5, 5), (7, 7), (10, 8)] {
+            for &dm in &[1, 2, 8] {
+                let out_c = dm;
+                for &(sp, stride) in &[(12i32, 1i32), (14, 2)] {
+                    for &pad in &[Padding::Valid, Padding::Same] {
+                        let (out_h, out_w) = match pad {
+                            Padding::Same => {
+                                ((sp + stride - 1) / stride, (sp + stride - 1) / stride)
+                            }
+                            Padding::Valid => ((sp - fh) / stride + 1, (sp - fw) / stride + 1),
+                        };
+                        if out_h < 1 || out_w < 1 {
+                            continue;
+                        }
+                        for &in_off in &[0, 3, 128] {
+                            let n = out_c as usize;
+                            let (mults, shifts): (Vec<i32>, Vec<i32>) =
+                                (vec![1 << 30; n], vec![1; n]);
+                            let p = DepthwiseConv2DParams {
+                                input_shape: [1, sp, sp, 1],
+                                filter_shape: [1, fh, fw, out_c],
+                                output_shape: [1, out_h, out_w, out_c],
+                                padding: pad,
+                                stride_width: stride,
+                                stride_height: stride,
+                                dilation_width_factor: 1,
+                                dilation_height_factor: 1,
+                                depth_multiplier: dm,
+                                input_offset: in_off,
+                                weights_offset: 0,
+                                output_offset: if in_off == 0 { 0 } else { -10 },
+                                output_multiplier_per_channel: &mults,
+                                output_shift_per_channel: &shifts,
+                                quantized_activation_min: -128,
+                                quantized_activation_max: 127,
+                            };
+                            let in_len = (sp * sp) as usize;
+                            let w_len = (fh * fw) as usize * n;
+                            let input = pattern(0xBC1E_0001u32 | (dm as u32 * 7), in_len);
+                            let weights = pattern(0xB0C1 + fh as u32 * 13, w_len);
+                            let bias = pattern_i32(0x1BC1 + out_c as u32, n);
+
+                            let got = bc1_model_layer(&input, &weights, &bias, &p);
+                            let mut want = vec![0i8; got.len()];
+                            hematite_ref::depthwise_conv::depthwise_conv2d(
+                                &input,
+                                &weights,
+                                &bias,
+                                &p,
+                                &mut want,
+                                &mut [],
+                            )
+                            .expect("ref depthwise accepts the shape");
+                            assert_eq!(
+                                got, want,
+                                "bc1 fh={fh} fw={fw} dm={dm} sp={sp} stride={stride} \
+                                 pad={pad:?} in_off={in_off}: bc1 model must equal ref scalar"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked >= 60, "bc1 matrix did not expand ({checked})");
     }
 
     /// The replication staging must produce the exact TFLM fan-out: output

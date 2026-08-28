@@ -603,6 +603,27 @@ pub fn probe_person_detect_stack() {
         model_person_detect::OUTPUT_LEN,
     );
 
+    // Honest shortfall gate: `predict_with_scratch` puts the 55,296 B arena on
+    // the device stack. On this board the stack is only ~57.5 KB (0x3fcdb700 -
+    // 0x3fccb62c), so arena + validation frames cannot fit and the probe would
+    // overflow into `__defmt_default_panic` (silent, no report). Read the live
+    // SP and report SKIP with the actual headroom instead of panicking.
+    extern "C" {
+        static _stack_end: u8;
+    }
+    let stack_bottom = core::ptr::addr_of!(_stack_end) as usize;
+    let headroom = unsafe { crate::firmware::read_sp() }.wrapping_sub(stack_bottom);
+    let need = model_person_detect::ARENA_LEN + 8192;
+    if headroom < need {
+        crate::firmware::uart0_log!(
+            "person_detect stack probe: SKIP (headroom {} B < arena+8K {} B on this board's ~57.5 KB stack)",
+            headroom,
+            need
+        );
+        crate::firmware::uart0_log!("=== PERSON_DETECT STACK PROBE DONE ===");
+        return;
+    }
+
     // S3Backend arm first — the fused path is the sweep's subject.  The
     // emitted `predict_with_scratch` puts the 55,296 B arena on the stack.
     let mut s3_out = [0i8; model_person_detect::OUTPUT_LEN];

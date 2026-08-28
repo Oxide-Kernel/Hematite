@@ -295,7 +295,7 @@ mod models_mobilenet_v2 {
         on_large_stack(|| {
             assert_eq!(Model::<RefBackend>::input_len(), flat_len(&models::mobilenet_v2_1_0_224_int8::INPUT_SHAPE));
             assert_eq!(Model::<RefBackend>::output_len(), flat_len(&models::mobilenet_v2_1_0_224_int8::OUTPUT_SHAPE));
-            let model = Model::new(RefBackend);
+            let mut model = Model::new(RefBackend);
             let _out = model.predict(&models::mobilenet_v2_1_0_224_int8::INPUT_DATA);
         });
     }

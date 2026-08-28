@@ -602,12 +602,17 @@ fn conv2d_1x1_scalar(
     let output_row_stride = out_w * out_channels;
 
     // ── Accumulation loop (identical to hematite-ref conv.rs) ───────────
+    // SAFETY of the `get_unchecked` calls: slice lengths were validated
+    // above against shape_product(input/filter/output shapes), and the
+    // in-bounds guard below guarantees `input_base/filter_base` point into
+    // the validated ranges, so every index is in-bounds.
+    let input_offset = params.input_offset;
     for oh in 0..out_h {
         let input_base_h = oh * params.stride_height - pad_h;
         for ow in 0..out_w {
             let input_base_w = ow * params.stride_width - pad_w;
             for oc in 0..out_channels {
-                let mut acc: i32 = bias[oc as usize];
+                let mut acc: i32 = unsafe { *bias.get_unchecked(oc as usize) };
                 let filter_oc_base = oc * filter_oc_stride;
 
                 for fh in 0..filter_h {
@@ -625,9 +630,13 @@ fn conv2d_1x1_scalar(
                                 + fw * filter_col_stride) as usize;
 
                             for ic in 0..filter_ic {
-                                let i_val = i32::from(input[input_base + ic as usize]);
-                                let w_val = i32::from(weights[filter_base + ic as usize]);
-                                acc += (i_val + params.input_offset) * w_val;
+                                let i_val = i32::from(unsafe {
+                                    *input.get_unchecked(input_base + ic as usize)
+                                });
+                                let w_val = i32::from(unsafe {
+                                    *weights.get_unchecked(filter_base + ic as usize)
+                                });
+                                acc += (i_val + input_offset) * w_val;
                             }
                         }
                         // else: zero-padding — contribute 0
@@ -635,8 +644,8 @@ fn conv2d_1x1_scalar(
                 }
 
                 // Per-channel requantize + output offset + clamp
-                let multiplier = multipliers[oc as usize];
-                let shift = shifts[oc as usize];
+                let multiplier = unsafe { *multipliers.get_unchecked(oc as usize) };
+                let shift = unsafe { *shifts.get_unchecked(oc as usize) };
                 let scaled = multiply_by_quantized_multiplier(acc, multiplier, shift);
                 let with_offset = scaled + params.output_offset;
 

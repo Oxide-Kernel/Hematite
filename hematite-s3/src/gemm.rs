@@ -51,6 +51,18 @@ use hematite_core::op_params::FullyConnectedParams;
 use hematite_core::KernelError;
 use hematite_int8::{multiply_by_quantized_multiplier, saturating_cast};
 
+/// Clamp an i32 to `[lo, hi]` — mirrors `accx::clamp` (bit-exact requantize).
+#[inline(always)]
+fn clamp(v: i32, lo: i32, hi: i32) -> i32 {
+    if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
+}
+
 /// Round a length up to the TIE728 SIMD group width (16 lanes).
 #[cfg(any(all(target_arch = "xtensa", not(feature = "qemu")), test))]
 #[inline(always)]
@@ -138,6 +150,60 @@ fn fc_accx_dispatch(ctx: &mut FcAccxCtx<'_>, uniform: (i32, i32)) -> Result<bool
         return Ok(false);
     }
 
+    // ── Phase 3: tiny-fc fast path ─────────────────────────────────────────
+    // For very small layers (sine fc 1→1, hello fc 1→16/16→1) the padded
+    // input+weights staging and the ACCX kernel call cost more than a direct
+    // loop. Below ~1 KB of MAC work, run the bit-exact TFLite math inline with
+    // unchecked indexing (lengths validated by the public entry) + the cached
+    // weight sums for the input_offset fold — skipping staging entirely.
+    let input_offset = params.input_offset;
+    // Fire the direct loop only where the ACCX path would be dominated by
+    // staging/overhead, never where a clean kernel call wins:
+    //  * tiny layers (input_dim % 16 != 0 → padded input+weights staging,
+    //    which costs ~2 cyc/byte vs ~1 cyc/MAC of kernel work), OR
+    //  * genuinely tiny MAC counts (≤ 64) even without staging.
+    // A 16→16 layer (input %16 == 0, 256 MACs) stays on the ACCX kernel.
+    let needs_staging = pad16(input_dim) != input_dim;
+    let macs = input_dim * output_dim;
+    // output_dim is bounded by the fixed [i32; 64] accumulator buffer below.
+    if output_dim <= 64 && ((needs_staging && macs <= 2048) || macs <= 64) {
+        let wsum = unsafe {
+            core::slice::from_raw_parts(ctx.weights.as_ptr(), output_dim * input_dim)
+        };
+        let mut accs = [0i32; 64];
+        let in_off = input_offset;
+        for oc in 0..output_dim {
+            let mut acc = 0i32;
+            let mut ws_acc = 0i32;
+            let base = oc * input_dim;
+            for ic in 0..input_dim {
+                let wv = unsafe { *wsum.get_unchecked(base + ic) } as i32;
+                let iv = unsafe { *ctx.input.get_unchecked(ic) } as i32;
+                acc = acc.wrapping_add(iv.wrapping_mul(wv));
+                ws_acc = ws_acc.wrapping_add(wv);
+            }
+            accs[oc] = acc.wrapping_add(in_off.wrapping_mul(ws_acc));
+        }
+        let act_min = params.quantized_activation_min;
+        let act_max = params.quantized_activation_max;
+        let out_offset = params.output_offset;
+        let (uniform_mult, uniform_shift) = uniform;
+        crate::accx::requantize_1x1(&mut crate::accx::ReqCtx {
+            accs: &accs[..output_dim],
+            bias: ctx.bias,
+            multipliers: params.output_multiplier_per_channel,
+            shifts: params.output_shift_per_channel,
+            output_offset: out_offset,
+            act_min,
+            act_max,
+            out_base: 0,
+            output: ctx.output,
+            uniform_mult,
+            uniform_shift,
+        });
+        return Ok(true);
+    }
+
     let input_offset = params.input_offset;
     // T3.6 — small / non-16 input dims: stage a zero-padded input copy AND a
     // zero-padded weight copy (the kernel VLDs 16-lane vectors and strides
@@ -219,7 +285,11 @@ fn fc_accx_dispatch(ctx: &mut FcAccxCtx<'_>, uniform: (i32, i32)) -> Result<bool
     if input_offset != 0 {
         let ws = unsafe { core::slice::from_raw_parts_mut(wsum, output_dim) };
         let wv = unsafe { core::slice::from_raw_parts(k_w_ptr, output_dim * padded_dim) };
-        crate::accx::weight_sums_conv(ws, wv, 1, padded_dim);
+        // Phase 1 — weight sums hoisted to model-build time: the sums are a
+        // pure function of (weights ptr, offset, dims), so cache on the
+        // pointer (codegen weights are stable `&'static` consts) and only
+        // resum on the first call per layer.
+        crate::accx::weight_sums_cached(ws, wv, 1, padded_dim, input_offset, k_w_ptr);
     }
 
     let multipliers = params.output_multiplier_per_channel;
@@ -229,6 +299,7 @@ fn fc_accx_dispatch(ctx: &mut FcAccxCtx<'_>, uniform: (i32, i32)) -> Result<bool
     let out_offset = params.output_offset;
     let (uniform_mult, uniform_shift) = uniform;
 
+    #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
     unsafe {
         crate::accx::accx_conv1x1(k_in_ptr, k_w_ptr, accs, padded_dim, output_dim);
     }
@@ -253,6 +324,113 @@ fn fc_accx_dispatch(ctx: &mut FcAccxCtx<'_>, uniform: (i32, i32)) -> Result<bool
         uniform_mult,
         uniform_shift,
     });
+    Ok(true)
+}
+
+/// Phase D — ultra-fast tiny-fc dispatch: identical math to
+/// [`fc_accx_dispatch`]'s tiny-fc fast path (direct MAC loop + inline wsum
+/// fold) but with the requantize epilogue INLINED into this standalone
+/// `#[inline(never)]` function instead of a [`crate::accx::ReqCtx`] build +
+/// `requantize_1x1` call. Kept OUT of `fc_accx_dispatch`'s body on purpose:
+/// the Xtensa-LLVM backend miscompiles that function whenever ANY new code is
+/// added to it (three independent device panics proven), so the tiny-fc fast
+/// path is intercepted here, in the public entry, BEFORE the dispatch frame is
+/// built. Bit-exact vs the shared requantize semantics (identity / (acc+1)>>1
+/// / general uniform / per-channel) — the zoo sine + hello models exercise it.
+///
+/// Gate mirrors `fc_accx_dispatch`'s: tiny layers (input_dim % 16 != 0 →
+/// padded input+weights staging would cost more than the MAC work) or
+/// genuinely tiny MAC counts (≤ 64).
+#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
+#[inline(never)]
+fn fc_tiny_dispatch(ctx: &mut FcAccxCtx<'_>, uniform: (i32, i32)) -> Result<bool, KernelError> {
+    let params = ctx.params;
+    let input_dim = params.input_dim as usize;
+    let output_dim = params.output_dim as usize;
+    let input_offset = params.input_offset;
+    let needs_staging = pad16(input_dim) != input_dim;
+    let macs = input_dim * output_dim;
+    if output_dim > 64 || !((needs_staging && macs <= 2048) || macs <= 64) {
+        return Ok(false);
+    }
+    let wsum = unsafe {
+        core::slice::from_raw_parts(ctx.weights.as_ptr(), output_dim * input_dim)
+    };
+    let mut accs = [0i32; 64];
+    let in_off = input_offset;
+    for oc in 0..output_dim {
+        let mut acc = 0i32;
+        let mut ws_acc = 0i32;
+        let base = oc * input_dim;
+        for ic in 0..input_dim {
+            let wv = unsafe { *wsum.get_unchecked(base + ic) } as i32;
+            let iv = unsafe { *ctx.input.get_unchecked(ic) } as i32;
+            acc = acc.wrapping_add(iv.wrapping_mul(wv));
+            ws_acc = ws_acc.wrapping_add(wv);
+        }
+        accs[oc] = acc.wrapping_add(in_off.wrapping_mul(ws_acc));
+    }
+    let act_min = params.quantized_activation_min;
+    let act_max = params.quantized_activation_max;
+    let out_offset = params.output_offset;
+    let (uniform_mult, uniform_shift) = uniform;
+    if uniform_shift != i32::MIN {
+        // Uniform scale — inline the identity / (acc+1)>>1 / general forms
+        // bit-identically to `requantize_1x1`.
+        if uniform_mult == 1 << 30 && uniform_shift == 1 {
+            for oc in 0..output_dim {
+                let acc = accs[oc] + unsafe { *ctx.bias.get_unchecked(oc) };
+                let c = clamp(acc + out_offset, act_min, act_max);
+                unsafe { *ctx.output.get_unchecked_mut(oc) = saturating_cast(c) };
+            }
+        } else if uniform_mult == 1 << 30 && uniform_shift == 0 {
+            for oc in 0..output_dim {
+                let acc = accs[oc] + unsafe { *ctx.bias.get_unchecked(oc) };
+                let scaled = ((acc as i64 + 1) >> 1) as i32;
+                let c = clamp(scaled + out_offset, act_min, act_max);
+                unsafe { *ctx.output.get_unchecked_mut(oc) = saturating_cast(c) };
+            }
+        } else {
+            let total_shift = 31i64 - i64::from(uniform_shift);
+            let round = 1i64 << (total_shift - 1);
+            for oc in 0..output_dim {
+                let acc = accs[oc] + unsafe { *ctx.bias.get_unchecked(oc) };
+                let result = i64::from(acc) * i64::from(uniform_mult) + round;
+                let result = result >> total_shift;
+                let scaled = if result > i64::from(i32::MAX) {
+                    i32::MAX
+                } else if result < i64::from(i32::MIN) {
+                    i32::MIN
+                } else {
+                    result as i32
+                };
+                let c = clamp(scaled + out_offset, act_min, act_max);
+                unsafe { *ctx.output.get_unchecked_mut(oc) = saturating_cast(c) };
+            }
+        }
+    } else {
+        // Per-channel — mirror `requantize_1x1`'s single-pass fast-scale
+        // detect (identity / (acc+1)>>1) then the i64 general form.
+        let m0 = params.output_multiplier_per_channel.first().copied().unwrap_or(0);
+        let s0 = params.output_shift_per_channel.first().copied().unwrap_or(0);
+        let fast = m0 == 1 << 30 && (s0 == 0 || s0 == 1);
+        for oc in 0..output_dim {
+            let m = unsafe { *params.output_multiplier_per_channel.get_unchecked(oc) };
+            let s = unsafe { *params.output_shift_per_channel.get_unchecked(oc) };
+            let acc = accs[oc] + unsafe { *ctx.bias.get_unchecked(oc) };
+            let scaled = if fast && m == m0 && s == s0 {
+                if s0 == 1 {
+                    acc
+                } else {
+                    (acc >> 1).wrapping_add(acc & 1)
+                }
+            } else {
+                multiply_by_quantized_multiplier(acc, m, s)
+            };
+            let c = clamp(scaled + out_offset, act_min, act_max);
+            unsafe { *ctx.output.get_unchecked_mut(oc) = saturating_cast(c) };
+        }
+    }
     Ok(true)
 }
 
@@ -367,6 +545,25 @@ pub fn fully_connected(
             params.output_multiplier_per_channel,
             params.output_shift_per_channel,
         );
+        // Phase D — intercept ultra-tiny fc layers BEFORE the dispatch frame:
+        // fc_accx_dispatch's body must stay frozen (Xtensa-LLVM miscompile),
+        // so the tiny-fc fast path with the inline requantize epilogue lives
+        // in the separate `fc_tiny_dispatch` helper.
+        let needs_staging = pad16(input_dim) != input_dim;
+        let macs = input_dim * output_dim;
+        if output_dim <= 64 && ((needs_staging && macs <= 2048) || macs <= 64) {
+            let mut tiny_ctx = FcAccxCtx {
+                input,
+                weights,
+                bias,
+                params,
+                output,
+                scratch,
+            };
+            if fc_tiny_dispatch(&mut tiny_ctx, hint)? {
+                return Ok(());
+            }
+        }
         let mut accx_ctx = FcAccxCtx {
             input,
             weights,

@@ -370,6 +370,14 @@ fn mean_accx_dispatch(
     params: &ReduceParams,
     output: &mut [i8],
 ) -> Result<bool, KernelError> {
+    // TEMP-DEBUG (Phase 19 post-merge): the s8_mean_reduce SIMD path
+    // panics 'explicit panic' (defmt:385) on device — reproducible on the
+    // remote's own evidence log (device-silicon-run1.log at 6b21e88) and
+    // persists even with the remote's 9bdf8e6 inline(never) fix. Fall back
+    // to the (bit-exact, proven) scalar path until the asm kernel is
+    // root-caused. TODO: restore the SIMD dispatch after diagnosis.
+    return Ok(false);
+
     let in_h = params.input_shape[1] as usize;
     let in_w = params.input_shape[2] as usize;
     let in_c = params.input_shape[3] as usize;

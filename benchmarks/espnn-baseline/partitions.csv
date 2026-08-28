@@ -1,0 +1,8 @@
+# ESP32-S3, 8MB flash, octal PSRAM.
+# App partition sized for the 4.4MB hematite/esp-nn zoo-model binary.
+# nvs_keys is required by the flash-encryption NVS key provider (DEVELOPMENT mode).
+# Name,   Type, SubType, Offset,   Size, Flags
+nvs,      data, nvs,      0x9000,  0x6000,
+nvs_keys, data, nvs_keys, 0xf000,  0x1000,
+phy_init, data, phy,      0x10000, 0x1000,
+factory,  app,  factory,  0x20000, 0x5e0000,
