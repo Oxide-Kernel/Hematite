@@ -37,7 +37,14 @@ hematite-codegen = { path = "../hematite-codegen", optional = true }
 # PSRAM region via `Psram::new` + `raw_parts` — esp-hal 1.1.1 has NO static
 # `.dram1.psram` linker section (that's an esp-idf concept), so a static arena
 # cannot be linked.
-esp-hal = { workspace = true, features = ["esp32s3", "defmt", "unstable"] }
+# `default-features = false` + explicit re-enable of `rt`/`exception-handler`
+# drops the `float-save-restore` default feature. The ESP32-S3 has NO FPU, so
+# saving/restoring the (non-existent) FPU registers in every exception frame is
+# dead code — and it is actively harmful under QEMU: the xtensa-lx-rt esp32s3
+# config falsely claims `XCHAL_HAVE_FP=1`, so `save_context` emits `rur.fcr`,
+# which QEMU's esp32s3 model does not emulate and hangs on (double-exception
+# loop). See benchmarks/QEMU_SIMD_VALIDATION.md.
+esp-hal = { workspace = true, default-features = false, features = ["esp32s3", "defmt", "unstable", "rt", "exception-handler"] }
 defmt = { workspace = true }
 # xtensa-lx-rt: provides `#[entry]` (reset vector) and the runtime startup.
 # esp-hal re-exports it under `__macro_implementation`, but the firmware's
