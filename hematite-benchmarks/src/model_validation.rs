@@ -294,11 +294,39 @@ mod model_mobilenet {
 
 fn validate_mobilenet() {
     // MobileNetV2 224×224 needs ~4 MB PSRAM (input + all intermediates as
-    // stack locals); QEMU has no PSRAM and the device SRAM is ~512 KB with a
-    // ~70 KB stack. It cannot run here — report an honest SKIP, never fake.
-    crate::firmware::uart0_log!(
-        "model mobilenet_v2_1.0_224_int8: SKIP (needs PSRAM; not present under QEMU)"
-    );
+    // stack locals); the device SRAM is ~512 KB with a ~70 KB stack. On
+    // hardware (real S3 MMU: 512 entries, no drom cap) the predict runs on a
+    // PSRAM-backed stack (firmware::run_on_psram_stack). Under QEMU the model
+    // must NOT be instantiated: linking the weights duplicates the [bench]
+    // runner's copy and pushes .rodata past the emulator's 8 MiB drom map
+    // (IllegalInstruction — problems.md T5.4-QEMU-4) — honest SKIP instead.
+    #[cfg(not(feature = "qemu"))]
+    {
+        if crate::firmware::psram_probe_range().1 >= 4 * 1024 * 1024 {
+            let out = crate::firmware::run_on_psram_stack(|| {
+                let mut m = model_mobilenet::Model::<RefBackend>::new(RefBackend);
+                m.predict(&model_mobilenet::golden::INPUT_DATA)
+            });
+            report(&compare(
+                "mobilenet_v2_1.0_224_int8",
+                &out,
+                &model_mobilenet::golden::EXPECTED_OUTPUT,
+            ));
+        } else {
+            crate::firmware::uart0_log!(
+                "model mobilenet_v2_1.0_224_int8: SKIP (needs PSRAM; probe found none)"
+            );
+        }
+    }
+    #[cfg(feature = "qemu")]
+    {
+        // QEMU drom-map guard: do NOT reference model_mobilenet here — the
+        // retained weights would duplicate the [bench] runner's copy and
+        // push .rodata past the emulator's 8 MiB drom map.
+        crate::firmware::uart0_log!(
+            "model mobilenet_v2_1.0_224_int8: SKIP reason=drom-map-cap (QEMU esp32s3 drom map caps at 8 MiB; full weights push .rodata past it — see problems.md T5.4-QEMU-4)"
+        );
+    }
 }
 
 /// Run all model validations. Called first from the firmware boot flow.
@@ -308,8 +336,13 @@ pub fn validate_all() {
     validate_hello_world();
     validate_kws();
     validate_anomaly();
-    validate_person_detect();
+    // mobilenet before person_detect: the person_detect arena-stack probe
+    // zeroes PSRAM_ARENA.1 / the esp-hal mapped-range words mid-pass (they
+    // sit at its SP target — problems.md T5.4-QEMU-3). The .data capture
+    // accessor makes mobilenet robust regardless, but running it first keeps
+    // the pass order independent of the clobber.
     validate_mobilenet();
+    validate_person_detect();
     crate::firmware::uart0_log!("=== MODEL VALIDATION DONE ===");
 }
 
@@ -486,11 +519,40 @@ fn validate_s3_person_detect() {
 }
 
 fn validate_s3_mobilenet() {
-    // MobileNetV2 224×224 needs ~4 MB PSRAM; this board has none (`PSRAM: 0
-    // bytes`). Honest SKIP with the Metis F10 record format — never fake.
-    crate::firmware::uart0_log!(
-        "model mobilenet_v2_1.0_224_int8 [s3]: SKIP reason=no-psram rerun_condition=board-with-PSRAM"
-    );
+    // Same split as validate_mobilenet: on hardware the S3 + ref predicts
+    // run on the PSRAM-backed stack and report against ref + golden; under
+    // QEMU the model must NOT be instantiated (drom-map cap — problems.md
+    // T5.4-QEMU-4) — honest Metis F10 SKIP instead, never fake.
+    #[cfg(not(feature = "qemu"))]
+    {
+        if crate::firmware::psram_probe_range().1 >= 4 * 1024 * 1024 {
+            let (s3_out, ref_out) = crate::firmware::run_on_psram_stack(|| {
+                let mut s3 = model_mobilenet::Model::<S3Backend>::new(S3Backend);
+                let s3 = s3.predict(&model_mobilenet::golden::INPUT_DATA);
+                let mut refb = model_mobilenet::Model::<RefBackend>::new(RefBackend);
+                let refb = refb.predict(&model_mobilenet::golden::INPUT_DATA);
+                (s3, refb)
+            });
+            report_s3(
+                "mobilenet_v2_1.0_224_int8",
+                &s3_out,
+                &ref_out,
+                &model_mobilenet::golden::EXPECTED_OUTPUT,
+            );
+        } else {
+            crate::firmware::uart0_log!(
+                "model mobilenet_v2_1.0_224_int8 [s3]: SKIP reason=no-psram rerun_condition=board-with-PSRAM"
+            );
+        }
+    }
+    #[cfg(feature = "qemu")]
+    {
+        // QEMU drom-map guard: no model_mobilenet references (see
+        // validate_mobilenet).
+        crate::firmware::uart0_log!(
+            "model mobilenet_v2_1.0_224_int8 [s3]: SKIP reason=drom-map-cap (QEMU esp32s3 drom map caps at 8 MiB; full weights push .rodata past it — see problems.md T5.4-QEMU-4)"
+        );
+    }
 }
 
 /// Run all zoo models through `Model::<S3Backend>` (plan todo 5). Called
@@ -501,8 +563,11 @@ pub fn validate_all_s3() {
     validate_s3_hello_world();
     validate_s3_kws();
     validate_s3_anomaly();
-    validate_s3_person_detect();
+    // Same ordering rationale as validate_all: mobilenet first, so the
+    // person_detect arena-stack probe's mid-pass clobber cannot affect it
+    // (the .data capture accessor is the robust path; this is belt-and-braces).
     validate_s3_mobilenet();
+    validate_s3_person_detect();
     crate::firmware::uart0_log!("=== MODEL VALIDATION S3 DONE ===");
 }
 

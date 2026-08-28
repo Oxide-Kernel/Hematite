@@ -462,6 +462,62 @@ unsafe fn set_sp(sp: usize) {
 /// failure, never a fabricated measurement.
 static mut PSRAM_ARENA: &'static mut [u8] = &mut [];
 
+/// QEMU-only capture of the PSRAM range found by the boot probe (`[ptr, len]`).
+///
+/// The validation section reads this (via [`psram_probe_range`]) so the
+/// PSRAM-tier models can run even AFTER the person_detect arena-stack probe
+/// zeroes the `PSRAM_ARENA` length word and esp-hal's `MAPPED_PSRAM_START/END`
+/// (linker layout: they sit exactly at `&SRAM_ARENA + 0x40000` = the probe's
+/// SP target; see problems.md "T5.4-QEMU-3"). The capture itself lives in
+/// `.data` — the nonzero initializer keeps rustc from splitting the zero tail
+/// into `.bss` (the clobber zone) — so it survives the probe.
+#[cfg(feature = "qemu")]
+static mut PSRAM_PROBE_CAPTURE: [usize; 2] = [0xE1E5_A11C, 0xBAAD_F00D];
+
+/// The PSRAM `(ptr, len)` backing the bench arena.
+///
+/// QEMU: the boot probe's captured range (`.data`-backed, survives the
+/// person_detect stack-probe clobber). Hardware: the runtime-mapped arena
+/// populated by the `esp_hal::init` PSRAM path. Empty `(0, 0)` when no PSRAM
+/// was found.
+pub(crate) fn psram_probe_range() -> (*mut u8, usize) {
+    #[cfg(feature = "qemu")]
+    {
+        // SAFETY: single-threaded firmware; written exactly once by the boot probe.
+        let [ptr, len] = unsafe { core::ptr::addr_of!(PSRAM_PROBE_CAPTURE).read() };
+        (ptr as *mut u8, len)
+    }
+    #[cfg(not(feature = "qemu"))]
+    {
+        // SAFETY: single-threaded firmware; set once by the boot PSRAM init.
+        let arena = unsafe { core::ptr::addr_of!(PSRAM_ARENA).read() };
+        (arena.as_ptr() as *mut u8, arena.len())
+    }
+}
+
+/// Run `f` on a stack carved from the TOP of the PSRAM arena.
+///
+/// MobileNetV2 224×224's generated `predict` allocas ~4 MB of intermediates
+/// on the stack — only the PSRAM arena can hold it. The stack is taken from
+/// the arena END so the model bench's front carve (`carve_model_bufs`) never
+/// collides. SAFETY: same contract as [`run_on_arena_stack`] — the arena must
+/// be unused by the caller and SP is restored before returning. The caller
+/// must gate on [`psram_probe_range`] being large enough; with less than
+/// ~4 MB the predict's alloca overruns the mapped region. (Device note: the
+/// arena-stack SP switch carries the same real-silicon window-underflow risk
+/// as [`run_on_arena_stack`]; under QEMU the mechanism is proven.)
+pub fn run_on_psram_stack<R>(f: impl FnOnce() -> R) -> R {
+    unsafe {
+        let (psram_ptr, psram_len) = psram_probe_range();
+        let top = (psram_ptr as usize + psram_len) & !15;
+        let old_sp = read_sp();
+        set_sp(top);
+        let r = f();
+        set_sp(old_sp);
+        r
+    }
+}
+
 /// Stack-canary slot.  BRING-UP: extend the linker script so this section is
 /// placed at the top of the stack region for true overflow detection; without
 /// that placement the canary still catches gross clobbers, and the
@@ -1416,10 +1472,44 @@ pub fn run_benchmarks() -> ! {
         firmware_log!("PSRAM: {} bytes", psram_len);
     }
     #[cfg(feature = "qemu")]
-    {
+    let psram_probe = {
         firmware_log!("esp-hal init SKIPPED (qemu feature: PLL cal_done poll hangs in emulator)");
-        firmware_log!("PSRAM init SKIPPED (qemu feature: no PSRAM in emulator)");
-    }
+        // PSRAM probe (Espressif QEMU fork): ATTEMPT real esp-hal PSRAM init
+        // against the emulated `ssi_psram` device attached at SPI1 CS1 by
+        // `-m 8M` (octal 8MB). `esp_hal::init` is bypassed in this build, so
+        // the PSRAM peripheral token comes from the public
+        // `Peripherals::steal()` (no lock, no panic; `take()` is
+        // pub(crate)). Defensive: `Psram::new` fails gracefully (init
+        // failure → `raw_parts` = (0x0, 0)); the arena is only updated on
+        // success and the probe always logs the byte count — it never
+        // panics, the suite continues either way. The captured (ptr, len)
+        // re-asserts the arena later (see the validation-section comment).
+        let psram = esp_hal::psram::Psram::new(
+            // SAFETY: single-threaded firmware; the PSRAM peripheral is
+            // stolen once and only used here; nothing else aliases it.
+            unsafe { esp_hal::peripherals::Peripherals::steal() }.PSRAM,
+            esp_hal::psram::PsramConfig::default(),
+        );
+        let (psram_ptr, psram_len) = psram.raw_parts();
+        // Capture into the .data-backed static so the validation section
+        // (PSRAM-tier models) can read the range after the person_detect
+        // stack probe clobbers PSRAM_ARENA.1 / the esp-hal mapped-range
+        // atomics (problems.md T5.4-QEMU-3).
+        unsafe {
+            PSRAM_PROBE_CAPTURE = [psram_ptr as usize, psram_len];
+        }
+        if psram_len > 0 {
+            // SAFETY: single-threaded firmware; PSRAM stays mapped for
+            // program lifetime (psram is held in scope). The slice is only
+            // used as a scratch arena, never aliased.
+            unsafe {
+                PSRAM_ARENA = core::slice::from_raw_parts_mut(psram_ptr, psram_len);
+            }
+        }
+        firmware_log!("PSRAM probe: {} bytes", psram_len);
+        firmware_log!("PSRAM probe map: {:08x}..{:08x}", psram_ptr as usize, psram_ptr as usize + psram_len);
+        (psram_ptr, psram_len)
+    };
 
     // 1. Boot-profile guardrail — panic on any drift from the locked profile.
     let profile = read_boot_profile();
@@ -1456,6 +1546,28 @@ pub fn run_benchmarks() -> ! {
     crate::model_validation::validate_all();
     #[cfg(feature = "model-validation")]
     crate::model_validation::validate_all_s3();
+    // The person_detect stack probe in model_validation (validate_all /
+    // validate_all_s3) switches the SP to &SRAM_ARENA + 0x40000 — and the
+    // linker placed the PSRAM_ARENA length word plus esp-hal's
+    // MAPPED_PSRAM_START/END exactly there, so the probe's stack writes zero
+    // them (a pre-existing latent bug, masked on hardware where PSRAM_ARENA
+    // stays empty). run_benchmarks' own frame survives (the suite keeps
+    // running), so the probe-captured range re-asserts the arena for the
+    // bench rows that follow — no hardware access. Root-cause fix (probe SP
+    // target / linker layout) tracked in local-notes/notepads/hematite-nn/problems.md.
+    #[cfg(feature = "qemu")]
+    {
+        let (psram_ptr, psram_len) = psram_probe;
+        if psram_len > 0 {
+            // SAFETY: single-threaded firmware; PSRAM stays mapped for
+            // program lifetime (psram is held in scope). The slice is only
+            // used as a scratch arena, never aliased.
+            unsafe {
+                PSRAM_ARENA = core::slice::from_raw_parts_mut(psram_ptr, psram_len);
+            }
+        }
+        firmware_log!("PSRAM arena re-asserted: {} bytes", psram_len);
+    }
 
     // 4.6 TIE728 SIMD correctness (elementwise + pool vs hematite-ref) —
     // hardware-only: gated `not(feature = "qemu")` because the QEMU fork's
