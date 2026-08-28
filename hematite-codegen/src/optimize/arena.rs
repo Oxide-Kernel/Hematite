@@ -38,7 +38,7 @@
 //! planner rejects — [`LayoutError::Oversized`] for a single tensor over
 //! the 512 KiB budget, e.g. mobilenet_v2's 224×224×32 activation — fall
 //! back to per-tensor stack emission (`ARENA_LEN = 0`), bit-exact, just
-//! larger (evidence: `local-notes/evidence/composed-kernels/t13-arena.md`).
+//! larger (evidence: the arena evidence note).
 //! Model inputs/outputs and constant tensors are excluded by the planner
 //! (caller-owned / flash-resident memory), never by this module.
 //!
@@ -554,7 +554,7 @@ mod tests {
     ));
 
     /// T1.3 — per-model arena peak pinned from `plan_arena` over the real
-    /// zoo models (recorded in local-notes/evidence/composed-kernels/t13-arena.md).
+    /// zoo models (recorded in the arena evidence note).
     /// Every arena-emitted model must fit MAX_INTERNAL = 512 KiB; models
     /// that exceed it (mobilenet_v2: the 224×224×32 first-conv activation
     /// alone is ~1.6 MiB) keep per-tensor stack emission instead.

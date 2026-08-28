@@ -236,5 +236,5 @@ them as `hematite_tests::goldens::conv2d_1x1::INPUT_DATA`, etc.
 - `GOLDEN_TFLM_VERSION` — the pinned TFLM SHA
 - `GOLDEN_PROVENANCE` — whether these values came from real TFLM or internal reference
 
-All Phase 2 helpers MUST follow this convention so test includes remain
-consistent across the corpus.
+All Phase 2 fixture generators MUST follow this convention so test includes
+remain consistent across the corpus.

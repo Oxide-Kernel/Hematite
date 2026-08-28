@@ -1,7 +1,6 @@
 # zoo-results — on-device zoo model validation ledger (plan todo 5, Metis F10)
 
-Row format (transcribed verbatim from the device serial log,
-`local-notes/evidence/simd-zoo-hardening/task-5-device-s3-models.log`):
+Row format (transcribed verbatim from the device serial log):
 
 ```
 PASS <model> <backend> <fnv1a>
@@ -72,9 +71,9 @@ vs defmt-write race; recorded for todo 8, not part of this todo's rows.
 
 ## Run-1 device rows (fused `Model::<S3Backend>` path)
 
-Source: `local-notes/evidence/composed-kernels/device-silicon-run1.log` (raw
-capture, ESP32-S3 rev v0.2 @ 240 MHz, 8 MB flash, permanent flash
-encryption, `PSRAM: 0 bytes`). Measured code: commit `fc067bf` (T6.3);
+Source: real-silicon run-1 device capture (ESP32-S3 rev v0.2 @ 240 MHz,
+8 MB flash, permanent flash encryption, `PSRAM: 0 bytes`). Measured code:
+commit `fc067bf` (T6.3);
 firmware built with `--features model-validation`; flashed via the
 owner-approved `esptool.py write_flash --encrypt` @ 921600.
 
@@ -106,7 +105,7 @@ record and the known follow-up).
 
 ## Head-to-head ledger (mandatory format: ISO timestamp + commit + full cycles both sides)
 
-Full analysis: `local-notes/evidence/composed-kernels/head-to-head.md`.
+Full analysis: the head-to-head ledger is recorded per-row below.
 
 ### A/B/C benchmark graphs (device, 2026-08-10; fused path)
 

@@ -254,7 +254,7 @@ rust_needs_build() {
     [ "$(cat "$stamp" 2>/dev/null)" = "$want" ] || { echo "  feature set changed (stamp: $(cat "$stamp" 2>/dev/null) vs $want)"; return 0; }
     # any .rs / Cargo.toml / Cargo.lock / build.rs newer than the ELF?
     if find "$REPO_ROOT" \
-        \( -path "$REPO_ROOT/target" -o -path "$REPO_ROOT/.git" -o -path "$REPO_ROOT/local-notes" \) -prune -o \
+        \( -path "$REPO_ROOT/target" -o -path "$REPO_ROOT/.git" \) -prune -o \
         -type f \( -name '*.rs' -o -name 'Cargo.toml' -o -name 'Cargo.lock' -o -name 'build.rs' \) \
         -newer "$elf" -print -quit 2>/dev/null | grep -q .; then
         echo "  source newer than ELF"

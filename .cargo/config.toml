@@ -9,8 +9,6 @@
 #
 # Xtensa builds are scoped into the cargo aliases below.  Host commands
 # (`cargo check`, `cargo test`, `cargo run`) need no explicit --target.
-#
-# See: local-notes/plans/hematite-nn.md T0.1 (amended 2026-08-04)
 # ───────────────────────────────────────────────────────────────────────
 
 [target.xtensa-esp32s3-none-elf]

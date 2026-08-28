@@ -17,9 +17,8 @@
 //!
 //! # Ops NOT wired (return [`KernelError::Unsupported`])
 //!
-//! s3 has no kernel (scalar or SIMD) for these ops, and the plan (todo 3 of
-//! `local-notes/plans/simd-zoo-hardening.md`) mandates `Unsupported` — honest
-//! failure rather than a silent wrong answer:
+//! s3 has no kernel (scalar or SIMD) for these ops, and the project plan
+//! mandates `Unsupported` — honest failure rather than a silent wrong answer:
 //!
 //! | Trait method | Reason |
 //! |---|---|

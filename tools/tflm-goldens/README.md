@@ -129,4 +129,5 @@ regenerates goldens from THIS harness's output.
 
 ## Evidence
 
-Task 9 execution record: `local-notes/evidence/simd-zoo-hardening/task-9-tflm-harness.log`.
+Task 9 execution record: the tflm-harness run log (device capture, kept in
+the benchmark evidence logs).

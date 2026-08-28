@@ -13,7 +13,7 @@
 //!   calls), so on real hardware the SIMD path is exercised; the `qemu`
 //!   feature is gated off inside those dispatch functions
 //!   (`EE.VSMULAS.S8.QACC.LD.INCP` is unemulated by this QEMU fork — see
-//!   `local-notes/notepads/hematite-nn/problems.md`).
+//!   the QEMU SIMD validation notes).
 //!
 //! # Call-site note (hardware-only suite)
 //!
@@ -24,7 +24,7 @@
 //! the Wave 2 device sweep; on QEMU this suite is non-terminating (see the
 //! per-op bisection evidence below).
 //!
-//! # Result (see `local-notes/notepads/hematite-nn/problems.md`, same date, for the
+//! # Result (see the QEMU SIMD validation notes, same date, for the
 //! full per-op bisection evidence)
 //!
 //! Every one of the 5 checks below fails under this QEMU fork
@@ -437,8 +437,7 @@ fn run_max_pool_check() {
 // pad_total ≤ 0, so these shapes dispatch the `*_hwc1` SIMD kernels on
 // device. Max semantics equal the ref bit-exact (PASS expected); avg runs
 // the documented fixed-point semantics (the ±1 known-delta class — see
-// `hematite-s3/src/pool.rs` module doc and `local-notes/evidence/composed-kernels/
-// t31-pool.md`). The relu-clamp shape exercises the Rust clamp post-pass.
+// `hematite-s3/src/pool.rs` module doc and the pool SIMD evidence notes). The relu-clamp shape exercises the Rust clamp post-pass.
 
 const GEN_POOL_IN: usize = 8 * 8 * 16;
 const GEN_POOL_OUT: usize = 6 * 6 * 16;

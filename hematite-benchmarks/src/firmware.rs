@@ -28,8 +28,8 @@
 //! Every esp-hal call is therefore marked `BRING-UP:` with the exact API to
 //! validate on hardware; the guardrail **logic** lives in
 //! [`crate::guardrails`] and the buffer-carve logic lives in
-//! [`crate::spec::carve_into`] — both fully host-tested.  See
-//! `local-notes/notepads/hematite-nn/problems.md` for the tracking entry.
+//! [`crate::spec::carve_into`] — both fully host-tested.  See the project's
+//! QEMU-aware tracking notes for the per-device entries.
 
 // esp-hal is referenced in both builds (CpuClock::max() is used even under
 // qemu to keep the crate linked — see `read_boot_profile`).
@@ -1649,7 +1649,7 @@ pub fn run_benchmarks() -> ! {
     // stays empty). run_benchmarks' own frame survives (the suite keeps
     // running), so the probe-captured range re-asserts the arena for the
     // bench rows that follow — no hardware access. Root-cause fix (probe SP
-    // target / linker layout) tracked in local-notes/notepads/hematite-nn/problems.md.
+    // target / linker layout) is a tracked open item.
     #[cfg(feature = "qemu")]
     {
         let (psram_ptr, psram_len) = psram_probe;

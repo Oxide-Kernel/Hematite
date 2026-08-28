@@ -1023,8 +1023,8 @@ const SIMD_AVGPOOL_32X32_PARAMS: PoolParams = PoolParams {
 // VALID rows and 2×2/stride-2 SAME); padded rows run the scalar fallback on
 // device (bit-exact vs ref — the pool backend delivers no scratch for
 // spatial padding staging) and are model-verified on the host. The avg
-// fixed-point-vs-ref divergence is documented in
-// `local-notes/evidence/composed-kernels/t31-pool.md`.
+// fixed-point-vs-ref divergence is documented in the pool SIMD evidence
+// notes.
 
 /// 3×3 stride-1 VALID (pad_total 0) — the generic hwc1 SIMD path (avg).
 const POOL_3X3_S1_VALID_PARAMS: PoolParams = PoolParams {

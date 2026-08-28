@@ -37,8 +37,8 @@
 //!
 //! So TFLM fills pads with the output tensor's zero point when the model
 //! has no constant-values tensor (mobilenet_v2's 18 PAD ops are this case;
-//! output zp == input zp == −14, and executed TFLM fills −14 — evidence:
-//! `local-notes/evidence/simd-zoo-hardening/task-10-goldens.log` §9(b)).
+//! output zp == input zp == −14, and executed TFLM fills −14 — evidence
+//! recorded in the task-10 goldens log).
 //!
 //! **Hematite's [`PadParams`] carries NO zero point** and the
 //! [`KernelBackend::pad`] trait method has no pad-value argument (codegen
@@ -53,8 +53,8 @@
 //! 0-vs-−14 drives 861/1000 output deltas), so this copy fills raw 0,
 //! bit-exact with the reference. The mv2 divergence vs the executed-TFLM
 //! golden therefore remains a documented PAD/rounding divergence shared by
-//! BOTH backends; the zero-point fill is tracked in
-//! `local-notes/notepads/simd-zoo-hardening/learnings.md` and the plan follow-up.
+//! BOTH backends; the zero-point fill is tracked as a documented project
+//! follow-up.
 
 use hematite_core::op_params::{
     ConcatParams, PadParams, ReshapeParams, ResizeNearestParams, SliceParams,

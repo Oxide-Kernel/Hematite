@@ -17,7 +17,7 @@ at a locked 240 MHz.
 - The device firmware (`src/firmware.rs`, `cfg(target_arch = "xtensa")`) is
   NOT compiled on the host.  It is structurally reviewed and its guardrail
   logic is host-tested; the esp-hal calls carry `BRING-UP:` markers to
-  validate on hardware.  Tracking: `local-notes/notepads/hematite-nn/problems.md`.
+  validate on hardware.
 
 ## Running on hardware
 

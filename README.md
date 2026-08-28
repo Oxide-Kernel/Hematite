@@ -49,9 +49,8 @@ benchmarked.
 
 Three identical models, deterministic fill, same FNV-1a checksums, run
 end-to-end on both stacks at 240 MHz on an ESP32-S3 (rev v0.2). Full detail
-in [`benchmarks/ESPRESSIF_VS_HEMATITE.md`](benchmarks/ESPRESSIF_VS_HEMATITE.md)
-and the ledger in
-[`local-notes/evidence/composed-kernels/head-to-head.md`](local-notes/evidence/composed-kernels/head-to-head.md).
+and the benchmark ledger in
+[`benchmarks/ESPRESSIF_VS_HEMATITE.md`](benchmarks/ESPRESSIF_VS_HEMATITE.md).
 
 | Model | ESP-NN optimized | **Hematite** | Hematite wins |
 |---|---|---|---|
@@ -63,8 +62,8 @@ Every number is bit-exact with the scalar reference on every layer of every
 model — the comparison is apples-to-apples. Benchmark ledger rule: every
 measured row carries ISO timestamp + git commit of the measured code + FULL
 Hematite cycles + FULL C-stack cycles + speedup ratio + config (never
-deltas-only) — see `benchmarks/ESPRESSIF_VS_HEMATITE.md` and
-`local-notes/evidence/composed-kernels/model-cycles.md`.
+deltas-only) — see `benchmarks/ESPRESSIF_VS_HEMATITE.md` and the
+`benchmarks/zoo-results/` readme.
 
 ## Workspace layout
 

@@ -3,8 +3,8 @@
 //
 //! T5.1 — static pins for the fused==unfused equivalence harness (test-only).
 //!
-//! The runtime harness (tests/fused_equivalence.rs) writes
-//! `local-notes/evidence/composed-kernels/fused-equivalence.md`; its per-model
+//! The runtime harness (tests/fused_equivalence.rs) writes the
+//! fused-equivalence evidence file; its per-model
 //! static columns (composed group count, T2 group count, final emitted
 //! mode) are carried as a manifest in that test file.  THIS module is the
 //! tripwire: it re-runs the REAL `fuse()` + `selector::select_kernel`

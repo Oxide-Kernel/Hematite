@@ -106,7 +106,7 @@ pub fn generate(w: &mut FixtureWriter) {
     let _ = writeln!(buf, "pub const FILTER_SHAPE: [i32; 4] = {:?};", [0i32; 4]);
     let _ = writeln!(buf, "pub const OUTPUT_SHAPE: [i32; 4] = {:?};\n", output_shape);
 
-    // Softmax-specific quantization consts (for T2.2c helper)
+    // Softmax-specific quantization consts (T2.2c)
     let _ = writeln!(buf, "/// De-quantization scale for softmax logits.");
     let _ = writeln!(
         buf,

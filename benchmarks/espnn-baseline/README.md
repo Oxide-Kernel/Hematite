@@ -114,8 +114,8 @@ writes MUST use `esptool write_flash --encrypt`, never plaintext/espflash):
   write_flash --encrypt 0x0 /tmp/bl.bin 0x8000 /tmp/pt.bin 0x10000 /tmp/espnn.bin
 ```
 
-Capture the UART report (115200 baud) verbatim into
-`local-notes/evidence/simd-zoo-hardening/task-20-espnn-zoo.log`.
+Capture the UART report (115200 baud) verbatim into the benchmark evidence
+logs for the zoo head-to-head record.
 
 ## Files
 

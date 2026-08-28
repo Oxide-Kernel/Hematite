@@ -323,7 +323,7 @@ mod models_mobilenet_v2 {
 //
 // The committed S3Backend (e064e7b) returned `KernelError::Unsupported` for
 // the data-movement ops it had no kernel for (reshape/transpose/pad — see
-// the status matrix in `local-notes/evidence/simd-zoo-hardening/task-3-s3backend.log`),
+// the status matrix in the task-3 s3backend log),
 // and `Model::predict` swallows the error (output left zeroed). The todo-25
 // amendment added scalar data-movement kernels (`hematite-s3/src/
 // data_movement.rs`) and wired them into S3Backend, so every zoo model now

@@ -3,7 +3,7 @@
 //! Each activation emits its quantization parameters explicitly.
 //! Where an op is trivial under symmetric quantization (zero_point=0),
 //! the simplification is exact and documented.
-//! HardSwish uses a DOWNGRADED provenance (see local-notes/notepads/hematite-nn/problems.md).
+//! HardSwish uses a DOWNGRADED provenance (documented in the project notes).
 
 use crate::tflm_math;
 use crate::fixture::FixtureWriter;
@@ -105,7 +105,7 @@ pub fn generate_hard_swish(w: &mut FixtureWriter) {
     let _ = writeln!(buf, "/// TFLM's 16-bit SaturatingDoublingHighMul/RoundingDivideByPOT chain.");
     let _ = writeln!(buf, "/// NOT bit-exact against executed TFLM HardSwish.");
     let _ = writeln!(buf, "/// T5.0 must implement the TFLM HardSwishParams chain with gemmlowp 16-bit primitives.");
-    let _ = writeln!(buf, "pub const GOLDEN_PROVENANCE: &str = \"DOWNGRADED: integer-div-rational-approx; NOT TFLM-faithful; see local-notes/notepads/hematite-nn/problems.md\";\n");
+    let _ = writeln!(buf, "pub const GOLDEN_PROVENANCE: &str = \"DOWNGRADED: integer-div-rational-approx; NOT TFLM-faithful\";\n");
 
     let _ = writeln!(buf, "pub const INPUT_SHAPE: [i32; 4] = {:?};", input_shape);
     let _ = writeln!(buf, "pub const OUTPUT_SHAPE: [i32; 4] = {:?};\n", output_shape);

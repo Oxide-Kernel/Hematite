@@ -462,8 +462,8 @@ pub fn conv2d_3x3(
     //
     // ALSO gated off under the `qemu` feature: QEMU's xtensa/esp32s3 TIE728
     // emulation does not correctly execute the TIE MAC instructions this
-    // kernel depends on (confirmed by direct bisection — see
-    // local-notes/notepads/hematite-nn/problems.md). QEMU builds fall through to the
+    // kernel depends on (confirmed by direct bisection — documented in the
+    // QEMU SIMD validation notes). QEMU builds fall through to the
     // scalar path; real hardware still gets SIMD.
     #[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]
     {

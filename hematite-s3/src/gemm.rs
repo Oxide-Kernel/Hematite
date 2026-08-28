@@ -532,7 +532,7 @@ pub fn fully_connected(
     // ALSO gated off under the `qemu` feature: QEMU's xtensa/esp32s3 TIE728
     // emulation does not correctly execute the TIE MAC instructions this
     // kernel depends on (confirmed by direct instruction-level bisection —
-    // see local-notes/notepads/hematite-nn/problems.md). QEMU builds fall through to
+    // see the QEMU SIMD validation notes). QEMU builds fall through to
     // the scalar path; real hardware still gets SIMD.
     //
     // `uniform_hint` is cached per params identity (todo 16): the O(output_dim)

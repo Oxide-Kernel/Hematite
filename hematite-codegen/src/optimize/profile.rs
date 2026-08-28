@@ -16,10 +16,10 @@
 //! (`cargo test -p hematite-codegen -- --nocapture profile_zoo_models`) and
 //! writes the same content via `std::fs` (host-only, mirroring the
 //! `tools/generate_goldens` precedent) to
-//! `local-notes/evidence/composed-kernels/fused-profile.md` (CARGO_MANIFEST_DIR
-//! relative).  The numbers in that file SET the plan's wave-6 speed targets
-//! (T6.2/T6.3), so every column is computed from the real `fuse()` runs — no
-//! hand-typed table.
+//! `target/evidence/composed-kernels/fused-profile.md` (CARGO_MANIFEST_DIR
+//! relative, gitignored).  The numbers in that file SET the plan's wave-6
+//! speed targets (T6.2/T6.3), so every column is computed from the real
+//! `fuse()` runs — no hand-typed table.
 //!
 //! # Arena numbers
 //!
@@ -536,7 +536,7 @@ fn render(profiles: &[ModelProfile]) -> String {
 fn evidence_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
-        .join("local-notes")
+        .join("target")
         .join("evidence")
         .join("composed-kernels")
         .join("fused-profile.md")
@@ -573,7 +573,7 @@ fn profile_zoo_models() {
     // Evidence file (host-side only, test-only module).
     let path = evidence_path();
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("create local-notes/evidence/composed-kernels");
+        std::fs::create_dir_all(parent).expect("create target/evidence/composed-kernels");
     }
     std::fs::write(&path, &markdown).unwrap_or_else(|e| {
         panic!("failed to write {}: {e}", path.display())
@@ -588,7 +588,7 @@ fn profile_zoo_models() {
 fn selector_evidence_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
-        .join("local-notes")
+        .join("target")
         .join("evidence")
         .join("composed-kernels")
         .join("selector-output.md")
@@ -660,7 +660,7 @@ fn render_selector_output(
 /// * The staging decision matches each model's first kernel: stage
 ///   sine/hello_world/anomaly_detect (16B-aligned copy), skip the rest.
 ///
-/// Writes `local-notes/evidence/composed-kernels/selector-output.md` (gitignored —
+/// Writes `target/evidence/composed-kernels/selector-output.md` (gitignored —
 /// see the T4.1 fused-profile precedent for the write path).
 #[test]
 fn selector_output_zoo_models() {
@@ -757,7 +757,7 @@ fn selector_output_zoo_models() {
 
     let path = selector_evidence_path();
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("create local-notes/evidence/composed-kernels");
+        std::fs::create_dir_all(parent).expect("create target/evidence/composed-kernels");
     }
     std::fs::write(&path, &md).unwrap_or_else(|e| {
         panic!("failed to write {}: {e}", path.display())

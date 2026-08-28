@@ -57,7 +57,7 @@
 //!   ±1 LSB on negative half-even window sums (device-validated: the 4×4×16
 //!   `avg_pool_2x2` check is the documented ±1 known-delta, `fnv 0xd0d19a11`),
 //!   and the reciprocal is exact only for power-of-two areas. The divergence
-//!   is DOCUMENTED (`local-notes/evidence/composed-kernels/t31-pool.md`), never
+//!   is DOCUMENTED (in the pool SIMD evidence), never
 //!   "fixed".
 //!
 //! ## Why the device path is no-padding-only

@@ -29,7 +29,7 @@ Sibling document: `QEMU_VALIDATION.md` (the 4-baseline cycle-count validation).
 `EE.VSMULAS.S8.QACC.LD.INCP` (used by the conv1x1/conv3x3/gemm kernels) is
 "decoded by Espressif's QEMU xtensa/esp32s3 fork but not correctly executed,
 causing a silent infinite exception loop". A 7-round UART-print bisection
-(`local-notes/notepads/hematite-nn/problems.md`) narrowed it to that opcode, and a
+narrowed it to that opcode, and a
 `qemu` Cargo feature was added to compile out the weighted-op SIMD paths under
 QEMU. Elementwise/pool SIMD was left enabled but `simd_validation.rs`
 documented the suite as "non-terminating on this QEMU build".

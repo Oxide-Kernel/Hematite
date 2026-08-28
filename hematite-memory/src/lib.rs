@@ -53,8 +53,8 @@ pub const MAX_IO_PER_OP: usize = 4;
 ///
 /// T1.3: raised from 64 to 255 so the zoo models with wide subgraphs
 /// plan through the arena — person_detect has 89 tensors and
-/// mobilenet_v2_1.0_224 has 212 (both exceeded the old cap; see
-/// `local-notes/evidence/composed-kernels/t13-arena.md`).  255 keeps the
+/// mobilenet_v2_1.0_224 has 212 (both exceeded the old cap; see the
+/// arena evidence note).  255 keeps the
 /// count representable in `ArenaPlan::tensor_count: u8` (indices
 /// 0..=254, count ≤ 255) and bounds the fixed `offsets` array width.
 pub const MAX_TENSORS: usize = 255;

@@ -56,8 +56,8 @@
 //! guarantees a single op's input/output slices never overlap because they
 //! are simultaneously live.  Models the planner rejects (mobilenet_v2: a
 //! single 224×224×32 activation exceeds the 512 KiB budget) keep per-tensor
-//! stack emission — bit-exact, just larger (evidence:
-//! `local-notes/evidence/composed-kernels/t13-arena.md`).
+//! stack emission — bit-exact, just larger (evidence: the arena evidence
+//! note).
 
 use proc_macro2::TokenStream;
 use quote::quote;
@@ -222,7 +222,7 @@ fn emit_model_with_options(
     // succeeds AND covers every emitted intermediate.  On planner rejection
     // (mobilenet_v2: a single 224²×32 activation exceeds MAX_INTERNAL) the
     // emitter falls back to per-tensor stack locals — bit-exact, just
-    // larger (see local-notes/evidence/composed-kernels/t13-arena.md).
+    // larger (see the t13-arena evidence note).
     let arena_plan = if arena_enabled { arena_plan_for(model, &storage) } else { None };
     let lens: Option<Vec<usize>> = match &arena_plan {
         Some(_) => Some(
@@ -609,8 +609,8 @@ fn fused_plan(
 /// fuse into ONE composed `fused_*` call, which fell back to per-op and why
 /// (the mirror-gate reasons `select_kernel` already computed).  The header
 /// line carries the W0-profile numbers (SIMD-eligible counts) so the
-/// emitted code is directly checkable against
-/// `local-notes/evidence/composed-kernels/fused-profile.md`; per-group lines cover
+/// emitted code is directly checkable against the fused-pattern profile
+/// evidence file; per-group lines cover
 /// every composed group plus every composed-candidate group the mirror left
 /// per-op (the interesting fallbacks), and the remaining plain per-op
 /// groups collapse to one aggregate line.  Emitted ONLY when the model has
@@ -673,7 +673,7 @@ fn fused_groups_summary(plan: &FusedPlan, schedule: &FusedSchedule) -> String {
     }
     if plain_per_op > 0 {
         lines.push(format!(
-            "remaining {plain_per_op} groups: plain per-op (no composed pattern) - per-group table: local-notes/evidence/composed-kernels/selector-output.md"
+            "remaining {plain_per_op} groups: plain per-op (no composed pattern) - per-group table in the selector-output evidence file"
         ));
     }
     lines.join("\n")
@@ -1537,7 +1537,7 @@ fn emit_op(
              in-scope op set (conv2d, depthwise_conv2d, fully_connected, average_pool_2d, \
              max_pool_2d, softmax, relu, relu6, hard_swish, leaky_relu, prelu, add, sub, mul, \
              mean, reshape, resize_nearest); this opcode is gated behind the T5 feature wave \
-             (see local-notes/plans/hematite-nn.md, T5: extended op support)"
+             (extended op support)"
         )),
     }
 }

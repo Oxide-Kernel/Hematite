@@ -522,8 +522,8 @@ pub fn conv2d_1x1(
     // ALSO gated off under the `qemu` feature: QEMU's xtensa/esp32s3 TIE728
     // emulation does not correctly execute `EE.VSMULAS.S8.QACC.LD.INCP` (the
     // fused MAC+load+increment instruction this kernel's MAC loop depends
-    // on) — confirmed by direct instruction-level bisection (see
-    // local-notes/notepads/hematite-nn/problems.md). This is a QEMU emulation gap,
+    // on) — confirmed by direct instruction-level bisection (documented in
+    // the QEMU SIMD validation notes). This is a QEMU emulation gap,
     // not a code defect, so QEMU builds fall through to the scalar path;
     // real hardware (no `qemu` feature) still gets SIMD once T5.3 validates
     // it there.

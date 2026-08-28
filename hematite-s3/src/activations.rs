@@ -445,8 +445,8 @@ pub(crate) fn hard_swish_simd_lanes(
 // trailing 16-element block before `retw`. The arg fields must therefore
 // reserve that block: `c_rs1_1 = (c − 16)/32`, `c_rs2_1 = ((c − 16)%32)/16`.
 // The earlier `c/32 − 1` / `(c%32)/16` formulas left the last 16 elements
-// unprocessed for any input size (tracked in
-// local-notes/notepads/hematite-nn/problems.md, fixed for Phase 10.1).
+// unprocessed for any input size (tracked in the activation SIMD notes,
+// fixed for Phase 10.1).
 #[cfg(target_arch = "xtensa")]
 mod activation_simd {
     // Include the vendored TIE728 shared macros and relu entry points.

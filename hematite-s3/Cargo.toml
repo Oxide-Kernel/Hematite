@@ -19,8 +19,8 @@ hematite-ref = { path = "../hematite-ref" }
 [features]
 # Propagated from hematite-benchmarks' `qemu` feature. QEMU's xtensa/esp32s3
 # TIE728 emulation does not correctly execute `EE.VSMULAS.S8.QACC.LD.INCP`
-# (confirmed by direct instruction-level bisection under QEMU — see
-# local-notes/notepads/hematite-nn/problems.md), so the conv2d-family SIMD dispatch
+# (confirmed by direct instruction-level bisection under QEMU — see the
+# QEMU SIMD validation notes), so the conv2d-family SIMD dispatch
 # (conv1x1 / conv3x3 / gemm, which all share that entry point) is additionally
 # gated off under this feature. Not a code defect — a QEMU emulation gap.
 qemu = []

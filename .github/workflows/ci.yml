@@ -3,8 +3,6 @@
 # Two independent jobs: host (stable Rust, all workspace checks)
 # and xtensa (esp-rs fork, device target check only).
 # Neither depends on the other; both must pass for PR merge.
-#
-# See: local-notes/plans/hematite-nn.md T0.3
 
 name: CI
 

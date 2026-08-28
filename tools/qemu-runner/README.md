@@ -230,7 +230,7 @@ subset.
   skipped when the release ELF exists, the feature stamp
   (`images/.rust_features`) matches the requested features, and no
   `.rs`/`Cargo.toml`/`Cargo.lock`/`build.rs` under the repo (excluding
-  `target/`, `.git/`, `local-notes/`) is newer than the ELF.
+  `target/`, `.git/`) is newer than the ELF.
 - `--no-rebuild`: skips all build steps entirely and reuses existing
   artifacts; fails with a clear message if an ELF is missing or if the
   feature stamp does not match the requested feature set (`cargo

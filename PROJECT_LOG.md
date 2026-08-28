@@ -6,10 +6,8 @@ neural-network inference engine for the ESP32-S3 (Xtensa LX7 + TIE728 SIMD),
 built bit-exact against TensorFlow Lite Micro semantics with zero runtime
 allocation and zero C in the device build path.
 
-This log complements `local-notes/plans/hematite-nn.md` (the working task plan,
-kept out of git) and `local-notes/notepads/hematite-nn/{learnings,issues,problems}.md`
-(the append-only engineering notepad). Those are the day-to-day scratch
-record; this file is the durable, committed history.
+This log is the durable, committed engineering history of the project —
+the day-to-day task plan and scratch notepad live outside this repository.
 
 ---
 
@@ -149,9 +147,9 @@ the deterministic executed-TFLite golden byte-for-byte:
 | `mobilenet_v2_1.0_224_int8` | honest SKIP — needs PSRAM, QEMU has none |
 
 Host suite stayed at 80 test suites green throughout. Two real, small bugs
-were found and fixed during review of the (partially aborted) helper work
-that produced this: a lifetime-annotation error and a module-privacy error
-in the new validation code — both one-line fixes.
+were found and fixed during review of the delegation work that produced
+this: a lifetime-annotation error and a module-privacy error in the new
+validation code — both one-line fixes.
 
 ### Phase 8 — TIE728 SIMD dispatch wiring + QEMU emulation-gap discovery
 `e4c1e8f` the single most important finding of this project's benchmark
@@ -829,10 +827,8 @@ execution. It fuses adjacent ops into composed-kernel calls (conv + requant
 chains, pool/softmax input-folds), widens the SIMD shape gates the zoo models
 actually need (dm>1 depthwise, small-shape FC, generic pool, non-identity
 elementwise, extended mean), and adds a shape-driven composed-kernel
-selector — all while preserving the bit-exact invariant. Evidence ledger:
-`local-notes/evidence/composed-kernels/` (head-to-head.md, model-cycles.md,
-device-sweep.md, selector-output.md, fused-equivalence.md, pad-decision.md,
-tree-audit.md, fused-profile.md).
+selector — all while preserving the bit-exact invariant. The evidence
+ledger for this phase lives outside this repository.
 
 **1. Fusion wiring (W1 — T1.1–T1.4, T2.1):**
 - **T1.1 correctness tiers** (a7a52b5): standalone-activation absorption is
@@ -1088,8 +1084,7 @@ ESP-NN 1.68M vs 2.63M, 763K vs 985K, 651K vs 649K — all bit-exact.
   history was retroactively rewritten to this identity (previously a mix
   of a scaffolding-era GitHub identity, this machine's global git config,
   and — for one working session — an unrelated organization's identity
-  mistakenly inherited from a global agent-configuration file). Recorded
-  as a standing rule in this repository's own `repo-guidelines.md`. **The rewritten
+  mistakenly inherited from a global configuration file). **The rewritten
   history has not been force-pushed to `origin/main`** — that remains an
   explicit, separate decision pending user confirmation.
 

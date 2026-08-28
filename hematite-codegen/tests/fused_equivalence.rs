@@ -30,10 +30,10 @@
 //! emitted composed params, never in the reference.
 //!
 //! The evidence writer ([`fused_equivalence_evidence`]) runs all 6 zoo
-//! models + the fixture and writes `local-notes/evidence/composed-kernels/
-//! fused-equivalence.md` (CARGO_MANIFEST_DIR-relative, the fused-profile.md
-//! precedent); its static manifest columns are pinned against the real
-//! `fuse()`/`selector` runs by the in-crate
+//! models + the fixture and writes `target/evidence/composed-kernels/
+//! fused-equivalence.md` (CARGO_MANIFEST_DIR-relative, gitignored, the
+//! fused-profile.md precedent); its static manifest columns are pinned
+//! against the real `fuse()`/`selector` runs by the in-crate
 //! `optimize::equivalence::*` tests.
 
 use hematite_ref::RefBackend;
@@ -359,7 +359,7 @@ fn t2_fixture_auto_unfuse_recovers_and_default_safe() {
 }
 
 // ---------------------------------------------------------------------------
-// T5.1 — evidence: local-notes/evidence/composed-kernels/fused-equivalence.md
+// T5.1 — evidence: target/evidence/composed-kernels/fused-equivalence.md
 // ---------------------------------------------------------------------------
 
 /// Static manifest carried by the evidence table — pinned against the real
@@ -387,7 +387,7 @@ fn final_mode(composed: usize, candidates: usize) -> &'static str {
 fn evidence_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
-        .join("local-notes")
+        .join("target")
         .join("evidence")
         .join("composed-kernels")
         .join("fused-equivalence.md")
@@ -406,7 +406,7 @@ struct ZooRow {
 
 /// (c)+(3) The evidence writer: runs every zoo model fused vs unfused and
 /// the fixture across all three arms, then writes
-/// `local-notes/evidence/composed-kernels/fused-equivalence.md` — per-model rows
+/// `target/evidence/composed-kernels/fused-equivalence.md` — per-model rows
 /// (composed group count, per-group pass/fail, auto-unfused groups, final
 /// emitted mode) + the fixture row proving the T2 auto-unfuse path.
 #[test]

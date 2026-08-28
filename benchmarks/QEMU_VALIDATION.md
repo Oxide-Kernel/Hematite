@@ -249,8 +249,7 @@ Findings:
 > them (masked on real hardware where the arena is empty). Workaround: the
 > firmware.rs qemu branch re-asserts the arena from probe-captured locals
 > after the validation sections (`PSRAM arena re-asserted: 8388608 bytes`).
-> Root-cause fix (probe SP target / linker layout) tracked in
-> `local-notes/notepads/hematite-nn/problems.md` T5.4-QEMU-3.
+> Root-cause fix (probe SP target / linker layout) is a known open item.
 
 **Upstream references:** espressif/qemu issue #129 (PSRAM works on esp-develop
 builds; the IDF-shipped pre-built binary is older and does NOT work, so an
@@ -390,8 +389,7 @@ once both are retained the drom grows to 8,731,444 bytes and the model
 dispatch tables land past the map, where reads return garbage and the run
 dies with `Guru Meditation Error: Core 1 panic'ed (IllegalInstruction)`
 before any model row (PC in a data-region address; identical at icount 3 —
-a layout issue, not timing; documented in `local-notes/notepads/hematite-nn/problems.md`
-T5.4-QEMU-4).
+a layout issue, not timing — documented in the QEMU validation notes).
 
 Fix in place (2026-08-12): the qemu arms of `validate_mobilenet` /
 `validate_s3_mobilenet` now log an honest `SKIP reason=drom-map-cap` and

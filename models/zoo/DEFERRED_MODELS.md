@@ -192,7 +192,7 @@ measurement.)
 The pad-value/zero-point plumbing (`PadParams` field + codegen emission +
 both backends) is **deferred** and recorded as an explicit follow-up
 (**T10**, kernel workstream) — it is NOT implemented in this plan. Rationale
-(recorded in full in `local-notes/evidence/composed-kernels/pad-decision.md`):
+(recorded in full in the composed-kernels pad decision):
 
 1. **PAD never fuses** (no fusion pattern covers it) — the composed-kernels
    workstream neither emits nor transforms any PAD call, so the fused path
@@ -213,8 +213,7 @@ for PAD-heavy models; only the relative ref↔s3, fused↔unfused claims hold.
 ### 8.2 Real-silicon confirmation (run 1, 2026-08-11 17:34)
 
 The two ⚠️ models' divergences were re-confirmed on real silicon through the
-fused `Model::<S3Backend>` path (log `local-notes/evidence/composed-kernels/
-device-silicon-run1.log`):
+fused `Model::<S3Backend>` path (real-silicon run 1 log, 2026-08-11):
 
 | Model | device run-1 result | consistent with |
 |---|---|---|

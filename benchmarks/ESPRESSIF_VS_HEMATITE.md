@@ -214,8 +214,7 @@ Canonical shapes: `conv1x1 64x1x1x64`; `conv3x3 32x32x64 VALID` +
 Methodology (identical on both stacks): ESP32-S3 rev v0.2 @ 240 MHz, CCOUNT
 cycle counter, 1 untimed warm-up + N=10 timed runs, min + median, same
 deterministic fill pattern. Rust = `hematite-benchmarks` firmware public API
-(fresh device run 2026-08-10, HEAD `33d498a`, evidence
-`local-notes/evidence/simd-zoo-hardening/task-15-normalized.log`). C = raw vendored
+(fresh device run 2026-08-10, HEAD `33d498a`). C = raw vendored
 TIE728 entry from the `espdl-baseline` harness (existing device tables,
 `bench10`/`bench11b` — the ESP-IDF toolchain is not on the current host, so
 the C column reuses the documented device numbers; rows the harness still
@@ -252,8 +251,7 @@ lacks are `—` with the reason, and the exact rows to add are specified in
 
 The A/B/C table above compares three **synthetic** models. This section is
 the real-zoo-model head-to-head: the 6 int8 zoo models timed on the Hematite
-stack (`model_bench`, todo 19, device run — evidence
-`local-notes/evidence/simd-zoo-hardening/task-19-model-bench.log`) vs the standard
+stack (`model_bench`, todo 19, device run) vs the standard
 ESP-NN C stack measured under the same conditions.
 
 **Same-conditions rule (plan Metis F8):** identical tflite model file,
@@ -334,8 +332,8 @@ numbers.
 Consolidated ledger in the user-mandated format (ISO timestamp + commit id of
 the measured code + FULL Hematite cycles + FULL C-stack cycles + speedup +
 config — never deltas-only). Full analysis (per-model and per-kernel
-speedup-loss identification with root-cause classes and next levers) lives in
-`local-notes/evidence/composed-kernels/head-to-head.md`.
+speedup-loss identification with root-cause classes and next levers) is
+captured in this document's model-level sections below.
 
 **Provenance:** A/B/C rows = real-device 2026-08-10 (Hematite measured-code
 HEAD `33d498a` per this doc's normalized-per-op note; C = espnn-baseline T0.3
@@ -384,7 +382,7 @@ Model C margin is **1.007×** (650,773 vs 655,303) — maintained ≥ 1.007×. T
 | person_detect | fused / unfused | SKIP reason=stack | — | SKIP | guard verified both arms |
 | mobilenet_v2 | fused / unfused | SKIP reason=no-psram | — | SKIP | guard verified both arms |
 
-### Speedup-loss summary (full per-model + per-kernel analysis in `local-notes/evidence/composed-kernels/head-to-head.md §5`)
+### Speedup-loss summary (full per-model + per-kernel analysis in the model-level bars below)
 
 - **A/B/C: Hematite beats/ties everywhere** (1.56× / 1.30× / 1.007×). No losing
   sections at model level.
@@ -420,8 +418,8 @@ Model C margin is **1.007×** (650,773 vs 655,303) — maintained ≥ 1.007×. T
 - conv1x1 **15.57×** vs scalar-ref (×100 fixed point **1557**, spec.rs:1681)
   and **10×** vs-scalar floor (×100 **1000**) — both hold.
 
-Full ledger rows (fused-vs-unfused closure + bar citations):
-`local-notes/evidence/composed-kernels/head-to-head.md §8`.
+Full ledger rows (fused-vs-unfused closure + bar citations) are recorded in
+the committed benchmark history.
 
 ## Where to look
 
