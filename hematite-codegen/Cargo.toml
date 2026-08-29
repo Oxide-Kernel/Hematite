@@ -7,7 +7,7 @@ keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 readme = "README.md"
-description = "Proc-macro TFLite → typed straight-line Rust compiler (#[model]) with fusion and arena planning."
+description = "Proc-macro TFLite → typed straight-line Rust compiler (#[model]) with fusion and arena planning; backend-agnostic."
 
 [lib]
 proc-macro = true

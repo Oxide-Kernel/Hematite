@@ -1,7 +1,7 @@
 # hematite-core
 
 Foundational types and traits for **Hematite** — a pure-Rust, `no_std`
-int8 neural-network inference engine for the ESP32-S3. This crate is
+int8 neural-network inference library. This crate is
 Layer 0 (semantics): the [`KernelBackend`] / [`FusedKernelBackend`]
 contracts, [`KernelError`], and the operator parameter structs below.
 Full documentation: <https://hematite.readthedocs.io/>.

@@ -7,7 +7,7 @@ keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 readme = "README.md"
-description = "Scalar reference backend (RefBackend) — the bit-exact golden oracle for Hematite's SIMD kernels."
+description = "Scalar reference backend (RefBackend) — the bit-exact golden oracle for Hematite's kernel backends."
 
 [dependencies]
 hematite-core = { path = "../hematite-core" }

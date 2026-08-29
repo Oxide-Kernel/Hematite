@@ -1,7 +1,7 @@
 # hematite-s3
 
 The **ESP32-S3 optimized backend** for **Hematite** — a pure-Rust,
-`no_std` int8 neural-network inference engine for the ESP32-S3.
+`no_std` int8 neural-network inference library.
 
 `S3Backend` implements the `KernelBackend` contract with **bespoke
 Xtensa TIE728 SIMD kernels** written from scratch (Rust + inline

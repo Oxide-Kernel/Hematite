@@ -7,6 +7,6 @@ keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 readme = "README.md"
-description = "Foundational types and traits (KernelBackend, FusedKernelBackend, op params) for Hematite, an int8 NN inference engine for the ESP32-S3."
+description = "Foundational types and traits (KernelBackend, FusedKernelBackend, op params) for Hematite, a platform-independent int8 NN inference library."
 
 [dependencies]

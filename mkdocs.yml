@@ -6,9 +6,10 @@
 
 site_name: Hematite
 site_description: >-
-  A pure-Rust, no_std int8 neural-network inference engine for the ESP32-S3 —
-  compile-time TFLite model compilation backed by bespoke Xtensa TIE728 SIMD
-  kernels, bit-exact against TensorFlow Lite Micro semantics.
+  A pure-Rust, no_std int8 neural-network inference library — compile-time
+  TFLite model compilation dispatched through pluggable KernelBackend
+  implementations, bit-exact against TensorFlow Lite Micro semantics, with a
+  bespoke Xtensa TIE728 SIMD backend for the ESP32-S3.
 site_url: https://hematite.readthedocs.io/
 repo_url: https://github.com/Oxide-Kernel/Hematite
 edit_uri: blob/main/docs/

@@ -4,12 +4,15 @@ title: Overview
 
 # Overview
 
-Hematite is a **pure-Rust, `no_std` int8 neural-network inference engine**
-for the **ESP32-S3** (Xtensa LX7 + TIE728 SIMD), built bit-exact against
-TensorFlow Lite Micro semantics.
+Hematite is a **pure-Rust, `no_std` int8 neural-network inference
+library**, built bit-exact against TensorFlow Lite Micro semantics. Its
+core — the `KernelBackend` contract, the `#[model]` compiler, the memory
+planner, the int8 math — is **platform-independent**: it runs anywhere
+Rust runs. The **ESP32-S3 (Xtensa LX7 + TIE728 SIMD)** is the first
+high-speed backend, and new backends plug in behind the same trait.
 
 It occupies a specific niche: **sizes where a small, deterministic,
-bit-exact engine beats a heavyweight framework**, running entirely in
+bit-exact library beats a heavyweight framework**, running entirely in
 static memory with zero runtime allocation and zero C in the device build
 path.
 
@@ -55,10 +58,15 @@ honors: conv2d, depthwise, fully-connected, pooling, softmax, activations,
 elementwise, data movement, recurrent, reductions — each mirroring the
 exact TFLite Micro int8 semantics.
 
-| Backend | Crate | Purpose |
-|---|---|---|
-| `RefBackend` | `hematite-ref` | Scalar reference — the golden oracle |
-| `S3Backend` | `hematite-s3` | ESP32-S3 TIE728 SIMD — the fast path |
+| Backend | Crate | Platform | Purpose |
+|---|---|---|---|
+| `RefBackend` | `hematite-ref` | any (host, `no_std`) | Scalar reference — the golden oracle |
+| `S3Backend` | `hematite-s3` | ESP32-S3 (Xtensa TIE728) | SIMD-accelerated — the current speed backend |
+
+Adding a backend for another target means implementing `KernelBackend`
+(and optionally `FusedKernelBackend` for composed kernels) — the
+generated model code, the compiler, and the correctness harness work
+unchanged. See the [custom-backend tutorial](tutorials/custom-backend.md).
 
 ## Design pillars
 
@@ -70,7 +78,7 @@ exact TFLite Micro int8 semantics.
 - **Zero runtime allocation.** No `alloc`, no `Vec`, no `Box`. Everything
   is stack arrays plus a compile-time-planned arena; `no_std` in the
   device path.
-- **A compiler, not a library.** You declare the model; the macro emits
+- **A compiler-driven library.** You declare the model; the macro emits
   the call chain. There is no inference loop and no op dispatch table to
   get wrong.
 - **Honest engineering.** Benchmarks carry full ledger rows (timestamp +
@@ -86,17 +94,18 @@ full layer-by-layer walk:
 
 | Layer | Crates | Responsibility |
 |---|---|---|
-| **L0 — Semantics** | `hematite-core`, `hematite-int8` | The `KernelBackend`/`FusedKernelBackend` contract + int8 math (TFLM-exact requant) |
-| **L1 — Reference oracle** | `hematite-ref` | Scalar implementation of every trait method — the golden answer |
-| **L2 — Accelerated device backend** | `hematite-s3` | Bespoke TIE728 SIMD kernels + dispatch gates |
-| **L3 — Model compilation** | `hematite-codegen`, `hematite-memory` | `#[model]` macro → typed `Model<B>`; arena/scratch planning |
-| **L4 — Validation & measurement** | `hematite-tests`, `hematite-benchmarks` | Golden-corpus tests + on-device benchmark firmware |
+| **L0 — Semantics** | `hematite-core`, `hematite-int8` | The `KernelBackend`/`FusedKernelBackend` contract + int8 math (TFLM-exact requant) — platform-independent |
+| **L1 — Reference oracle** | `hematite-ref` | Scalar implementation of every trait method — the golden answer (platform-independent) |
+| **L2 — Accelerated backends** | `hematite-s3` | `S3Backend` — bespoke TIE728 SIMD kernels + dispatch gates (ESP32-S3; the pattern for future backends) |
+| **L3 — Model compilation** | `hematite-codegen`, `hematite-memory` | `#[model]` macro → typed `Model<B>`; arena/scratch planning (platform-independent) |
+| **L4 — Validation & measurement** | `hematite-tests`, `hematite-benchmarks` | Golden-corpus tests + benchmark firmware |
 
 ## Scope
 
 Hematite targets the **int8 quantized** inference path (per-channel
 quantization, TFLM requant semantics). It is not a float engine, and it is
-not a general ML framework — it is a focused, provably-correct engine for
-deploying int8 models to the ESP32-S3 with maximum performance.
+not a general ML framework — it is a focused, provably-correct *library*
+for deploying int8 models, with maximum performance on the ESP32-S3 today
+and a backend architecture ready for more targets tomorrow.
 
 Next: [Installation](installation.md).

@@ -98,5 +98,6 @@ Full tables: [Benchmarks](../benchmarks/index.md).
 - Not an ESP-IDF component (no IDF dependency; works with the esp-hal
   no-std stack).
 - Not a float engine (int8 quantized TFLM-semantics only).
-- Not a general ML framework — a focused, provably-correct engine for
-  int8 models on the ESP32-S3.
+- Not a general ML framework — a focused, provably-correct *library*
+  for int8 models, accelerated on the ESP32-S3 today and portable to
+  future backends through the same trait.

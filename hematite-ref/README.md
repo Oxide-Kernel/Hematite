@@ -1,7 +1,7 @@
 # hematite-ref
 
 The **scalar reference backend** for **Hematite** — a pure-Rust, `no_std`
-int8 neural-network inference engine for the ESP32-S3.
+int8 neural-network inference library.
 
 `RefBackend` implements every `KernelBackend` method with straightforward
 scalar math that mirrors TFLite Micro's int8 semantics exactly. It is the

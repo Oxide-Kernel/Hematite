@@ -1,12 +1,20 @@
 ---
-title: Layer 2 — ESP32-S3 Accelerated Backend
+title: Layer 2 — Accelerated Backends
 ---
 
-# Layer 2 — The ESP32-S3 backend (`hematite-s3`)
+# Layer 2 — The backend layer (`hematite-s3` today)
 
-The speed. `S3Backend` implements the `KernelBackend` contract with
-**bespoke Xtensa TIE728 SIMD kernels**, written from scratch in Rust +
+The speed — and the **extensibility point of the whole library**. Everything
+above this layer (contract, compiler, tests) is backend-agnostic; Layer 2 is
+where hardware-specific acceleration lives, behind the `KernelBackend` (+
+`FusedKernelBackend`) traits.
+
+The current backend is **`S3Backend`** — the ESP32-S3 (Xtensa TIE728)
+implementation, with **bespoke SIMD kernels** written from scratch in Rust +
 inline assembly (`s8_accx_*.S` files) — no vendored Espressif kernels.
+Future backends (other chips, other SIMD ISAs, …) follow the same shape:
+implement the trait, override the scratch-size functions, reuse the
+dispatch-gate pattern.
 
 ## The dispatch contract
 

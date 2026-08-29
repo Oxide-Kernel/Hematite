@@ -7,7 +7,7 @@ keywords.workspace = true
 categories.workspace = true
 license.workspace = true
 readme = "README.md"
-description = "ESP32-S3 optimized backend: bespoke Xtensa TIE728 SIMD kernels (S3Backend) behind the KernelBackend trait."
+description = "ESP32-S3 backend for Hematite: bespoke Xtensa TIE728 SIMD kernels (S3Backend) behind the KernelBackend trait."
 
 [dependencies]
 hematite-core = { path = "../hematite-core" }

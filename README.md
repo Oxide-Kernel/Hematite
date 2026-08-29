@@ -1,9 +1,11 @@
 # Hematite
 
-**A pure-Rust, `no_std`, int8 neural-network inference engine for the
-ESP32-S3** — compile-time TFLite model compilation backed by bespoke
-Xtensa TIE728 SIMD kernels, bit-exact against TensorFlow Lite Micro
-semantics.
+**A pure-Rust, `no_std`, int8 neural-network inference library** —
+compile-time TFLite model compilation dispatched through pluggable
+[`KernelBackend`](https://docs.rs/hematite-core) implementations,
+bit-exact against TensorFlow Lite Micro semantics. Runs anywhere Rust
+runs; ships a **bespoke Xtensa TIE728 SIMD backend for the ESP32-S3** as
+its first high-speed target.
 
 ```toml
 [dependencies]
@@ -15,7 +17,7 @@ hematite-codegen = "0.1"
 
 ```rust
 use hematite_codegen::model;
-use hematite_s3::S3Backend;
+use hematite_s3::S3Backend;   // swap for RefBackend on the host — same code, bit-equal output
 
 #[model("models/sine.tflite")]
 pub struct SineModel;
@@ -27,18 +29,35 @@ fn main() {
 }
 ```
 
+## Library first, pluggable backends
+
+Hematite's core — the `KernelBackend` trait contract, the `#[model]`
+compiler, the memory planner, the int8 math — is **platform-independent**
+and runs on any Rust target. Hardware acceleration lives entirely behind
+the trait:
+
+| Backend | Platform | Status |
+|---|---|---|
+| `RefBackend` (`hematite-ref`) | any (host, `no_std`) | scalar reference — the golden oracle |
+| `S3Backend` (`hematite-s3`) | ESP32-S3 (Xtensa TIE728) | SIMD-accelerated — the current speed backend |
+
+New targets are added by implementing `KernelBackend` (+
+`FusedKernelBackend`) — generated model code, the compiler, and the
+correctness harness work unchanged. See the
+[custom-backend tutorial](https://hematite.readthedocs.io/en/latest/tutorials/custom-backend/).
+
 ## Highlights
 
 - **Bit-exact by construction.** Every SIMD kernel's output equals the
   scalar reference exactly (same `out_fnv` FNV-1a checksum) — verified
   on-device for every kernel row and every zoo-model layer.
-- **A compiler, not a kernel library.** `#[model]` reads the `.tflite`
+- **A compiler-driven library.** `#[model]` reads the `.tflite`
   at build time and emits typed straight-line Rust; you never hand-wire
   kernel calls.
-- **100% bespoke SIMD assembly.** ACCX/GPR-accumulator kernels written
-  from scratch (including a reverse-engineered QACC depthwise
-  read-back) — at the TIE728 MAC-issue floor, and correct where vendor
-  kernels saturate their 8-bit lanes.
+- **100% bespoke SIMD assembly (s3 backend).** ACCX/GPR-accumulator
+  kernels written from scratch (including a reverse-engineered QACC
+  depthwise read-back) — at the TIE728 MAC-issue floor, and correct
+  where vendor kernels saturate their 8-bit lanes.
 - **Zero runtime allocation.** No `alloc`, no heap: stack arrays plus a
   compile-time-planned liveness arena. `no_std` in the device path.
 - **Honest benchmarks.** Every row carries ISO timestamp + commit +
@@ -77,12 +96,12 @@ hosted at **[hematite.readthedocs.io](https://hematite.readthedocs.io/)**
 
 | Crate | Layer | Role |
 |---|---|---|
-| `hematite-core` | L0 | `KernelBackend` / `FusedKernelBackend` contract, op params |
-| `hematite-int8` | L0 | TFLM-exact int8 quantization math |
-| `hematite-ref` | L1 | scalar reference backend — the golden oracle |
-| `hematite-s3` | L2 | ESP32-S3 TIE728 SIMD kernels — the fast path |
-| `hematite-memory` | L3 | compile-time liveness arena planner |
-| `hematite-codegen` | L3 | `#[model]` proc-macro: TFLite → straight-line Rust |
+| `hematite-core` | L0 | `KernelBackend` / `FusedKernelBackend` contract, op params (platform-independent) |
+| `hematite-int8` | L0 | TFLM-exact int8 quantization math (platform-independent) |
+| `hematite-ref` | L1 | scalar reference backend — the golden oracle (platform-independent) |
+| `hematite-s3` | L2 | ESP32-S3 TIE728 SIMD kernels — the current accelerated backend |
+| `hematite-memory` | L3 | compile-time liveness arena planner (platform-independent) |
+| `hematite-codegen` | L3 | `#[model]` proc-macro: TFLite → straight-line Rust (platform-independent) |
 | `hematite-tests` | L4 | golden-corpus tests |
 | `hematite-benchmarks` | L4 | on-device benchmark + validation firmware |
 

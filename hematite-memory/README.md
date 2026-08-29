@@ -1,8 +1,7 @@
 # hematite-memory
 
 Compile-time **USMP-style liveness arena planner** for **Hematite** — a
-pure-Rust, `no_std` int8 neural-network inference engine for the
-ESP32-S3.
+pure-Rust, `no_std` int8 neural-network inference library.
 
 `liveness_plan` computes tensor offsets and the peak intermediate size
 (`ArenaPlan`) over an op schedule; `ScratchLayout` sizes per-op kernel

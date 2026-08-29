@@ -1,8 +1,8 @@
 # hematite-codegen
 
 Compile-time **TFLite → straight-line Rust** model compiler for
-**Hematite** — a pure-Rust, `no_std` int8 neural-network inference engine
-for the ESP32-S3.
+**Hematite** — a pure-Rust, `no_std` int8 neural-network inference library
+(platform-independent core; SIMD-accelerated ESP32-S3 backend).
 
 `#[model("path.tflite")]` runs at build time:
 
