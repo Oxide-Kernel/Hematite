@@ -3,6 +3,8 @@ name = "hematite-tests"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
+description = "Golden-corpus integration tests for Hematite (test-only)."
 
 [dependencies]
 # hematite-core is needed by the per-op integration tests to build the

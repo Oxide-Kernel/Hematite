@@ -1,0 +1,103 @@
+# Hematite documentation — MkDocs Material configuration.
+#
+# Built for Read the Docs (see .readthedocs.yaml). Local preview:
+#   python3 -m venv .docs-venv && .docs-venv/bin/pip install mkdocs-material
+#   .docs-venv/bin/mkdocs serve
+
+site_name: Hematite
+site_description: >-
+  A pure-Rust, no_std int8 neural-network inference engine for the ESP32-S3 —
+  compile-time TFLite model compilation backed by bespoke Xtensa TIE728 SIMD
+  kernels, bit-exact against TensorFlow Lite Micro semantics.
+site_url: https://hematite.readthedocs.io/
+repo_url: https://github.com/Oxide-Kernel/Hematite
+edit_uri: blob/main/docs/
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.top
+    - navigation.expand
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+  icon:
+    repo: fontawesome/brands/github
+  favicon: assets/hematite.svg
+  logo: assets/hematite.svg
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/Oxide-Kernel/Hematite
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - tables
+  - footnotes
+  - attr_list
+  - md_in_html
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - overview.md
+      - installation.md
+      - quickstart.md
+  - Tutorials:
+      - tutorials/host-inference.md
+      - tutorials/on-device-inference.md
+      - tutorials/custom-backend.md
+  - How-To Guides:
+      - how-to/scratch-and-memory.md
+      - how-to/validate-bit-exactness.md
+      - how-to/run-under-qemu.md
+  - Architecture:
+      - architecture/index.md
+      - architecture/layer-0-semantics.md
+      - architecture/layer-1-reference.md
+      - architecture/layer-2-s3-backend.md
+      - architecture/layer-3-codegen.md
+      - architecture/layer-4-validation.md
+      - architecture/memory-model.md
+  - Benchmarks:
+      - benchmarks/index.md
+      - benchmarks/synthetic-models.md
+      - benchmarks/zoo-models.md
+      - benchmarks/methodology.md
+  - Comparison: comparison/vs-esp-nn.md
+  - Reference:
+      - reference/api.md
+      - reference/op-support-matrix.md
+  - Contributing: contributing.md
+
+extra_css:
+  - assets/extra.css

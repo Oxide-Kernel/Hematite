@@ -3,6 +3,7 @@ name = "hematite-benchmarks"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "ESP32-S3 hardware benchmark suite: per-kernel + model-level CCOUNT benchmarks"
 
 [[bin]]

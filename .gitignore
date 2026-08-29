@@ -3,6 +3,10 @@
 debug
 target
 
+# Docs build output (MkDocs) and local doc tooling venvs
+site/
+.docs-venv/
+
 # Plan/notepad scratch state (never commit — per project convention)
 local-notes/
 

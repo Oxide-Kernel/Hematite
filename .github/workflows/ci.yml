@@ -64,3 +64,14 @@ jobs:
 
       - name: cargo xtensa-check
         run: cargo xtensa-check --workspace --locked
+
+  docs:
+    name: Docs (MkDocs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build docs
+        run: |
+          pip install -r requirements-docs.txt
+          mkdocs build --strict

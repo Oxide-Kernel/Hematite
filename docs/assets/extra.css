@@ -1,0 +1,25 @@
+/* Hematite docs — small bespoke tweaks over the Material theme. */
+
+/* Tame very wide code lines in tables */
+.md-typeset table code {
+  word-break: break-word;
+}
+
+/* Code block font stack consistent with the project's tooling */
+.md-typeset code {
+  font-size: 0.8em;
+}
+
+/* Benchmark tables: keep numbers monospace and aligned */
+.md-typeset table td:nth-child(n+3) {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Slightly tighter headings on deep pages */
+.md-typeset h1 { letter-spacing: -0.01em; }
+.md-typeset h2 { border-bottom: 1px solid var(--md-default-fg-color--lightest); padding-bottom: 0.2em; }
+
+/* Home page: hero code block breathing room */
+.md-typeset pre {
+  border-radius: 6px;
+}

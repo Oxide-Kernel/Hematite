@@ -2,6 +2,11 @@
 name = "hematite-core"
 version.workspace = true
 edition.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 license.workspace = true
+readme = "README.md"
+description = "Foundational types and traits (KernelBackend, FusedKernelBackend, op params) for Hematite, an int8 NN inference engine for the ESP32-S3."
 
 [dependencies]

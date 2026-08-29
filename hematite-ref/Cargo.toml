@@ -2,7 +2,12 @@
 name = "hematite-ref"
 version.workspace = true
 edition.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 license.workspace = true
+readme = "README.md"
+description = "Scalar reference backend (RefBackend) — the bit-exact golden oracle for Hematite's SIMD kernels."
 
 [dependencies]
 hematite-core = { path = "../hematite-core" }

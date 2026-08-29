@@ -16,6 +16,10 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
+repository = "https://github.com/Oxide-Kernel/Hematite"
+keywords = ["esp32", "neural-network", "tensorflow-lite", "int8", "no-std"]
+categories = ["embedded", "no-std", "hardware-support"]
+
 
 [workspace.dependencies]
 esp-hal = { version = "1.1", default-features = false }

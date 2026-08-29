@@ -1,4 +1,14 @@
-# hematite-core — Field-to-TFLM Mapping
+# hematite-core
+
+Foundational types and traits for **Hematite** — a pure-Rust, `no_std`
+int8 neural-network inference engine for the ESP32-S3. This crate is
+Layer 0 (semantics): the [`KernelBackend`] / [`FusedKernelBackend`]
+contracts, [`KernelError`], and the operator parameter structs below.
+Full documentation: <https://hematite.readthedocs.io/>.
+
+---
+
+# Field-to-TFLM Mapping
 
 Each operator parameter struct mirrors the corresponding TFLM C struct(s).
 Fields are listed in declaration order.  C names use the original casing;

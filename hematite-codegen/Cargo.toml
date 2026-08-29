@@ -2,7 +2,12 @@
 name = "hematite-codegen"
 version.workspace = true
 edition.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 license.workspace = true
+readme = "README.md"
+description = "Proc-macro TFLite → typed straight-line Rust compiler (#[model]) with fusion and arena planning."
 
 [lib]
 proc-macro = true

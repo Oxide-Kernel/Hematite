@@ -2,7 +2,12 @@
 name = "hematite-int8"
 version.workspace = true
 edition.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
 license.workspace = true
+readme = "README.md"
+description = "TFLite-Micro-exact int8 quantization math (32-bit requantize, saturating cast) shared by all Hematite backends."
 
 [dependencies]
 hematite-core = { path = "../hematite-core" }
