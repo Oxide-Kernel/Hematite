@@ -19,12 +19,12 @@
 //! the same buffer cannot coexist), so two narrow helpers concentrate the
 //! only `unsafe` in this file:
 //!
-//! * [`alias_input`] — a shared view of a mutable buffer, for the in-place
+//! * `alias_input` — a shared view of a mutable buffer, for the in-place
 //!   elementwise/activation steps.  Sound because every hematite-ref
 //!   elementwise / activation kernel reads `input[i]` strictly before
 //!   writing `output[i]` (elementwise.rs, activation.rs), so input ==
 //!   output aliasing is well-defined per element.
-//! * [`scratch_as_i8`] — `&mut [u8]` → `&mut [i8]` for the fold
+//! * `scratch_as_i8` — `&mut [u8]` → `&mut [i8]` for the fold
 //!   intermediate.  Sound because `u8` and `i8` have identical layout
 //!   (size 1, alignment 1) and the buffer is only used as scratch.
 //!

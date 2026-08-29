@@ -8,7 +8,7 @@
 //!
 //! Three composed kernels live in this module:
 //!
-//! * [`fused_conv2d`](Self::fused_conv2d) (T2.2) — conv → residual-ADD →
+//! * `fused_conv2d` (T2.2) — conv → residual-ADD →
 //!   activation as ONE kernel call. On real silicon the anchor conv runs
 //!   through the existing ACCX SIMD dispatch (`conv1x1_accx_dispatch` /
 //!   `conv3x3_accx_dispatch` — the two conv-family paths reachable from a
@@ -18,20 +18,20 @@
 //!   per element WITHOUT materializing the conv output to memory — the conv
 //!   output i8 value is held in a register and fed straight into the
 //!   two-stage TFLM Add rounding.
-//! * [`fused_elementwise_chain`](Self::fused_elementwise_chain) (T2.3) — N
+//! * `fused_elementwise_chain` (T2.3) — N
 //!   elementwise steps as ONE kernel call, with each step's own requantize
 //!   preserved. On real silicon, when EVERY step is SIMD-eligible under the
 //!   per-step gates, the chain runs in ONE pass over `num_elements`: 16-wide
 //!   chunks are vector-loaded from `src`, the running value stays in i32
 //!   REGISTER lanes between steps (each step's per-op requantize applied in
-//!   the lanes via the host-compilable [`chain_step_apply`] — the exact
+//!   the lanes via the host-compilable `chain_step_apply` — the exact
 //!   fixed-point sequence of the per-op kernel the decomposition would run,
 //!   NEVER materialized to memory), and the final i8 chunk is vector-stored
 //!   to `dst`. Zero intermediate stores.
-//! * [`fused_pool_with_fold`](Self::fused_pool_with_fold) (T2.4) — pool +
+//! * `fused_pool_with_fold` (T2.4) — pool +
 //!   MUL/SUB input fold + activation epilogue as ONE kernel call. On real
 //!   silicon, when the anchor pool passes the existing pool SIMD gate AND
-//!   the fold is in the provably-exact subset ([`fused_pool_fold_simd_eligible`]),
+//!   the fold is in the provably-exact subset (`fused_pool_fold_simd_eligible`),
 //!   the fold materializes into scratch (per-op `mul`/`sub`, SIMD when the
 //!   fold's own elementwise gates hold), the pool SIMD kernel reads the
 //!   staged scratch directly, and the activation epilogue is applied
@@ -455,7 +455,7 @@ fn chain_step_apply(step: &ElementwiseChainStep<'_>, running: i32, operand: i8) 
 /// Execute the ENTIRE chain on one element's src i8 value, register-held.
 ///
 /// Bit-exact vs the `RefBackend` decomposition by construction: every step
-/// applies the exact per-op kernel sequence ([`chain_step_apply`]) and the
+/// applies the exact per-op kernel sequence (`chain_step_apply`) and the
 /// running value between steps is the decomposition's `dst[i]` i8 value as
 /// an i32. Used by the host unit tests to prove the register math equals the
 /// decomposition, and by the device dispatch's chunk loop.
@@ -580,7 +580,7 @@ fn fused_conv2d_accx(
 /// The chain runs in ONE pass over `num_elements`: 16-element chunks are
 /// vector-loaded from `src`, the running value stays in i32 REGISTER lanes
 /// between steps (each step's own requantize applied in the lanes via
-/// [`chain_step_apply`] — the decomposition's per-op sequence, never
+/// `chain_step_apply` — the decomposition's per-op sequence, never
 /// materialized to memory), and the final i8 chunk is vector-stored to `dst`.
 /// Zero intermediate stores.
 ///
@@ -706,7 +706,7 @@ fn fused_pool_fold_simd_eligible(params: &FoldedPoolParams<'_>) -> bool {
 /// `Ok(true)` when handled and `Ok(false)` when ineligible (the trait method
 /// falls through to the per-op decomposition).
 ///
-/// Engagement: [`fused_pool_fold_simd_eligible`] (pool gate + provably-exact
+/// Engagement: `fused_pool_fold_simd_eligible` (pool gate + provably-exact
 /// fold subset) and the fold staging fits in `scratch`. The fold materializes
 /// into scratch (`scratch_as_i8` — the per-op `mul`/`sub`, which SIMD-engage
 /// through the elementwise gates when eligible and aligned), the pool reads

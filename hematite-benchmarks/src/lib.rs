@@ -17,7 +17,7 @@
 //!   three speedup columns, SRAM/PSRAM tier labels, reference bars.
 //! * [`guardrails`] — C3 methodology guardrails (boot profile, CCOUNT
 //!   calibration, stack canary, watchdog policy) — pure, host-tested logic.
-//! * [`firmware`] — device-only ESP32-S3 firmware (esp-hal + defmt/RTT).
+//! * `firmware` — device-only ESP32-S3 firmware (esp-hal + defmt/RTT).
 
 #![cfg_attr(target_arch = "xtensa", no_std)]
 // Xtensa inline asm (CCOUNT read in timing.rs) needs the experimental-arch

@@ -13,7 +13,7 @@
 //!
 //! On host (stable-aarch64-apple-darwin), only leg (b) executes. The SIMD
 //! dispatch is `#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]` —
-//! device-only (see [`fc_accx_dispatch`]); the scalar kernel below is the
+//! device-only (see `fc_accx_dispatch`); the scalar kernel below is the
 //! complete bit-exact fallback on every other target.
 //!
 //! # Layouts
@@ -32,7 +32,7 @@
 //! by [`crate::accx`]) computes the exact 32-bit dot product per output unit
 //! into scratch, then the bit-exact TFLite requantize epilogue runs in Rust —
 //! an FC layer is mathematically a 1×1 conv with H=W=1. See
-//! [`fc_accx_dispatch`] for the eligibility gate.
+//! `fc_accx_dispatch` for the eligibility gate.
 //!
 //! # Small / non-16 input dims (T3.6)
 //!
@@ -328,7 +328,7 @@ fn fc_accx_dispatch(ctx: &mut FcAccxCtx<'_>, uniform: (i32, i32)) -> Result<bool
 }
 
 /// Phase D — ultra-fast tiny-fc dispatch: identical math to
-/// [`fc_accx_dispatch`]'s tiny-fc fast path (direct MAC loop + inline wsum
+/// `fc_accx_dispatch`'s tiny-fc fast path (direct MAC loop + inline wsum
 /// fold) but with the requantize epilogue INLINED into this standalone
 /// `#[inline(never)]` function instead of a [`crate::accx::ReqCtx`] build +
 /// `requantize_1x1` call. Kept OUT of `fc_accx_dispatch`'s body on purpose:

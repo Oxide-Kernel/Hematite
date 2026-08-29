@@ -166,7 +166,7 @@ pub fn generate_leaky_relu(w: &mut FixtureWriter) {
 }
 
 /// PReLU: f(x) = MultiplyByQuantizedMultiplier(x, mult_1, shift_1) if x >= 0
-///                else MultiplyByQuantizedMultiplier(x * alpha[i], mult_2, shift_2)
+///                else MultiplyByQuantizedMultiplier(x * alpha\[i\], mult_2, shift_2)
 ///
 /// Implements the TFLM Prelu reference from
 /// tensorflow/lite/kernels/internal/reference/prelu.h.

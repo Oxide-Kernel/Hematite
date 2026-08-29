@@ -12,7 +12,7 @@
 //! Mirrors `tools/generate_goldens/src/tflm_math.rs` bit-for-bit
 //! (`logistic_q4_27`, `tanh_q4_27`, `one_minus_x_over_one_plus_x_for_x_in_0_1`,
 //! and the shared `exp_on_negative_values` / `one_over_one_plus_x_for_x_in_0_1`
-//! infrastructure). The same primitives also live privately in [`softmax`]
+//! infrastructure). The same primitives also live privately in `softmax`
 //! (softmax uses them on Q5.26); this module carries the Q4.27 activation
 //! entry points and the `one_minus_x_over_one_plus_x` variant softmax does
 //! not need, so it is self-contained rather than reaching into softmax's

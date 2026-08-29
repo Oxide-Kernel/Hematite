@@ -10,7 +10,7 @@
 //! ## Crate structure
 //!
 //! * [`model`] — the proc-macro attribute entry point (only public item).
-//! * [`flatbuffer`] — hand-rolled TFLite flatbuffer parser and IR types
+//! * `flatbuffer` — hand-rolled TFLite flatbuffer parser and IR types
 //!   (consumed by T4.1 generate, T4.2a fusion, T4.2b arena, T4.2c layout).
 //!
 //! Because this is a proc-macro crate, only the `#[proc_macro_attribute]`

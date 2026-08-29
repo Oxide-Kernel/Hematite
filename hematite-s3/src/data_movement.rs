@@ -41,9 +41,9 @@
 //! recorded in the task-10 goldens log).
 //!
 //! **Hematite's [`PadParams`] carries NO zero point** and the
-//! [`KernelBackend::pad`] trait method has no pad-value argument (codegen
+//! `KernelBackend::pad` trait method has no pad-value argument (codegen
 //! emits `backend.pad(src, &PAD_PARAMS_i, dst)`), so the s3 kernel — like
-//! [`hematite-ref`]'s `pad_op` — cannot know the zero point. Implementing
+//! `hematite-ref`'s `pad_op` — cannot know the zero point. Implementing
 //! the TFLM fill requires param plumbing (a zero-point field on
 //! `PadParams` + codegen emission), which is the T10-flagged follow-up
 //! (task-10 log §9(b): "needs param plumbing"), OUT OF SCOPE for this
@@ -314,7 +314,7 @@ pub fn split_op(
 /// Mirrors TFLM `Pad` with constant value 0 — see the module docs for the
 /// full TFLM fill-value analysis (`output_zero_point` vs raw 0) and why the
 /// s3 copy keeps raw 0 (params carry no zero point; the relative `s3 == ref`
-/// gate requires identical fill to [`hematite-ref`]'s `pad_op`).
+/// gate requires identical fill to `hematite-ref`'s `pad_op`).
 ///
 /// # Layouts
 ///

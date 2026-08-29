@@ -76,7 +76,7 @@ pub struct TimedRun {
 
 /// Clock abstraction so the timing machinery is host-testable.
 ///
-/// On device this is implemented by [`RealClock`] (CCOUNT + ESP32-S3 system
+/// On device this is implemented by `RealClock` (CCOUNT + ESP32-S3 system
 /// timer).  Tests use a [`FakeClock`].
 pub trait Clock {
     /// Current CCOUNT value (32-bit on Xtensa — widened to `u64`).
@@ -283,7 +283,7 @@ impl Clock for RealClock {
 /// Read the Xtensa `CCOUNT` special register (32-bit, 240 MHz on S3).
 ///
 /// `pub(crate)` so the device firmware's calibration routine uses the same
-/// read path as [`RealClock`].
+/// read path as `RealClock`.
 #[cfg(target_arch = "xtensa")]
 pub(crate) fn read_ccount() -> u32 {
     let c: u32;

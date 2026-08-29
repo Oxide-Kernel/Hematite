@@ -13,7 +13,7 @@
 //!
 //! On host (stable-aarch64-apple-darwin), only leg (b) executes. The SIMD
 //! dispatch is `#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]` —
-//! device-only (see [`conv3x3_accx_dispatch`]); the scalar kernel below is the
+//! device-only (see `conv3x3_accx_dispatch`); the scalar kernel below is the
 //! complete bit-exact fallback on every other target.
 //!
 //! # Layouts

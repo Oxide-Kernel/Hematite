@@ -13,7 +13,7 @@
 //!
 //! On host (stable-aarch64-apple-darwin), only leg (b) executes. The SIMD
 //! dispatch is `#[cfg(all(target_arch = "xtensa", not(feature = "qemu")))]` —
-//! device-only (see [`conv1x1_accx_dispatch`]); the scalar kernel below is the
+//! device-only (see `conv1x1_accx_dispatch`); the scalar kernel below is the
 //! complete bit-exact fallback on every other target.
 //!
 //! # Layouts
@@ -34,7 +34,7 @@
 //! The bespoke `s8_accx_conv1x1.S` kernel (assembled into the crate by
 //! [`crate::accx`] via `global_asm!`) accumulates into i32 GPR accumulators,
 //! so the bit-exact requantize epilogue runs in Rust — no fused-asm
-//! requantize, no arg-struct ABI. See [`conv1x1_accx_dispatch`] for the
+//! requantize, no arg-struct ABI. See `conv1x1_accx_dispatch` for the
 //! eligibility gate (zero offsets, 16-aligned channel counts, runtime 16-byte
 //! pointer alignment, sufficient scratch).
 //!

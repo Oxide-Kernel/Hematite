@@ -31,7 +31,7 @@
 //! * **`reshape` / `transpose`** — no standalone scalar kernel exists yet
 //!   (Phase-2 `data_movement.rs` only covers concat/split/pad/slice). Both are
 //!   pure data movement with no arithmetic, so the adapter implements them
-//!   inline (see [`transpose_impl`]). These should be promoted to
+//!   inline (see `transpose_impl`). These should be promoted to
 //!   standalone kernels in `data_movement.rs` by a Phase-2 completion task.
 
 use hematite_core::op_params::{
